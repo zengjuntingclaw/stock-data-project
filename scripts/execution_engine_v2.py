@@ -60,11 +60,16 @@ class LimitBoardChecker:
     # 涨跌停幅度配置
     LIMIT_CONFIG = {
         "main": 0.10,        # 主板
-        "gem": 0.20,         # 创业板
-        "star": 0.20,        # 科创板
+        "gem": 0.20,         # 创业板（2020-08-24后）
+        "gem_before": 0.10,  # 创业板（2020-08-24前）
+        "star": 0.20,        # 科创板（2019-07-22后）
         "bse": 0.30,         # 北交所
         "st": 0.05,          # ST股票
     }
+    
+    # 关键时间节点
+    GEM_REFORM_DATE = datetime(2020, 8, 24)   # 创业板注册制改革日期
+    STAR_LAUNCH_DATE = datetime(2019, 7, 22)  # 科创板开板日期
     
     @staticmethod
     def get_board_type(symbol: str) -> str:
@@ -90,9 +95,12 @@ class LimitBoardChecker:
             return "main"  # 默认主板
     
     @staticmethod
-    def get_limit_pct(symbol: str, name: str = "", is_st: bool = False) -> float:
+    def get_limit_pct(symbol: str, 
+                      name: str = "", 
+                      is_st: bool = False,
+                      trade_date: Optional[datetime] = None) -> float:
         """
-        获取涨跌停幅度
+        获取涨跌停幅度（考虑历史时间线）
         
         Parameters
         ----------
@@ -102,12 +110,26 @@ class LimitBoardChecker:
             股票名称（用于判断ST）
         is_st : bool
             是否ST（从数据源获取）
+        trade_date : datetime
+            交易日期（用于判断历史规则）
         """
         # ST优先（统一5%）
         if is_st or "ST" in name or "*ST" in name:
             return LimitBoardChecker.LIMIT_CONFIG["st"]
         
         board = LimitBoardChecker.get_board_type(symbol)
+        
+        # 创业板：2020-08-24前为10%，之后为20%
+        if board == "gem":
+            if trade_date and trade_date < LimitBoardChecker.GEM_REFORM_DATE:
+                return LimitBoardChecker.LIMIT_CONFIG["gem_before"]
+            return LimitBoardChecker.LIMIT_CONFIG["gem"]
+        
+        # 科创板：2019-07-22前不存在，之后为20%
+        if board == "star":
+            return LimitBoardChecker.LIMIT_CONFIG["star"]
+        
+        # 北交所、主板
         return LimitBoardChecker.LIMIT_CONFIG.get(board, 0.10)
     
     @staticmethod
@@ -118,7 +140,22 @@ class LimitBoardChecker:
                     list_date: Optional[datetime] = None,
                     trade_date: Optional[datetime] = None) -> Tuple[bool, bool]:
         """
-        判断涨跌停
+        判断涨跌停（考虑历史时间线）
+        
+        Parameters
+        ----------
+        symbol : str
+            股票代码
+        pct_chg : float
+            涨跌幅
+        name : str
+            股票名称
+        is_st : bool
+            是否ST
+        list_date : datetime
+            上市日期（用于判断新股）
+        trade_date : datetime
+            交易日期（用于判断历史规则）
         
         Returns
         -------
@@ -128,19 +165,19 @@ class LimitBoardChecker:
         if list_date and trade_date:
             days_listed = (trade_date.date() - list_date.date()).days
             if days_listed == 0:
-                # 主板首日44%涨幅限制，无跌停限制
                 board = LimitBoardChecker.get_board_type(symbol)
+                # 主板首日44%涨幅限制，无跌停限制
                 if board in ["main"]:
                     return pct_chg >= 0.44, False
                 # 科创板/创业板/北交所首日无涨跌停
                 elif board in ["star", "gem", "bse"]:
                     return False, False
         
-        limit_pct = LimitBoardChecker.get_limit_pct(symbol, name, is_st)
+        limit_pct = LimitBoardChecker.get_limit_pct(symbol, name, is_st, trade_date)
         
         # 允许0.1%误差（四舍五入）
-        is_up = pct_chg >= (limit_pct - 0.001)
-        is_down = pct_chg <= -(limit_pct - 0.001)
+        is_up = pct_chg >= (limit_pct * 100 - 0.1)
+        is_down = pct_chg <= -(limit_pct * 100 - 0.1)
         
         return is_up, is_down
     
@@ -150,11 +187,13 @@ class LimitBoardChecker:
                            pct_chg_col: str = "pct_chg",
                            name_col: str = "name",
                            st_col: str = "is_st",
-                           list_date_col: str = "list_date") -> pd.DataFrame:
+                           list_date_col: str = "list_date",
+                           trade_date_col: str = "trade_date") -> pd.DataFrame:
         """
-        向量化涨跌停判定
+        向量化涨跌停判定（考虑历史时间线）
         
-        输入DataFrame需包含：symbol, pct_chg, name（可选）, is_st（可选）
+        输入DataFrame需包含：symbol, pct_chg, name（可选）, is_st（可选）, 
+                              list_date（可选）, trade_date（必须）
         """
         df = df.copy()
         
@@ -169,26 +208,40 @@ class LimitBoardChecker:
         else:
             df["_is_st"] = False
         
-        # 涨跌停幅度
-        df["_limit_pct"] = np.where(
-            df["_is_st"],
-            0.05,
-            df["_board"].map({
-                "main": 0.10,
-                "gem": 0.20,
-                "star": 0.20,
-                "bse": 0.30
-            }).fillna(0.10)
-        )
+        # 获取交易日期
+        if trade_date_col in df.columns:
+            df["_trade_date"] = pd.to_datetime(df[trade_date_col])
+        else:
+            df["_trade_date"] = datetime.now()  # 默认当前日期
         
-        # 新股首日特殊处理（简化：跳过）
+        # 涨跌停幅度（考虑历史时间线）
+        def get_limit_with_history(row):
+            """根据交易日期获取正确的涨跌停幅度"""
+            trade_dt = row["_trade_date"]
+            
+            # ST统一5%
+            if row["_is_st"]:
+                return 0.05
+            
+            board = row["_board"]
+            
+            # 创业板：2020-08-24前为10%
+            if board == "gem":
+                if trade_dt < LimitBoardChecker.GEM_REFORM_DATE:
+                    return 0.10
+                return 0.20
+            
+            # 其他板块
+            return LimitBoardChecker.LIMIT_CONFIG.get(board, 0.10)
+        
+        df["_limit_pct"] = df.apply(get_limit_with_history, axis=1)
         
         # 判定涨跌停
-        df["limit_up"] = df[pct_chg_col] >= (df["_limit_pct"] - 0.001)
-        df["limit_down"] = df[pct_chg_col] <= -(df["_limit_pct"] - 0.001)
+        df["limit_up"] = df[pct_chg_col] >= (df["_limit_pct"] * 100 - 0.1)
+        df["limit_down"] = df[pct_chg_col] <= -(df["_limit_pct"] * 100 - 0.1)
         
         # 清理临时列
-        df.drop(columns=["_board", "_is_st", "_limit_pct"], inplace=True)
+        df.drop(columns=["_board", "_is_st", "_trade_date", "_limit_pct"], inplace=True)
         
         return df
 
@@ -204,11 +257,17 @@ class ExecutionEngineV2:
       1. T+1 交易限制
       2. 除权除息自动调整
       3. 真实持仓管理
+      4. 价格模式校验（真实价格 vs 复权价格）
+    
+    价格模式说明：
+      - "real"（推荐）：使用真实价格（不复权），配合CorporateAction准确计算
+      - "adjusted"：使用前复权/后复权价格，跳过股数变化处理
     """
     
     def __init__(self, 
                  cost_config: Optional[Dict] = None,
-                 adv_limit: float = 0.1):
+                 adv_limit: float = 0.1,
+                 price_mode: Literal["real", "adjusted"] = "real"):
         """
         Parameters
         ----------
@@ -216,6 +275,10 @@ class ExecutionEngineV2:
             交易成本配置
         adv_limit : float
             成交量限制（占ADV的比例）
+        price_mode : str
+            价格模式：
+            - "real"：真实价格（不复权），必须配合CorporateAction
+            - "adjusted"：复权价格，跳过股数变化处理
         """
         self.cost_config = cost_config or {
             "commission": 0.0003,     # 佣金 0.03%
@@ -224,6 +287,17 @@ class ExecutionEngineV2:
             "slippage": 0.001,         # 滑点 0.1%
         }
         self.adv_limit = adv_limit
+        self.price_mode = price_mode
+        
+        # 价格模式校验
+        if price_mode not in ["real", "adjusted"]:
+            raise ValueError(f"price_mode must be 'real' or 'adjusted', got {price_mode}")
+        
+        if price_mode == "adjusted":
+            logger.warning(
+                "使用复权价格模式时，CorporateAction的股数变化处理将被跳过。\n"
+                "请确保传入的行情数据已正确复权，否则持仓计算将不准确。"
+            )
         
         # 持仓管理
         self.positions: Dict[str, Position] = {}
@@ -266,7 +340,24 @@ class ExecutionEngineV2:
         处理除权除息：
           - 送股/转增：股数增加，成本降低
           - 现金分红：现金增加，成本降低
+        
+        注意：如果price_mode="adjusted"（复权价格模式），跳过股数变化处理，
+             仅处理现金分红（因为分红已体现在复权价格中）。
         """
+        # 复权价格模式：跳过股数变化处理
+        if self.price_mode == "adjusted":
+            # 仅处理现金分红（股息税等）
+            for action in self.corporate_actions:
+                if action.ex_date != trade_date:
+                    continue
+                if action.symbol not in self.positions:
+                    continue
+                if action.action_type == "dividend" and action.cash_dividend > 0:
+                    # 现金分红增加账户余额（但已体现在复权价格中，这里只记录）
+                    logger.debug(f"{trade_date} | {action.symbol} 分红日（复权模式，跳过）")
+            return
+        
+        # 真实价格模式：完整处理股数变化和分红
         for action in self.corporate_actions:
             if action.ex_date != trade_date:
                 continue
@@ -369,9 +460,14 @@ class ExecutionEngineV2:
             current = self.positions.get(sym, Position(sym, 0, 0, 0, trade_date, trade_date))
             available = self.get_available_shares(sym)
             
-            if target < available:
-                # 卖出
-                sell_shares = min(available - target, available)
+            # 修正：卖出股数 = min(需要减仓数量, 可用股数)
+            # 需要减仓数量 = 当前总股数 - 目标股数
+            shares_to_reduce = current.shares - target
+            if shares_to_reduce > 0:
+                sell_shares = min(shares_to_reduce, available)
+                if sell_shares <= 0:
+                    continue
+                
                 price = self._get_price(market_data, sym, "open")
                 
                 # 检查跌停

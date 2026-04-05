@@ -450,87 +450,173 @@ class FactorStation:
         return self._calc_roe_ttm_pandas(pit_df)
     
     def _calc_roe_ttm_pandas(self, pit_df: pd.DataFrame) -> pd.Series:
-        """Pandas 方式计算 ROE_TTM"""
+        """
+        Pandas 方式计算 ROE_TTM（A股累计值算法）
+        
+        A股财务数据是累计值：
+          - Q1报：1-3月累计
+          - 中报：1-6月累计
+          - 三季报：1-9月累计
+          - 年报：1-12月全年值
+        
+        正确的TTM算法：
+          - 本期是年报：TTM = 本期值
+          - 否则：TTM = 本期累计 + 上年年报 - 上年同期累计
+        """
         if "net_profit" not in pit_df.columns or "total_equity" not in pit_df.columns:
             return pd.Series(dtype=float, name="roe_ttm")
         
-        # 按报告期排序，取最近4期
-        pit_df = pit_df.sort_values(["ts_code", "end_date"])
+        # 确保end_date是日期格式
+        pit_df = pit_df.copy()
+        pit_df["end_date"] = pd.to_datetime(pit_df["end_date"])
+        pit_df["year"] = pit_df["end_date"].dt.year
+        pit_df["month"] = pit_df["end_date"].dt.month
+        
+        # 判断报告期类型
+        def get_report_type(month):
+            if month == 3:
+                return "Q1"
+            elif month == 6:
+                return "Q2"  # 中报
+            elif month == 9:
+                return "Q3"  # 三季报
+            elif month == 12:
+                return "Q4"  # 年报
+            else:
+                return "OTHER"
+        
+        pit_df["report_type"] = pit_df["month"].apply(get_report_type)
         
         results = {}
+        
         for ts_code, group in pit_df.groupby("ts_code"):
-            # 取最近4个季度的净利润
-            recent_4q = group.tail(4)
-            if len(recent_4q) < 4:
+            group = group.sort_values("end_date")
+            
+            # 取最新一期
+            if len(group) == 0:
                 continue
             
-            # TTM 净利润 = 最近4季度之和
-            net_profit_ttm = recent_4q["net_profit"].sum()
+            latest = group.iloc[-1]
+            latest_year = latest["year"]
+            latest_month = latest["month"]
+            latest_np = latest["net_profit"]
+            latest_te = latest["total_equity"]
             
-            # 最新净资产
-            total_equity_latest = recent_4q["total_equity"].iloc[-1]
+            if pd.isna(latest_te) or latest_te <= 0:
+                continue
             
-            if total_equity_latest and total_equity_latest > 0:
-                results[ts_code] = net_profit_ttm / total_equity_latest
+            # 年报直接作为TTM
+            if latest_month == 12:
+                net_profit_ttm = latest_np
+            else:
+                # 需要找上年年报和上年同期
+                # 上年年报
+                prev_year_annual = group[
+                    (group["year"] == latest_year - 1) & (group["month"] == 12)
+                ]
+                # 上年同期
+                prev_year_same = group[
+                    (group["year"] == latest_year - 1) & (group["month"] == latest_month)
+                ]
+                
+                if len(prev_year_annual) == 0 or len(prev_year_same) == 0:
+                    # 数据不完整，跳过
+                    continue
+                
+                prev_annual_np = prev_year_annual["net_profit"].iloc[0]
+                prev_same_np = prev_year_same["net_profit"].iloc[0]
+                
+                # TTM = 本期累计 + 上年年报 - 上年同期累计
+                net_profit_ttm = latest_np + prev_annual_np - prev_same_np
+            
+            if pd.notna(net_profit_ttm) and latest_te > 0:
+                results[ts_code] = net_profit_ttm / latest_te
         
         return pd.Series(results, name="roe_ttm")
     
     def _calc_roe_ttm_sql(self, conn, trade_date: str) -> pd.Series:
         """
-        DuckDB SQL 计算ROE_TTM（向量化）
+        DuckDB SQL 计算ROE_TTM（A股累计值算法）
         
-        使用窗口函数 sum() over (rows between 3 preceding and current row)
+        A股正确TTM算法：
+          - 年报：TTM = 本期值
+          - 其他报告期：TTM = 本期累计 + 上年年报 - 上年同期累计
         """
         sql = f"""
             WITH pit_filtered AS (
-                SELECT *
+                SELECT 
+                    ts_code,
+                    end_date,
+                    net_profit,
+                    total_equity,
+                    EXTRACT(YEAR FROM end_date) AS year,
+                    EXTRACT(MONTH FROM end_date) AS month
                 FROM financial_data
                 WHERE ann_date <= '{trade_date}'
+                AND net_profit IS NOT NULL
             ),
-            ranked AS (
+            with_report_type AS (
                 SELECT
                     ts_code,
                     end_date,
                     net_profit,
                     total_equity,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY ts_code
-                        ORDER BY end_date DESC
-                    ) AS rn
+                    year,
+                    month,
+                    CASE
+                        WHEN month = 12 THEN 'ANNUAL'
+                        WHEN month = 9 THEN 'Q3'
+                        WHEN month = 6 THEN 'Q2'
+                        WHEN month = 3 THEN 'Q1'
+                        ELSE 'OTHER'
+                    END AS report_type
                 FROM pit_filtered
-                WHERE net_profit IS NOT NULL
             ),
-            recent_4q AS (
-                SELECT
-                    ts_code,
-                    end_date,
-                    net_profit,
-                    total_equity,
-                    SUM(net_profit) OVER (
-                        PARTITION BY ts_code
-                        ORDER BY end_date
-                        ROWS BETWEEN 3 PRECEDING AND CURRENT ROW
-                    ) AS net_profit_ttm,
-                    FIRST_VALUE(total_equity) OVER (
-                        PARTITION BY ts_code
-                        ORDER BY end_date DESC
-                    ) AS total_equity_latest
-                FROM ranked
-                WHERE rn <= 4
-            ),
-            latest AS (
+            latest_report AS (
+                -- 每只股票的最新报告期
                 SELECT DISTINCT ON (ts_code)
                     ts_code,
-                    net_profit_ttm,
-                    total_equity_latest
-                FROM recent_4q
+                    end_date,
+                    net_profit,
+                    total_equity,
+                    year,
+                    month,
+                    report_type
+                FROM with_report_type
                 ORDER BY ts_code, end_date DESC
+            ),
+            ttm_calc AS (
+                SELECT
+                    l.ts_code,
+                    l.end_date,
+                    l.net_profit,
+                    l.total_equity,
+                    l.year,
+                    l.month,
+                    CASE
+                        -- 年报直接作为TTM
+                        WHEN l.month = 12 THEN l.net_profit
+                        -- 其他报告期需要计算
+                        ELSE l.net_profit + COALESCE(a.net_profit, 0) - COALESCE(s.net_profit, 0)
+                    END AS net_profit_ttm
+                FROM latest_report l
+                -- 上年年报
+                LEFT JOIN with_report_type a
+                    ON l.ts_code = a.ts_code
+                    AND a.year = l.year - 1
+                    AND a.month = 12
+                -- 上年同期
+                LEFT JOIN with_report_type s
+                    ON l.ts_code = s.ts_code
+                    AND s.year = l.year - 1
+                    AND s.month = l.month
             )
             SELECT
                 ts_code,
-                net_profit_ttm / NULLIF(total_equity_latest, 0) AS roe_ttm
-            FROM latest
-            WHERE total_equity_latest > 0
+                net_profit_ttm / NULLIF(total_equity, 0) AS roe_ttm
+            FROM ttm_calc
+            WHERE total_equity > 0
+            AND net_profit_ttm IS NOT NULL
         """
         df = conn.execute(sql).fetchdf()
         if df.empty:
