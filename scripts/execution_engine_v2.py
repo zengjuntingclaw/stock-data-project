@@ -42,6 +42,14 @@ class CorporateAction:
     cash_dividend: float = 0.0     # 现金分红（每股）
 
 
+@dataclass
+class CashRecord:
+    """资金记录（区分可用和冻结）"""
+    amount: float                  # 资金金额
+    date: datetime                 # 记录日期
+    cash_type: str                 # available / pending_withdraw
+
+
 # ──────────────────────────────────────────────────────────────
 # A股涨跌停判定
 # ──────────────────────────────────────────────────────────────
@@ -302,10 +310,26 @@ class ExecutionEngineV2:
         # 持仓管理
         self.positions: Dict[str, Position] = {}
         self.cash = 0.0
+        self.available_cash = 0.0        # 可用资金（当日可买）
+        self.pending_withdraw = 0.0      # 待取资金（T+1后可取）
         
         # 交易记录
         self.trade_history: List[Dict] = []
         self.corporate_actions: List[CorporateAction] = []
+    
+    def set_initial_capital(self, amount: float):
+        """
+        设置初始资金
+        
+        Parameters
+        ----------
+        amount : float
+            初始资金金额
+        """
+        self.cash = amount
+        self.available_cash = amount
+        self.pending_withdraw = 0.0
+        logger.info(f"初始资金设置: {amount:,.2f} 元")
     
     # ───────────────────────────────────────────────────────────
     # T+1 持仓管理
@@ -314,14 +338,22 @@ class ExecutionEngineV2:
         """
         每日开盘前更新持仓：
           1. 将昨日买入的pending_shares转为available
-          2. 处理除权除息
+          2. 将昨日卖出的pending_withdraw转为available_cash
+          3. 处理除权除息
         """
+        # T+1股票解冻
         for symbol, pos in self.positions.items():
             if pos.pending_shares > 0:
                 # T+1：昨日买入的今日可卖
                 pos.available_shares += pos.pending_shares
                 pos.pending_shares = 0
                 logger.debug(f"{trade_date} | {symbol} 解冻 {pos.pending_shares} 股")
+        
+        # T+1资金解冻（卖出所得资金次日可取）
+        if self.pending_withdraw > 0:
+            self.available_cash += self.pending_withdraw
+            logger.debug(f"{trade_date} | 资金解冻 {self.pending_withdraw:,.2f} 元")
+            self.pending_withdraw = 0.0
         
         # 处理除权除息
         self._process_corporate_actions(trade_date)
@@ -331,6 +363,32 @@ class ExecutionEngineV2:
         if symbol not in self.positions:
             return 0
         return self.positions[symbol].available_shares
+    
+    def get_cash_status(self) -> Dict:
+        """
+        获取资金状态
+        
+        Returns
+        -------
+        dict: {
+            "total_cash": 总资金,
+            "available_cash": 可用资金（当日可买）,
+            "pending_withdraw": 待取资金（T+1后可取）,
+            "market_value": 持仓市值
+        }
+        """
+        market_value = sum(
+            pos.shares * self._get_price(pd.DataFrame(), sym, "close") if sym in self.positions else 0
+            for sym, pos in self.positions.items()
+        ) if hasattr(self, '_last_market_data') else 0
+        
+        return {
+            "total_cash": self.cash,
+            "available_cash": self.available_cash,
+            "pending_withdraw": self.pending_withdraw,
+            "market_value": market_value,
+            "total_assets": self.cash + market_value
+        }
     
     # ───────────────────────────────────────────────────────────
     # 除权除息处理
@@ -492,10 +550,10 @@ class ExecutionEngineV2:
                     logger.warning(f"{trade_date} | {sym} 涨停，无法买入")
                     continue
                 
-                # 检查资金
+                # 检查资金（使用available_cash而非cash）
                 amount = buy_shares * price
-                if amount > self.cash:
-                    buy_shares = int(self.cash / price / 100) * 100
+                if amount > self.available_cash:
+                    buy_shares = int(self.available_cash / price / 100) * 100
                 
                 if buy_shares > 0:
                     trade = self._execute_buy(sym, buy_shares, price, trade_date)
@@ -535,6 +593,7 @@ class ExecutionEngineV2:
             self.positions[symbol] = pos
         
         self.cash -= total_cost
+        self.available_cash -= total_cost
         
         trade = {
             "symbol": symbol,
@@ -568,7 +627,12 @@ class ExecutionEngineV2:
         if pos.shares == 0:
             del self.positions[symbol]
         
+        # A股资金结算：
+        # - 卖出所得当日可买（加到available_cash）
+        # - 但不可取（记录到pending_withdraw，次日可取）
         self.cash += net_proceeds
+        self.available_cash += net_proceeds
+        self.pending_withdraw += net_proceeds
         
         trade = {
             "symbol": symbol,
