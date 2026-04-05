@@ -413,6 +413,252 @@ class FactorStation:
         result = pit_df["roe"].copy()
         result.index = pit_df["ts_code"]
         return result
+    
+    def calc_roe_ttm(self,
+                     financial_df: pd.DataFrame,
+                     trade_date: str,
+                     conn=None) -> pd.Series:
+        """
+        计算 ROE_TTM 因子（滚动十二个月）
+        
+        使用最近四个季度的净利润之和 / 最新净资产。
+        严格遵守 PIT 约束：只使用 ann_date <= trade_date 的数据。
+        
+        Parameters
+        ----------
+        financial_df : DataFrame
+            财务数据表（含 net_profit, total_equity, ann_date, end_date）
+        trade_date : str
+            截面日期
+        conn : DuckDB 连接（可选）
+            用于 SQL 计算，提高效率
+            
+        Returns
+        -------
+        Series: ts_code → ROE_TTM
+        """
+        # PIT 过滤
+        pit_df = self.pit_helper.get_latest_available(financial_df, trade_date)
+        if pit_df.empty:
+            return pd.Series(dtype=float, name="roe_ttm")
+        
+        # 如果有 DuckDB 连接，使用 SQL 窗口函数
+        if conn is not None:
+            return self._calc_roe_ttm_sql(conn, trade_date)
+        
+        # 否则使用 Pandas
+        return self._calc_roe_ttm_pandas(pit_df)
+    
+    def _calc_roe_ttm_pandas(self, pit_df: pd.DataFrame) -> pd.Series:
+        """Pandas 方式计算 ROE_TTM"""
+        if "net_profit" not in pit_df.columns or "total_equity" not in pit_df.columns:
+            return pd.Series(dtype=float, name="roe_ttm")
+        
+        # 按报告期排序，取最近4期
+        pit_df = pit_df.sort_values(["ts_code", "end_date"])
+        
+        results = {}
+        for ts_code, group in pit_df.groupby("ts_code"):
+            # 取最近4个季度的净利润
+            recent_4q = group.tail(4)
+            if len(recent_4q) < 4:
+                continue
+            
+            # TTM 净利润 = 最近4季度之和
+            net_profit_ttm = recent_4q["net_profit"].sum()
+            
+            # 最新净资产
+            total_equity_latest = recent_4q["total_equity"].iloc[-1]
+            
+            if total_equity_latest and total_equity_latest > 0:
+                results[ts_code] = net_profit_ttm / total_equity_latest
+        
+        return pd.Series(results, name="roe_ttm")
+    
+    def _calc_roe_ttm_sql(self, conn, trade_date: str) -> pd.Series:
+        """
+        DuckDB SQL 计算ROE_TTM（向量化）
+        
+        使用窗口函数 sum() over (rows between 3 preceding and current row)
+        """
+        sql = f"""
+            WITH pit_filtered AS (
+                SELECT *
+                FROM financial_data
+                WHERE ann_date <= '{trade_date}'
+            ),
+            ranked AS (
+                SELECT
+                    ts_code,
+                    end_date,
+                    net_profit,
+                    total_equity,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY ts_code
+                        ORDER BY end_date DESC
+                    ) AS rn
+                FROM pit_filtered
+                WHERE net_profit IS NOT NULL
+            ),
+            recent_4q AS (
+                SELECT
+                    ts_code,
+                    end_date,
+                    net_profit,
+                    total_equity,
+                    SUM(net_profit) OVER (
+                        PARTITION BY ts_code
+                        ORDER BY end_date
+                        ROWS BETWEEN 3 PRECEDING AND CURRENT ROW
+                    ) AS net_profit_ttm,
+                    FIRST_VALUE(total_equity) OVER (
+                        PARTITION BY ts_code
+                        ORDER BY end_date DESC
+                    ) AS total_equity_latest
+                FROM ranked
+                WHERE rn <= 4
+            ),
+            latest AS (
+                SELECT DISTINCT ON (ts_code)
+                    ts_code,
+                    net_profit_ttm,
+                    total_equity_latest
+                FROM recent_4q
+                ORDER BY ts_code, end_date DESC
+            )
+            SELECT
+                ts_code,
+                net_profit_ttm / NULLIF(total_equity_latest, 0) AS roe_ttm
+            FROM latest
+            WHERE total_equity_latest > 0
+        """
+        df = conn.execute(sql).fetchdf()
+        if df.empty:
+            return pd.Series(dtype=float, name="roe_ttm")
+        return df.set_index("ts_code")["roe_ttm"]
+    
+    def calc_pe_ttm(self,
+                    price_df: pd.DataFrame,
+                    financial_df: pd.DataFrame,
+                    trade_date: str,
+                    conn=None) -> pd.Series:
+        """
+        计算 PE_TTM 因子（滚动市盈率）
+        
+        PE_TTM = 市值 / (最近4季度净利润之和)
+        或 = 股价 / (最近4季度EPS之和)
+        
+        Parameters
+        ----------
+        price_df : DataFrame
+            当日行情（含 close, total_mv）
+        financial_df : DataFrame
+            财务数据（含 net_profit, total_shares）
+        trade_date : str
+            截面日期
+        conn : DuckDB 连接（可选）
+            
+        Returns
+        -------
+        Series: ts_code → PE_TTM
+        """
+        # PIT 过滤
+        pit_df = self.pit_helper.get_latest_available(financial_df, trade_date)
+        if pit_df.empty:
+            return pd.Series(dtype=float, name="pe_ttm")
+        
+        # 合并市值数据
+        price_df = price_df.copy()
+        if "total_mv" not in price_df.columns:
+            # 用收盘价 × 总股本估算市值
+            if "close" in price_df.columns and "total_shares" in pit_df.columns:
+                pit_latest = pit_df.drop_duplicates("ts_code", keep="last")
+                price_df = price_df.merge(
+                    pit_latest[["ts_code", "total_shares"]],
+                    on="ts_code", how="left"
+                )
+                price_df["total_mv"] = price_df["close"] * price_df["total_shares"]
+        
+        if conn is not None:
+            return self._calc_pe_ttm_sql(conn, trade_date)
+        
+        # Pandas 计算
+        results = {}
+        for ts_code, group in pit_df.groupby("ts_code"):
+            recent_4q = group.tail(4)
+            if len(recent_4q) < 4:
+                continue
+            
+            net_profit_ttm = recent_4q["net_profit"].sum()
+            
+            if ts_code in price_df["ts_code"].values:
+                mv = price_df.loc[price_df["ts_code"] == ts_code, "total_mv"].iloc[0]
+                if mv and mv > 0 and net_profit_ttm and net_profit_ttm > 0:
+                    results[ts_code] = mv / net_profit_ttm
+        
+        return pd.Series(results, name="pe_ttm")
+    
+    def _calc_pe_ttm_sql(self, conn, trade_date: str) -> pd.Series:
+        """DuckDB SQL 计算 PE_TTM"""
+        sql = f"""
+            WITH pit_fin AS (
+                SELECT *
+                FROM financial_data
+                WHERE ann_date <= '{trade_date}'
+            ),
+            ttm_profit AS (
+                SELECT
+                    ts_code,
+                    SUM(net_profit) OVER (
+                        PARTITION BY ts_code
+                        ORDER BY end_date
+                        ROWS BETWEEN 3 PRECEDING AND CURRENT ROW
+                    ) AS net_profit_ttm
+                FROM (
+                    SELECT DISTINCT ON (ts_code, end_date)
+                        ts_code, end_date, net_profit
+                    FROM pit_fin
+                    WHERE net_profit IS NOT NULL
+                    ORDER BY ts_code, end_date DESC
+                )
+                WHERE ROW_NUMBER() OVER (PARTITION BY ts_code ORDER BY end_date DESC) <= 4
+            ),
+            latest_profit AS (
+                SELECT DISTINCT ON (ts_code)
+                    ts_code, net_profit_ttm
+                FROM ttm_profit
+                ORDER BY ts_code, end_date DESC
+            ),
+            market_data AS (
+                SELECT ts_code, close, total_mv
+                FROM daily_quotes
+                WHERE trade_date = '{trade_date}'
+            )
+            SELECT
+                m.ts_code,
+                m.total_mv / NULLIF(p.net_profit_ttm, 0) AS pe_ttm
+            FROM market_data m
+            JOIN latest_profit p ON m.ts_code = p.ts_code
+            WHERE p.net_profit_ttm > 0
+        """
+        df = conn.execute(sql).fetchdf()
+        if df.empty:
+            return pd.Series(dtype=float, name="pe_ttm")
+        return df.set_index("ts_code")["pe_ttm"]
+    
+    def calc_pb_ttm(self,
+                    price_df: pd.DataFrame,
+                    financial_df: pd.DataFrame,
+                    trade_date: str) -> pd.Series:
+        """
+        计算 PB_TTM 因子（市净率）
+        
+        PB = 市值 / 净资产
+        
+        注：PB本身不需要TTM，直接用最新净资产即可。
+        这里为保持接口一致性保留此方法。
+        """
+        return self.calc_pb_pit(financial_df, trade_date)
 
     def calc_roic_pit(self,
                       financial_df: pd.DataFrame,

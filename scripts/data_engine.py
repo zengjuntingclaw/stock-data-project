@@ -862,8 +862,20 @@ class DataEngine:
             )
             df["pre_close"] = df["close"].shift(1)
             df["is_suspend"] = df["volume"] == 0
-            df["limit_up"] = df["pct_chg"] >= 9.9
-            df["limit_down"] = df["pct_chg"] <= -9.9
+            
+            # 多层次涨跌停判定（替代硬编码9.9%）
+            code = symbol.zfill(6)
+            if code.startswith("688"):      # 科创板
+                limit_pct = 0.20
+            elif code.startswith("30"):    # 创业板
+                limit_pct = 0.20
+            elif code.startswith("4") or code.startswith("8"):  # 北交所
+                limit_pct = 0.30
+            else:                          # 主板
+                limit_pct = 0.10
+            
+            df["limit_up"] = df["pct_chg"] >= (limit_pct * 100 - 0.1)
+            df["limit_down"] = df["pct_chg"] <= -(limit_pct * 100 - 0.1)
             df["data_source"] = "akshare"
 
             # 计算复权因子
@@ -1048,8 +1060,20 @@ class DataEngine:
             df["ts_code"] = f"{sym6}.SH" if sym6.startswith(("6", "5", "9", "688")) else f"{sym6}.SZ"
             df["pre_close"] = df["close"].shift(1)
             df["is_suspend"] = df["volume"] == 0
-            df["limit_up"] = df["pct_chg"] >= 9.9
-            df["limit_down"] = df["pct_chg"] <= -9.9
+            
+            # 多层次涨跌停判定
+            code = symbol.zfill(6)
+            if code.startswith("688"):
+                limit_pct = 0.20
+            elif code.startswith("30"):
+                limit_pct = 0.20
+            elif code.startswith("4") or code.startswith("8"):
+                limit_pct = 0.30
+            else:
+                limit_pct = 0.10
+            
+            df["limit_up"] = df["pct_chg"] >= (limit_pct * 100 - 0.1)
+            df["limit_down"] = df["pct_chg"] <= -(limit_pct * 100 - 0.1)
             df["data_source"] = "akshare"
 
             # 复权因子
@@ -1125,8 +1149,20 @@ class DataEngine:
             df["pct_chg"] = df["close"].pct_change().fillna(0) * 100
             df["amount"] = df["amount"].astype(float)
             df["is_suspend"] = df["volume"] == 0
-            df["limit_up"] = df["pct_chg"] >= 9.9
-            df["limit_down"] = df["pct_chg"] <= -9.9
+            
+            # 多层次涨跌停判定
+            code = symbol.zfill(6)
+            if code.startswith("688"):
+                limit_pct = 0.20
+            elif code.startswith("30"):
+                limit_pct = 0.20
+            elif code.startswith("4") or code.startswith("8"):
+                limit_pct = 0.30
+            else:
+                limit_pct = 0.10
+            
+            df["limit_up"] = df["pct_chg"] >= (limit_pct * 100 - 0.1)
+            df["limit_down"] = df["pct_chg"] <= -(limit_pct * 100 - 0.1)
             df["data_source"] = "baostock"
             df["adj_factor"] = 1.0
             df["turnover"] = 0.0
