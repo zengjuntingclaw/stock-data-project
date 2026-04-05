@@ -1,0 +1,36 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+
+# 数据文件（不上传）
+*.duckdb
+*.parquet
+*.csv
+*.h5
+*.hdf5
+
+# 日志
+logs/
+*.log
+
+# 输出文件
+_output/
+
+# 临时文件
+_tmp_parquet/
+data/_tmp_parquet/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 系统文件
+.DS_Store
+Thumbs.db
