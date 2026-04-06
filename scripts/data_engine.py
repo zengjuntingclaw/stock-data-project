@@ -1158,6 +1158,34 @@ class DataEngine:
             logger.debug(f"Baostock fetch failed for {symbol}: {e}")
             return pd.DataFrame()
 
+    def _batch_get_latest_dates(self, ts_codes: List[str]) -> Dict[str, str]:
+        """批量获取多只股票的最新日期（单条SQL替代N次查询，减少DB I/O）
+        
+        Returns
+        -------
+        Dict[str, str]: {ts_code: latest_date_str} 字典
+        """
+        if not ts_codes or not HAS_DUCKDB:
+            return {}
+        codes_df = pd.DataFrame({"ts_code": ts_codes})
+        with self.get_connection() as conn:
+            conn.register('tmp_batch_latest', codes_df)
+            df = conn.execute("""
+                SELECT d.ts_code, MAX(d.trade_date) as latest_date
+                FROM daily_quotes d
+                INNER JOIN tmp_batch_latest t ON d.ts_code = t.ts_code
+                GROUP BY d.ts_code
+            """).fetchdf()
+            conn.execute("DROP VIEW tmp_batch_latest")
+        if df.empty:
+            return {}
+        result = {}
+        for _, row in df.iterrows():
+            val = row["latest_date"]
+            if val and not pd.isna(val):
+                result[row["ts_code"]] = pd.Timestamp(val).strftime("%Y-%m-%d")
+        return result
+
     def update_daily_data(self,
                           symbols: List[str] = None,
                           adjust: Literal["qfq", "hfq", ""] = "qfq",
@@ -1166,18 +1194,21 @@ class DataEngine:
                           check_dividend: bool = True,
                           cross_validate: bool = True) -> Dict:
         """
-        多线程增量更新日线数据 — 生产级增强版
+        多线程增量更新日线数据 — 生产级增强版 v2
         
-        改进点：
+        改进点（Issue #1）：
         1. max_workers 默认 12（充分利用多核）
-        2. 复权因子监测（dividend_check）
-        3. 多源交叉验证（AkShare vs Baostock）
-        4. 断点续传加固 + DataValidator
+        2. 批量 latest_date 缓存（单条SQL替代N次查询）
+        3. 限速移入线程内部（主线程不再 sleep）
+        4. 批量入库累积写入（减少DB连接开销）
+        5. 复权因子监测（dividend_check）
+        6. 多源交叉验证（AkShare vs Baostock）
+        7. 断点续传加固 + DataValidator
         """
         start_time = time.time()
         stats = {
             "total": len(symbols) if symbols else 0,
-            "success": 0, "failed": 0, "records": 0,
+            "success": 0, "failed": 0, "skipped": 0, "records": 0,
             "akshare_success": 0, "baostock_fallback": 0,
             "dividend_detected": 0,
             "cross_validate_errors": 0,
@@ -1200,28 +1231,68 @@ class DataEngine:
             logger.info("Data is up-to-date.")
             return stats
 
+        # ── Issue #2: 批量缓存 latest_date（单条SQL替代5000+次查询）──
+        ts_codes = []
+        for sym in symbols:
+            sym6 = str(sym).zfill(6)
+            if sym6.startswith(("6", "5", "9", "688")):
+                ts_codes.append(f"{sym6}.SH")
+            else:
+                ts_codes.append(f"{sym6}.SZ")
+
+        logger.info(f"Pre-caching latest dates for {len(ts_codes)} stocks...")
+        latest_cache = self._batch_get_latest_dates(ts_codes)
+        logger.info(f"Cache hit: {len(latest_cache)}/{len(ts_codes)} stocks have local data")
+
+        # 预过滤：排除已是最新且无复权因子的股票
+        active_symbols = []
+        for sym, tc in zip(symbols, ts_codes):
+            cached = latest_cache.get(tc, "")
+            if cached and cached >= start_date:
+                stats["skipped"] += 1
+            else:
+                active_symbols.append(sym)
+
         logger.info(f"Incremental update: {start_date} ~ {end_date}, "
-              f"{len(symbols)} stocks, workers={max_workers}")
+              f"total={len(symbols)}, active={len(active_symbols)}, "
+              f"skipped={stats['skipped']}, workers={max_workers}")
+
+        if not active_symbols:
+            stats["elapsed_sec"] = time.time() - start_time
+            return stats
+
+        # ── 线程安全的批量累积缓冲区 ──
+        import threading
+        batch_buffer = []
+        batch_lock = threading.Lock()
+        BATCH_FLUSH_SIZE = 50  # 每50只股票批量入库一次
 
         def _download_one(sym: str) -> Tuple[str, pd.DataFrame, str, str]:
-            """单线程下载器"""
-            symbol_clean = str(sym).zfill(6)
-            ts_code = (f"{symbol_clean}.SH" if symbol_clean.startswith(("6", "5", "9", "688"))
-                       else f"{symbol_clean}.SZ")
-            sym_latest = self.get_latest_date(ts_code)
-            if sym_latest and sym_latest >= start_date:
-                return sym, pd.DataFrame(), "", ""
+            """单线程下载器（内部自带限速）"""
+            try:
+                symbol_clean = str(sym).zfill(6)
+                ts_code = (f"{symbol_clean}.SH" if symbol_clean.startswith(("6", "5", "9", "688"))
+                           else f"{symbol_clean}.SZ")
+                # 使用缓存而非实时查询
+                sym_latest = latest_cache.get(ts_code, "")
+                if sym_latest and sym_latest >= start_date:
+                    return sym, pd.DataFrame(), "", ""
 
-            actual_start = start_date
-            if actual_start > end_date:
-                return sym, pd.DataFrame(), "", ""
+                actual_start = start_date
+                if actual_start > end_date:
+                    return sym, pd.DataFrame(), "", ""
 
-            df, source = self._fetch_single_with_retry(sym, actual_start, end_date, adjust)
-            return sym, df, source, ""
+                # 线程内限速：避免并发请求过猛
+                time.sleep(delay * random.uniform(0.5, 1.5))
 
-        # 多线程下载
+                df, source = self._fetch_single_with_retry(sym, actual_start, end_date, adjust)
+                return sym, df, source, ""
+            except Exception as e:
+                return sym, pd.DataFrame(), "", str(e)
+
+        # 多线程下载 + 批量入库
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {pool.submit(_download_one, s): s for s in symbols}
+            futures = {pool.submit(_download_one, s): s for s in active_symbols}
             done = 0
             for future in as_completed(futures):
                 sym, df, source, err = future.result()
@@ -1233,13 +1304,19 @@ class DataEngine:
                         if div_alerts:
                             stats["dividend_detected"] += len(div_alerts)
 
-                    # DataValidator 验证后入库
+                    # DataValidator 验证
                     val = self.validator.validate(df)
                     if not val["ok"]:
                         for issue in val["issues"]:
                             stats["errors"].append(f"{sym}: {issue}")
 
-                    self.save_quotes(df, mode="append")
+                    # 累积到批量缓冲区
+                    with batch_lock:
+                        batch_buffer.append(df)
+                        if len(batch_buffer) >= BATCH_FLUSH_SIZE:
+                            self.save_quotes(pd.concat(batch_buffer, ignore_index=True), mode="append")
+                            batch_buffer.clear()
+
                     stats["success"] += 1
                     stats["records"] += len(df)
                     if source == "akshare":
@@ -1252,19 +1329,25 @@ class DataEngine:
                         stats["errors"].append(f"{sym}: {err}")
 
                 if done % 200 == 0:
-                    logger.info(f"Progress: {done}/{len(symbols)} ({done/len(symbols)*100:.1f}%) "
+                    logger.info(f"Progress: {done}/{len(active_symbols)} "
+                          f"({done/len(active_symbols)*100:.1f}%) "
                           f"success={stats['success']} failed={stats['failed']}")
-                time.sleep(delay)
+
+        # 刷出缓冲区剩余数据
+        if batch_buffer:
+            self.save_quotes(pd.concat(batch_buffer, ignore_index=True), mode="append")
+            batch_buffer.clear()
 
         # 多源交叉验证（抽样）
         if cross_validate and HAS_BAOSTOCK and stats["success"] > 0:
-            self._cross_validate_sources(symbols[:min(50, len(symbols))], end_date, stats)
+            self._cross_validate_sources(active_symbols[:min(50, len(active_symbols))], end_date, stats)
 
         stats["elapsed_sec"] = time.time() - start_time
         rate = stats["success"] / stats["elapsed_sec"] if stats["elapsed_sec"] > 0 else 0
         logger.info(f"Update done. success={stats['success']} failed={stats['failed']} "
-              f"records={stats['records']} time={stats['elapsed_sec']:.1f}s "
-              f"({rate:.1f} stocks/s) dividend={stats['dividend_detected']} "
+              f"skipped={stats['skipped']} records={stats['records']} "
+              f"time={stats['elapsed_sec']:.1f}s ({rate:.1f} stocks/s) "
+              f"dividend={stats['dividend_detected']} "
               f"validate_err={stats['cross_validate_errors']}")
         return stats
 
@@ -1387,13 +1470,183 @@ class DataEngine:
             bs.logout()
 
     # ──────────────────────────────────────────────────────────
+    # Issue #3: 停牌日期填充 & 退市过滤
+    # ──────────────────────────────────────────────────────────
+    def _fill_suspend_dates(self,
+                            df: pd.DataFrame,
+                            start_date: str,
+                            end_date: str) -> pd.DataFrame:
+        """填充停牌日缺失日期（Forward Fill），解决均线断裂问题
+        
+        对于数据库中缺失的停牌日期（volume=0 或无数据行），
+        使用前一日收盘价填充 OHLC，确保时间序列连续性。
+        
+        Parameters
+        ----------
+        df : pd.DataFrame
+            已有的日线数据
+        start_date : str
+            期望的起始日期 YYYY-MM-DD
+        end_date : str
+            期望的结束日期 YYYY-MM-DD
+            
+        Returns
+        -------
+        pd.DataFrame: 填充后的完整时间序列
+        """
+        if df.empty:
+            return df
+
+        ts_code = df["ts_code"].iloc[0]
+        
+        # 获取交易日历中的完整交易日序列
+        trade_dates = self.get_trade_dates(start_date, end_date)
+        if not trade_dates:
+            return df
+
+        existing_dates = set(
+            pd.to_datetime(df["trade_date"]).dt.strftime("%Y-%m-%d").tolist()
+        )
+        missing_dates = [d for d in trade_dates if d not in existing_dates]
+        
+        if not missing_dates:
+            return df
+        
+        # 构造缺失日期的填充行（使用前向填充）
+        fill_rows = []
+        last_valid = df.iloc[-1]  # 默认使用最后一行
+        for mdate in missing_dates:
+            # 找到该缺失日期之前的最近有效数据
+            mdt = pd.Timestamp(mdate)
+            valid_before = df[pd.to_datetime(df["trade_date"]) < mdt]
+            if not valid_before.empty:
+                last_valid = valid_before.iloc[-1]
+            fill_rows.append({
+                "ts_code": ts_code,
+                "trade_date": mdt,
+                "open": last_valid.get("close", 0),
+                "high": last_valid.get("close", 0),
+                "low": last_valid.get("close", 0),
+                "close": last_valid.get("close", 0),
+                "pre_close": last_valid.get("close", 0),
+                "volume": 0,
+                "amount": 0,
+                "pct_chg": 0,
+                "turnover": 0,
+                "adj_factor": last_valid.get("adj_factor", 1.0),
+                "is_suspend": True,
+                "limit_up": False,
+                "limit_down": False,
+                "data_source": "filled",
+            })
+        
+        if fill_rows:
+            fill_df = pd.DataFrame(fill_rows)
+            df = pd.concat([df, fill_df], ignore_index=True)
+            df = df.sort_values("trade_date").reset_index(drop=True)
+            logger.debug(f"Filled {len(fill_rows)} suspend dates for {ts_code}")
+        
+        return df
+
+    def is_delisted(self, ts_code: str) -> bool:
+        """检查股票是否已退市
+        
+        Parameters
+        ----------
+        ts_code : str
+            股票代码如 '000001.SZ'
+            
+        Returns
+        -------
+        bool: True 表示已退市
+        """
+        result = self.query(
+            "SELECT is_delisted FROM stock_basic WHERE ts_code = ?",
+            (ts_code,)
+        )
+        if result.empty:
+            return False
+        return bool(result.iloc[0, 0])
+
+    def get_delist_date(self, ts_code: str) -> Optional[str]:
+        """获取退市日期
+        
+        Returns
+        -------
+        str or None: 退市日期 YYYY-MM-DD，未退市返回 None
+        """
+        result = self.query(
+            "SELECT delist_date FROM stock_basic WHERE ts_code = ? AND is_delisted = TRUE",
+            (ts_code,)
+        )
+        if result.empty or pd.isna(result.iloc[0, 0]):
+            return None
+        return pd.Timestamp(result.iloc[0, 0]).strftime("%Y-%m-%d")
+
+    def filter_delisted_stocks(self, symbols: List[str], as_of_date: str) -> List[str]:
+        """过滤在指定日期已退市的股票
+        
+        Parameters
+        ----------
+        symbols : List[str]
+            股票代码列表（6位数字）
+        as_of_date : str
+            截止日期 YYYY-MM-DD
+            
+        Returns
+        -------
+        List[str]: 仍可交易的股票代码列表
+        """
+        if not symbols or not HAS_DUCKDB:
+            return symbols
+        
+        ts_codes = []
+        for sym in symbols:
+            sym6 = str(sym).zfill(6)
+            if sym6.startswith(("6", "5", "9", "688")):
+                ts_codes.append(f"{sym6}.SH")
+            else:
+                ts_codes.append(f"{sym6}.SZ")
+        
+        codes_df = pd.DataFrame({"ts_code": ts_codes})
+        sym_map = dict(zip(ts_codes, symbols))
+        
+        with self.get_connection() as conn:
+            conn.register('tmp_delisted_filter', codes_df)
+            df = conn.execute("""
+                SELECT t.ts_code, s.symbol
+                FROM tmp_delisted_filter t
+                LEFT JOIN stock_basic s ON t.ts_code = s.ts_code
+                WHERE s.is_delisted IS NULL 
+                   OR s.is_delisted = FALSE
+                   OR s.delist_date IS NULL
+                   OR s.delist_date > ?
+            """, (as_of_date,)).fetchdf()
+            conn.execute("DROP VIEW tmp_delisted_filter")
+        
+        if df.empty:
+            return []
+        
+        # 使用 ts_code 列映射回原始 symbol
+        result = []
+        for _, row in df.iterrows():
+            tc = row["ts_code"]
+            if "symbol" in df.columns and not pd.isna(row.get("symbol")):
+                result.append(str(row["symbol"]))
+            elif tc in sym_map:
+                result.append(sym_map[tc])
+        
+        return result
+
+    # ──────────────────────────────────────────────────────────
     # 单股数据提取
     # ──────────────────────────────────────────────────────────
     def get_security_data(self,
                           code: str,
                           start_date: str = None,
                           end_date: str = None,
-                          adjust: Literal["qfq", "hfq", ""] = "qfq") -> pd.DataFrame:
+                          adjust: Literal["qfq", "hfq", ""] = "qfq",
+                          fill_suspend: bool = True) -> pd.DataFrame:
         """
         获取单只股票数据
         
@@ -1409,6 +1662,8 @@ class DataEngine:
             结束日期
         adjust : 'qfq' | 'hfq' | ''
             复权方式
+        fill_suspend : bool
+            是否填充停牌日（默认True）
         """
         # 标准化代码
         if "." in code:
@@ -1419,6 +1674,18 @@ class DataEngine:
 
         start_date = start_date or DEFAULT_START_DATE
         end_date = end_date or datetime.now().strftime("%Y-%m-%d")
+
+        # Issue #3: 检查是否已退市（退市后停止抓取）
+        delist_date = self.get_delist_date(ts_code)
+        if delist_date and delist_date < start_date:
+            logger.debug(f"{ts_code} delisted on {delist_date}, skip fetch")
+            # 仍然返回本地已有数据
+            local = self.query("""
+                SELECT * FROM daily_quotes
+                WHERE ts_code = ? AND trade_date BETWEEN ? AND ?
+                ORDER BY trade_date
+            """, (ts_code, start_date, end_date))
+            return local
 
         # 查本地（参数化查询防止SQL注入）
         local = self.query("""
@@ -1432,17 +1699,34 @@ class DataEngine:
             today = datetime.now().strftime("%Y-%m-%d")
             if pd.Timestamp(local_latest).strftime("%Y-%m-%d") < today:
                 new_start = (pd.Timestamp(local_latest) + timedelta(days=1)).strftime("%Y-%m-%d")
-                new_df = self.fetch_single(symbol, new_start, today, adjust)
-                if not new_df.empty:
-                    self.save_quotes(new_df, mode="append")
-                    local = pd.concat([local, new_df], ignore_index=True)
-            return local.sort_values("trade_date").reset_index(drop=True)
+                # 退市后不抓取
+                if delist_date and new_start > delist_date:
+                    new_start = delist_date
+                if new_start <= end_date:
+                    new_df = self.fetch_single(symbol, new_start, today, adjust)
+                    if not new_df.empty:
+                        self.save_quotes(new_df, mode="append")
+                        local = pd.concat([local, new_df], ignore_index=True)
+            result = local.sort_values("trade_date").reset_index(drop=True)
+        else:
+            # 本地没有，从网络拉（带重试）
+            if delist_date:
+                fetch_end = min(
+                    pd.Timestamp(end_date),
+                    pd.Timestamp(delist_date)
+                ).strftime("%Y-%m-%d")
+            else:
+                fetch_end = end_date
+            df, source = self._fetch_single_with_retry(symbol, start_date, fetch_end, adjust)
+            if not df.empty:
+                self.save_quotes(df, mode="append")
+            result = df
 
-        # 本地没有，从网络拉（带重试）
-        df, source = self._fetch_single_with_retry(symbol, start_date, end_date, adjust)
-        if not df.empty:
-            self.save_quotes(df, mode="append")
-        return df
+        # Issue #3: 停牌日填充
+        if fill_suspend and not result.empty:
+            result = self._fill_suspend_dates(result, start_date, end_date)
+
+        return result
 
     # ──────────────────────────────────────────────────────────
     # 财务数据（PIT 约束）

@@ -30,7 +30,7 @@ from scripts.data_engine import DataEngine, detect_board, detect_limit, build_ts
 # 数据验证器
 from scripts.data_validator import DataValidator
 
-__version__ = "3.0.0"
+__version__ = "3.1.0"
 __all__ = [
     # 数据类
     "Order", "Trade", "OrderStatus", "OrderSide",
