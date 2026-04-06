@@ -15,13 +15,11 @@ logger.add(sys.stdout, format="<green>{time:HH:mm:ss}</green> | <level>{level: <
 logger.add(project_root / "logs" / "v2_{time}.log", rotation="10 MB", retention="7 days", level="DEBUG")
 
 from scripts.data_classes import TradingCostConfig
-from scripts.execution_engine import ExecutionEngine
-from scripts.trading_utils import TradingFilter, DelistingMonitor, STMonitor
-from scripts.dynamic_universe import DynamicUniverse, UniverseConfig
+from scripts.execution_engine_v3 import ExecutionEngineV3, CashAccount, Position
 from scripts.pit_aligner import PITDataAligner
-from scripts.factor_engine import VectorizedFactorEngine, LongTableManager
 from scripts.performance import EnhancedPerformanceAnalyzer
 from scripts.data_engine import DataEngine
+from scripts.backtest_engine_v3 import ProductionBacktestEngine, BacktestConfig
 
 
 def setup():
@@ -35,60 +33,66 @@ def run_backtest(start="2022-01-01", end="2024-12-31", capital=1e7):
     """回测主流程"""
     logger.info(f"区间: {start} ~ {end}, 资金: {capital/1e7:.0f}千万")
     
-    # 1. 初始化
-    cost = TradingCostConfig()
-    exec_engine = ExecutionEngine(cost_config=cost, adv_limit=0.1)
-    filter = TradingFilter(exclude_st=True, min_listing_days=60, min_market_cap=5e8)
-    universe_cfg = UniverseConfig(min_market_cap=5e8, min_listing_days=60, top_n=500)
-    universe = DynamicUniverse(config=universe_cfg)
-    perf = EnhancedPerformanceAnalyzer(risk_free=0.03)
-    
-    logger.info("组件初始化完成")
-    
-    # 2. 数据准备（简化版）
-    logger.info("数据引擎初始化...")
+    # 1. 初始化组件
     data = DataEngine()
     
-    # 3. 生成测试数据验证流程
-    logger.info("\n生成测试数据验证...")
-    dates = pd.date_range(start, end, freq='B')
-    dates = [d for d in dates if d.weekday() < 5]
+    # 2. 配置回测引擎
+    config = BacktestConfig(
+        start_date=datetime.strptime(start, "%Y-%m-%d"),
+        end_date=datetime.strptime(end, "%Y-%m-%d"),
+        initial_capital=capital,
+    )
     
-    # 模拟持仓
-    positions = {'000001': 1000, '000002': 2000}
+    # 3. 简单策略：等权买入前N只
+    def simple_strategy(factor_data: pd.DataFrame, date: datetime) -> Dict[str, float]:
+        if factor_data.empty:
+            return {}
+        n = min(50, len(factor_data))
+        weight = 1.0 / n
+        return {sym: weight for sym in factor_data.index[:n]}
     
-    # 生成调仓日订单
-    signal_date = datetime(2023, 1, 31)
-    target = {'000001': 2000, '000003': 1000}
-    orders = exec_engine.generate_orders(target, positions, signal_date)
+    # 4. 运行回测
+    logger.info("启动回测引擎...")
+    engine = ProductionBacktestEngine(config=config, data_engine=data, factor_engine=None)
+    result = engine.run(simple_strategy)
     
-    logger.info(f"生成订单: {len(orders)}个")
-    for o in orders:
-        logger.info(f"  {o.side.value.upper()} {o.symbol} {o.target_shares}股 @ {o.execution_date.date()}")
+    if 'error' in result:
+        logger.error(f"回测失败: {result['error']}")
+        logger.info("使用模拟数据验证框架...")
+        _verify_with_mock_data()
+        return False
     
-    # 模拟成交
-    market = pd.DataFrame({
-        'symbol': ['000001', '000002', '000003'],
-        'open': [10.0, 20.0, 15.0],
-        'volume': [1e6, 2e6, 5e5],
-        'is_limit_up': [False, False, False],
-        'is_limit_down': [False, False, False],
-        'is_suspended': [False, False, False]
-    })
-    
-    trades, remaining = exec_engine.execute(orders, market, orders[0].execution_date)
-    logger.info(f"成交: {len(trades)}笔")
-    for t in trades:
-        logger.info(f"  {t.side.name} {t.symbol} {t.shares}股 @ {t.price:.2f}")
-    
-    # 4. 绩效计算
-    logger.info("\n绩效分析...")
-    returns = pd.Series([0.01, -0.005, 0.02] * 100)
-    metrics = perf.calculate(returns)
-    logger.info(perf.report(metrics))
-    
-    logger.info("\n✅ 验证完成！v2.0框架可正常运行")
+    perf = result.get('performance', {})
+    logger.info(f"总收益: {perf.get('total_return', 0):.2%}")
+    logger.info(f"夏普: {perf.get('sharpe_ratio', 0):.2f}")
+    logger.info(f"最大回撤: {perf.get('max_drawdown', 0):.2%}")
+    logger.info(f"交易笔数: {result.get('trades', 0)}")
+    logger.info("回测完成!")
     return True
+
+
+def _verify_with_mock_data():
+    """使用模拟数据验证框架核心组件可运行"""
+    from scripts.trading_rules import AShareTradingRules, TradingCalendar
+    from scripts.survivorship_bias import SurvivorshipBiasHandler
+    
+    # 验证交易规则
+    rules_ok = AShareTradingRules.get_board('600000') == AShareTradingRules.BOARD_MAIN
+    rules_ok &= AShareTradingRules.get_price_limit('300001', datetime(2020, 8, 24)) == 0.20
+    
+    # 验证日历
+    cal = TradingCalendar()
+    cal_ok = not cal.is_trading_day(datetime(2024, 1, 1))  # 元旦
+    cal_ok &= cal.is_trading_day(datetime(2024, 1, 2))      # 周二
+    
+    # 验证执行引擎
+    engine = ExecutionEngineV3(initial_cash=1e6)
+    exec_ok = engine.cash.available == 1e6
+    
+    if rules_ok and cal_ok and exec_ok:
+        logger.info("框架核心组件验证通过")
+    else:
+        logger.warning("框架验证发现问题")
 
 
 if __name__ == "__main__":

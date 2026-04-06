@@ -21,6 +21,8 @@ import hashlib
 import warnings
 import random
 
+from loguru import logger
+
 warnings.filterwarnings("ignore")
 
 # ──────────────────────────────────────────────────────────────
@@ -69,7 +71,7 @@ class DataValidator:
         """
         基础数据验证
         
-        检查：价格 <= 0、涨跌幅异常(>20%)、成交量 < 0
+        检查：价格 <= 0、涨跌幅异常(>20% 按板块区分)、成交量 < 0
         """
         issues = []
         if df.empty:
@@ -88,9 +90,22 @@ class DataValidator:
                     "sample": bad[["ts_code", "trade_date", col]].head(3).to_dict("records")
                 })
 
-        # 涨跌幅异常
-        if "pct_chg" in df.columns:
-            abnormal = df[(df["pct_chg"].abs() > 20)]
+        # 涨跌幅异常（按板块区分：主板>10%为异常，创业板/科创板>20%，北交所>30%）
+        if "pct_chg" in df.columns and "ts_code" in df.columns:
+            def _max_pct(row):
+                code = str(row["ts_code"])[:6]
+                if code.startswith("688") or code.startswith("30"):
+                    return 20
+                elif code.startswith("4") or code.startswith("8"):
+                    return 30
+                else:
+                    return 10
+            
+            if hasattr(df, "pct_chg"):
+                max_pct = df.apply(_max_pct, axis=1)
+                abnormal = df[df["pct_chg"].abs() > max_pct]
+            else:
+                abnormal = df[(df["pct_chg"].abs() > 20)]
             if len(abnormal) > 0:
                 issues.append({
                     "type": "abnormal_change",
@@ -387,6 +402,42 @@ class DataEngine:
         conn.close()
 
     # ──────────────────────────────────────────────────────────
+    # 工具方法
+    # ──────────────────────────────────────────────────────────
+    @staticmethod
+    def _detect_limit(code: str) -> float:
+        """根据股票代码返回涨跌停幅度
+        
+        科创板(688): 20%, 创业板(30): 20%, 北交所(4/8): 30%, 主板: 10%
+        """
+        c = str(code).zfill(6)
+        if c.startswith("688"):
+            return 0.20
+        elif c.startswith("30"):
+            return 0.20
+        elif c.startswith("4") or c.startswith("8"):
+            return 0.30
+        else:
+            return 0.10
+    
+    @staticmethod
+    def _apply_limit_flags(df: pd.DataFrame, code: str, pct_col: str = "pct_chg") -> pd.DataFrame:
+        """统一应用涨跌停标记"""
+        limit_pct = DataEngine._detect_limit(code)
+        df["limit_up"] = df[pct_col] >= (limit_pct * 100 - 0.1)
+        df["limit_down"] = df[pct_col] <= -(limit_pct * 100 - 0.1)
+        return df
+    
+    @staticmethod
+    def _build_ts_code(symbol: str) -> str:
+        """构造 ts_code（上海/深圳）"""
+        sym6 = str(symbol).zfill(6)
+        if sym6.startswith(("6", "5", "9", "688")):
+            return f"{sym6}.SH"
+        else:
+            return f"{sym6}.SZ"
+    
+    # ──────────────────────────────────────────────────────────
     # 幸存者偏差处理
     # ──────────────────────────────────────────────────────────
     def get_all_stocks(self, include_delisted: bool = True) -> pd.DataFrame:
@@ -484,12 +535,14 @@ class DataEngine:
                 df["trade_date"] = pd.Timestamp.now()
                 df["out_date"] = pd.NaT
 
-                # 写入数据库
+                # 写入数据库（使用DataFrame注册为临时表再INSERT）
                 conn.execute(f"DELETE FROM index_constituents WHERE index_code = '{index_code}'")
+                conn.register('tmp_constituents', df)
                 conn.execute(f"""
                     INSERT INTO index_constituents (index_code, ts_code, trade_date, in_date, out_date)
-                    VALUES ('{index_code}', ?, ?, ?, NULL)
-                """, [list(df["ts_code"]), list(df["trade_date"]), list(df["in_date"])])
+                    SELECT '{index_code}', ts_code, trade_date, in_date, out_date
+                    FROM tmp_constituents
+                """)
                 print(f"[OK] Synced {len(df)} constituents for {index_code}")
         except Exception as e:
             print(f"[WARN] Failed to sync index constituents: {e}")
@@ -525,34 +578,49 @@ class DataEngine:
         
         记录每只股票何时被ST/解除ST，用于时间序列特征，
         严禁在T日过滤"未来的ST"。
+        
+        注意：daily_quotes 表没有 name 字段，需要从 stock_basic 表 JOIN 获取。
         """
         if not HAS_DUCKDB:
             return
 
         conn = duckdb.connect(str(self.db_path))
 
-        # 从日线数据中推断ST状态（name字段包含"ST"即为ST）
+        # 从 stock_basic 获取含 ST 的股票列表
         try:
-            conn.execute("""
+            # 先找到所有历史上曾是 ST 的股票
+            st_stocks = conn.execute("""
+                SELECT ts_code, name FROM stock_basic 
+                WHERE name LIKE '%ST%' OR name LIKE '%*ST%'
+            """).fetchdf()
+            
+            if st_stocks.empty:
+                conn.close()
+                return
+            
+            st_codes = st_stocks['ts_code'].tolist()
+            code_list = "','".join(st_codes)
+            
+            # 从日线数据推断 ST 状态变化
+            conn.execute(f"""
                 INSERT OR REPLACE INTO st_status_history
                 (ts_code, trade_date, is_st, is_new_st)
                 SELECT 
-                    ts_code,
-                    trade_date,
-                    CASE WHEN name LIKE '%ST%' OR name LIKE '%*ST%' THEN TRUE ELSE FALSE END as is_st,
-                    FALSE as is_new_st
+                    sub.ts_code,
+                    sub.trade_date,
+                    TRUE as is_st,
+                    CASE 
+                        WHEN sub.prev_st = 0 OR sub.prev_st IS NULL THEN TRUE 
+                        ELSE FALSE 
+                    END as is_new_st
                 FROM (
-                    SELECT ts_code, trade_date, name,
-                           LAG(CASE WHEN name LIKE '%ST%' OR name LIKE '%*ST%' THEN TRUE ELSE FALSE END, 1) OVER 
-                           (PARTITION BY ts_code ORDER BY trade_date) as prev_st
-                    FROM (
-                        SELECT ts_code, trade_date, name
-                        FROM daily_quotes d
-                        JOIN stock_basic s ON d.ts_code = s.ts_code
-                        WHERE s.name LIKE '%ST%' OR s.name LIKE '%*ST%'
-                    )
-                )
-                WHERE is_st = TRUE AND (prev_st IS NULL OR prev_st = FALSE)
+                    SELECT 
+                        d.ts_code,
+                        d.trade_date,
+                        LAG(1) OVER (PARTITION BY d.ts_code ORDER BY d.trade_date) as prev_st
+                    FROM daily_quotes d
+                    WHERE d.ts_code IN ('{code_list}')
+                ) sub
             """)
             print("[OK] Synced ST status history")
         except Exception as e:
@@ -652,17 +720,19 @@ class DataEngine:
         # 年报（4个财年）
         try:
             bs.login()
-            for year in range(start_year, end_year + 1):
-                rs = bs.query_profit_statements_per_year(
-                    bs_code=bs_code, year=str(year)
-                )
-                if rs and rs.error_code == "0":
-                    while rs.next():
-                        row = dict(zip(rs.fields, rs.get_row_data()))
-                        if row.get("profit_statements_pub_date"):
-                            records.append(self._bs_profit_row(row, symbol))
-                time.sleep(0.1)
-            bs.logout()
+            try:
+                for year in range(start_year, end_year + 1):
+                    rs = bs.query_profit_statements_per_year(
+                        bs_code=bs_code, year=str(year)
+                    )
+                    if rs and rs.error_code == "0":
+                        while rs.next():
+                            row = dict(zip(rs.fields, rs.get_row_data()))
+                            if row.get("profit_statements_pub_date"):
+                                records.append(self._bs_profit_row(row, symbol))
+                    time.sleep(0.1)
+            finally:
+                bs.logout()
         except Exception:
             pass
 
@@ -863,19 +933,8 @@ class DataEngine:
             df["pre_close"] = df["close"].shift(1)
             df["is_suspend"] = df["volume"] == 0
             
-            # 多层次涨跌停判定（替代硬编码9.9%）
-            code = symbol.zfill(6)
-            if code.startswith("688"):      # 科创板
-                limit_pct = 0.20
-            elif code.startswith("30"):    # 创业板
-                limit_pct = 0.20
-            elif code.startswith("4") or code.startswith("8"):  # 北交所
-                limit_pct = 0.30
-            else:                          # 主板
-                limit_pct = 0.10
-            
-            df["limit_up"] = df["pct_chg"] >= (limit_pct * 100 - 0.1)
-            df["limit_down"] = df["pct_chg"] <= -(limit_pct * 100 - 0.1)
+            # 涨跌停判定（使用统一方法）
+            df = self._apply_limit_flags(df, symbol)
             df["data_source"] = "akshare"
 
             # 计算复权因子
@@ -1061,19 +1120,8 @@ class DataEngine:
             df["pre_close"] = df["close"].shift(1)
             df["is_suspend"] = df["volume"] == 0
             
-            # 多层次涨跌停判定
-            code = symbol.zfill(6)
-            if code.startswith("688"):
-                limit_pct = 0.20
-            elif code.startswith("30"):
-                limit_pct = 0.20
-            elif code.startswith("4") or code.startswith("8"):
-                limit_pct = 0.30
-            else:
-                limit_pct = 0.10
-            
-            df["limit_up"] = df["pct_chg"] >= (limit_pct * 100 - 0.1)
-            df["limit_down"] = df["pct_chg"] <= -(limit_pct * 100 - 0.1)
+            # 涨跌停判定
+            df = self._apply_limit_flags(df, symbol)
             df["data_source"] = "akshare"
 
             # 复权因子
@@ -1150,19 +1198,8 @@ class DataEngine:
             df["amount"] = df["amount"].astype(float)
             df["is_suspend"] = df["volume"] == 0
             
-            # 多层次涨跌停判定
-            code = symbol.zfill(6)
-            if code.startswith("688"):
-                limit_pct = 0.20
-            elif code.startswith("30"):
-                limit_pct = 0.20
-            elif code.startswith("4") or code.startswith("8"):
-                limit_pct = 0.30
-            else:
-                limit_pct = 0.10
-            
-            df["limit_up"] = df["pct_chg"] >= (limit_pct * 100 - 0.1)
-            df["limit_down"] = df["pct_chg"] <= -(limit_pct * 100 - 0.1)
+            # 涨跌停判定
+            df = self._apply_limit_flags(df, symbol)
             df["data_source"] = "baostock"
             df["adj_factor"] = 1.0
             df["turnover"] = 0.0
@@ -1349,59 +1386,60 @@ class DataEngine:
         if not HAS_BAOSTOCK:
             return
 
-        bs.login()
-        for sym in symbols[:20]:  # 抽样20只
-            sym6 = str(sym).zfill(6)
-            bs_code = f"sh.{sym6}" if sym6.startswith("6") else f"sz.{sym6}"
+        try:
+            bs.login()
+            for sym in symbols[:20]:  # 抽样20只
+                sym6 = str(sym).zfill(6)
+                bs_code = f"sh.{sym6}" if sym6.startswith("6") else f"sz.{sym6}"
 
-            # AkShare 数据
-            ak_data = self.query(f"""
-                SELECT pct_chg FROM daily_quotes
-                WHERE ts_code LIKE '{sym6}%'
-                AND trade_date = '{trade_date}'
-                LIMIT 1
-            """)
-            if ak_data.empty:
-                continue
-
-            # Baostock 数据
-            try:
-                rs = bs.query_history_k_data_plus(
-                    bs_code, "date,pctChg",
-                    start_date=trade_date.replace("-", ""),
-                    end_date=trade_date.replace("-", ""),
-                    frequency="d"
-                )
-                if rs is None or rs.error_code != "0":
+                # AkShare 数据
+                ak_data = self.query(f"""
+                    SELECT pct_chg FROM daily_quotes
+                    WHERE ts_code LIKE '{sym6}%'
+                    AND trade_date = '{trade_date}'
+                    LIMIT 1
+                """)
+                if ak_data.empty:
                     continue
 
-                bs_pct = None
-                while rs.next():
-                    row = rs.get_row_data()
-                    if row[1]:
-                        bs_pct = float(row[1])
-                        break
+                # Baostock 数据
+                try:
+                    rs = bs.query_history_k_data_plus(
+                        bs_code, "date,pctChg",
+                        start_date=trade_date.replace("-", ""),
+                        end_date=trade_date.replace("-", ""),
+                        frequency="d"
+                    )
+                    if rs is None or rs.error_code != "0":
+                        continue
 
-                if bs_pct is None:
-                    continue
+                    bs_pct = None
+                    while rs.next():
+                        row = rs.get_row_data()
+                        if row[1]:
+                            bs_pct = float(row[1])
+                            break
 
-                ak_pct = ak_data["pct_chg"].iloc[0]
-                diff = abs(ak_pct - bs_pct)
+                    if bs_pct is None:
+                        continue
 
-                if diff > 0.5:  # 偏差超过 0.5%
-                    stats["cross_validate_errors"] += 1
-                    conn = duckdb.connect(str(self.db_path))
-                    conn.execute(f"""
-                        INSERT INTO data_quality_alert
-                        (alert_type, ts_code, trade_date, detail)
-                        VALUES ('cross_validate', '{sym6}', '{trade_date}',
-                                'AkShare={ak_pct:.2f}% vs Baostock={bs_pct:.2f}%, diff={diff:.2f}%')
-                    """)
-                    conn.close()
-            except Exception:
-                pass
+                    ak_pct = ak_data["pct_chg"].iloc[0]
+                    diff = abs(ak_pct - bs_pct)
 
-        bs.logout()
+                    if diff > 0.5:  # 偏差超过 0.5%
+                        stats["cross_validate_errors"] += 1
+                        conn = duckdb.connect(str(self.db_path))
+                        conn.execute(f"""
+                            INSERT INTO data_quality_alert
+                            (alert_type, ts_code, trade_date, detail)
+                            VALUES ('cross_validate', '{sym6}', '{trade_date}',
+                                    'AkShare={ak_pct:.2f}% vs Baostock={bs_pct:.2f}%, diff={diff:.2f}%')
+                        """)
+                        conn.close()
+                except Exception as e:
+                    logger.debug(f"Cross-validate error for {sym6}: {e}")
+        finally:
+            bs.logout()
 
     # ──────────────────────────────────────────────────────────
     # 单股数据提取
@@ -1562,11 +1600,11 @@ class DataEngine:
 
         code_list = "','".join(ts_codes)
 
-        # 构建窗口函数SQL
+        # 构建窗口函数SQL（使用复利乘积计算滚动收益率）
         window_parts = []
         for w in windows:
             window_parts.append(f"""
-                ROUND(MAX(CASE WHEN rn = {w} THEN pct_chg ELSE NULL END) OVER (PARTITION BY ts_code ORDER BY trade_date ROWS BETWEEN {w-1} PRECEDING AND CURRENT ROW), 4) as window_{w}
+                ROUND(EXP(SUM(LN(1 + pct_chg / 100.0)) OVER (PARTITION BY ts_code ORDER BY trade_date ROWS BETWEEN {w-1} PRECEDING AND CURRENT ROW)) - 1, 4) as window_{w}
             """)
 
         sql = f"""

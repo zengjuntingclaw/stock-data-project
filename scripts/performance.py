@@ -34,12 +34,14 @@ class EnhancedPerformanceAnalyzer:
     def _dd_days(self, r: pd.Series) -> int:
         cum, running_max = (1 + r).cumprod(), r.cumprod().expanding().max()
         dd = (cum - running_max) / running_max
-        max_d, in_d, start = 0, False, 0
-        for i, d in enumerate(dd):
-            if d < 0 and not in_d: in_d, start = True, i
-            elif d == 0 and in_d: max_d = max(max_d, i - start); in_d = False
-        if in_d: max_d = max(max_d, len(dd) - start)
-        return max_d
+        if dd.empty:
+            return 0
+        # 向量化计算：标记回撤区间
+        is_dd = dd < 0
+        # 计算回撤持续天数
+        dd_groups = (~is_dd).cumsum()
+        dd_days = is_dd.groupby(dd_groups).sum()
+        return int(dd_days.max()) if len(dd_days) > 0 else 0
     
     def _beta_alpha(self, r: pd.Series, b: pd.Series) -> Tuple[float, float]:
         X = np.column_stack([np.ones(len(b)), b])

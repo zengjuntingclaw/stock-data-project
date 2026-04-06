@@ -25,8 +25,8 @@ class Position:
     available_shares: int = 0          # 可卖数量（T+1）
     avg_cost: float = 0.0              # 平均成本
     
-    @property
     def market_value(self, price: float) -> float:
+        """计算持仓市值（普通方法，@property不支持传入参数）"""
         return self.shares * price
 
 
@@ -41,12 +41,15 @@ class CashAccount:
     # 待结算资金队列: [(settle_date, amount), ...]
     pending_settlements: List[Tuple[datetime, float]] = field(default_factory=list)
     
+    # 待转为可取资金的队列: [(withdrawable_date, amount), ...]
+    # T+1卖出 → T+2才可取
+    pending_withdrawals: List[Tuple[datetime, float]] = field(default_factory=list)
+    
     def update_settlements(self, current_date: datetime):
         """更新T+1资金结算
         
         T+1规则：卖出股票所得资金
         - T+1日：资金可用（可买股票）
-        - T+1日：资金不可取（不能提现）
         - T+2日：资金可取（能提现）
         """
         new_pending = []
@@ -54,11 +57,21 @@ class CashAccount:
             if settle_date <= current_date:
                 # T+1日：资金可用（可买股票）
                 self.available += amount
-                # 注意：withdrawable（可取资金）在T+1日仍不可用
-                # 需要再过一天才能取
+                # 资金T+2日可取，加入待取队列
+                withdrawable_date = settle_date + timedelta(days=1)
+                self.pending_withdrawals.append((withdrawable_date, amount))
             else:
                 new_pending.append((settle_date, amount))
         self.pending_settlements = new_pending
+        
+        # 处理可取资金（T+2日释放）
+        new_withdrawals = []
+        for withdrawable_date, amount in self.pending_withdrawals:
+            if withdrawable_date <= current_date:
+                self.withdrawable += amount
+            else:
+                new_withdrawals.append((withdrawable_date, amount))
+        self.pending_withdrawals = new_withdrawals
 
 
 class ExecutionEngineV3:
@@ -180,6 +193,9 @@ class ExecutionEngineV3:
         """
         # 更新资金结算
         self.cash.update_settlements(current_date)
+        
+        # T+1持仓可卖数量更新（在每日开始时释放昨日买入的冻结）
+        self.update_position_available(current_date)
         
         trades = []
         remaining = []
@@ -347,8 +363,7 @@ class ExecutionEngineV3:
             total_cost_basis = pos.avg_cost * pos.shares + trade.shares * trade.price
             pos.shares += trade.shares
             pos.avg_cost = total_cost_basis / pos.shares if pos.shares > 0 else 0
-            # 买入的股票当日不可卖（T+1）
-            # available_shares 不变
+            # 买入的股票当日不可卖（T+1），次日结算时由 update_position_available 释放
             
         else:
             # 卖出：减少持仓，资金T+1可用
@@ -367,6 +382,20 @@ class ExecutionEngineV3:
             
             # 总资产减少手续费
             self.cash.total -= (trade.commission + trade.stamp_tax + trade.slippage)
+    
+    def update_position_available(self, current_date: datetime):
+        """T+1持仓可卖数量更新
+        
+        买入的股票在下一个交易日变为可卖状态。
+        所有持仓的 available_shares 应在 T+1 日同步为 shares（减去今日新买入的部分）。
+        """
+        for sym, pos in self.positions.items():
+            # available_shares 应始终等于 shares 减去今日买入的
+            # 简化处理：每日结算时同步 available_shares = shares
+            # 因为买入是在 execute 时执行，下一个交易日才释放
+            # 但如果今日有卖出，available_shares 已经被减少
+            # 所以正确的逻辑是：每个交易日开始时，把昨天的冻结释放
+            pos.available_shares = pos.shares
     
     def get_portfolio_value(self, prices: Dict[str, float]) -> Dict[str, float]:
         """获取组合市值"""

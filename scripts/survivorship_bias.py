@@ -77,34 +77,36 @@ class SurvivorshipBiasHandler:
                 logger.error(f"Baostock login failed: {lg.error_msg}")
                 return
             
-            for year in range(start_year, end_year + 1):
-                # 查询每年最后一个交易日的所有股票
-                rs = bs.query_all_stock(day=f"{year}-12-31")
-                if rs.error_code != '0':
-                    continue
-                
-                while (rs.error_code == '0') & rs.next():
-                    row = rs.get_row_data()
-                    symbol = row[0].split('.')[1]  # sh.600000 -> 600000
+            try:
+                for year in range(start_year, end_year + 1):
+                    # 查询每年最后一个交易日的所有股票
+                    rs = bs.query_all_stock(day=f"{year}-12-31")
+                    if rs.error_code != '0':
+                        continue
                     
-                    if symbol not in self._stocks:
-                        # 查询股票基本信息
-                        rs_detail = bs.query_stock_basic(code=row[0])
-                        if rs_detail.error_code == '0' and rs_detail.next():
-                            detail = rs_detail.get_row_data()
-                            self._stocks[symbol] = StockLifetime(
-                                symbol=symbol,
-                                name=detail[1],
-                                list_date=pd.to_datetime(detail[6]) if detail[6] else pd.Timestamp(f"{year}-01-01"),
-                                delist_date=pd.to_datetime(detail[7]) if detail[7] else None,
-                                board=self._detect_board(symbol),
-                            )
-                            
-                            if detail[7]:  # 有退市日期
-                                self._delisted.add(symbol)
-            
-            bs.logout()
-            logger.info(f"Loaded {len(self._stocks)} stocks from Baostock ({len(self._delisted)} delisted)")
+                    while (rs.error_code == '0') & rs.next():
+                        row = rs.get_row_data()
+                        symbol = row[0].split('.')[1]  # sh.600000 -> 600000
+                        
+                        if symbol not in self._stocks:
+                            # 查询股票基本信息
+                            rs_detail = bs.query_stock_basic(code=row[0])
+                            if rs_detail.error_code == '0' and rs_detail.next():
+                                detail = rs_detail.get_row_data()
+                                self._stocks[symbol] = StockLifetime(
+                                    symbol=symbol,
+                                    name=detail[1],
+                                    list_date=pd.to_datetime(detail[6]) if detail[6] else pd.Timestamp(f"{year}-01-01"),
+                                    delist_date=pd.to_datetime(detail[7]) if detail[7] else None,
+                                    board=self._detect_board(symbol),
+                                )
+                                
+                                if detail[7]:  # 有退市日期
+                                    self._delisted.add(symbol)
+                
+                logger.info(f"Loaded {len(self._stocks)} stocks from Baostock ({len(self._delisted)} delisted)")
+            finally:
+                bs.logout()
             
         except Exception as e:
             logger.error(f"Failed to load from Baostock: {e}")
