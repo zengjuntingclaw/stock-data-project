@@ -112,15 +112,9 @@ class SurvivorshipBiasHandler:
             logger.error(f"Failed to load from Baostock: {e}")
     
     def _detect_board(self, symbol: str) -> str:
-        """识别板块"""
-        import re
-        if re.match(r'^68[0-9]{5}$', symbol):
-            return '科创板'
-        elif re.match(r'^30[0-9]{5}$', symbol):
-            return '创业板'
-        elif re.match(r'^8[0-9]{5}$|^4[0-9]{5}$', symbol):
-            return '北交所'
-        return '主板'
+        """识别板块（委托到公共函数）"""
+        from scripts.data_engine import detect_board
+        return detect_board(symbol)
     
     def get_universe(
         self,

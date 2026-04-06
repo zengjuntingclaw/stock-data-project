@@ -25,7 +25,7 @@ from scripts.backtest_engine_v3 import ProductionBacktestEngine, BacktestConfig
 from scripts.performance import EnhancedPerformanceAnalyzer, BrinsonAttribution
 
 # 数据引擎（v1兼容）
-from scripts.data_engine import DataEngine
+from scripts.data_engine import DataEngine, detect_board, detect_limit, build_ts_code
 
 __version__ = "3.0.0"
 __all__ = [
@@ -45,5 +45,5 @@ __all__ = [
     # 绩效分析
     "EnhancedPerformanceAnalyzer", "BrinsonAttribution",
     # 数据引擎
-    "DataEngine",
+    "DataEngine", "detect_board", "detect_limit", "build_ts_code",
 ]

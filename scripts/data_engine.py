@@ -18,13 +18,24 @@ from typing import Optional, List, Dict, Union, Literal, Tuple
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
-import hashlib
 import warnings
 import random
 
 from loguru import logger
 
 warnings.filterwarnings("ignore")
+
+# ──────────────────────────────────────────────────────────────
+# 全局常量
+# ──────────────────────────────────────────────────────────────
+DEFAULT_START_DATE = "2018-01-01"     # 默认数据起始日期
+DEFAULT_ADJ_TOLERANCE = 0.005         # 交叉验证容差 0.5%
+DEFAULT_SAMPLE_RATIO = 0.05           # 交叉验证抽样比例 5%
+DEFAULT_ADJ_CHANGE_THRESHOLD = 0.05   # 复权因子变化告警阈值 5%
+DEFAULT_LIMIT_TOLERANCE = 0.01        # 涨跌停判定容差 0.01%
+DEFAULT_MAX_WORKERS = 12              # 默认多线程数
+DEFAULT_FETCH_DELAY = 0.2             # 默认请求延迟(秒)
+DEFAULT_MAX_RETRIES = 3               # 默认最大重试次数
 
 # ──────────────────────────────────────────────────────────────
 # 依赖导入
@@ -53,6 +64,53 @@ except ImportError:
     bs = None
     from loguru import logger as _fallback_logger
     _fallback_logger.warning("baostock not installed. Run: pip install baostock")
+
+
+# ──────────────────────────────────────────────────────────────
+# 公共工具函数
+# ──────────────────────────────────────────────────────────────
+
+def detect_board(symbol: str) -> str:
+    """根据股票代码识别板块（统一实现，供所有模块复用）
+    
+    科创板(688xxx): 科创板, 创业板(30xxxx): 创业板,
+    北交所(8xxxxx/4xxxxx): 北交所, 其余: 主板
+    """
+    import re
+    s = str(symbol).zfill(6)
+    if re.match(r'^688[0-9]{3}$', s):
+        return '科创板'
+    elif re.match(r'^30[0-9]{4}$', s):
+        return '创业板'
+    elif re.match(r'^8[0-9]{5}$', s) or re.match(r'^4[0-9]{5}$', s):
+        return '北交所'
+    else:
+        return '主板'
+
+
+def detect_limit(code: str) -> float:
+    """根据股票代码返回涨跌停幅度（统一实现）
+    
+    科创板(688): 20%, 创业板(30): 20%, 北交所(4/8): 30%, 主板: 10%
+    """
+    c = str(code).zfill(6)
+    if c.startswith("688"):
+        return 0.20
+    elif c.startswith("30"):
+        return 0.20
+    elif c.startswith("4") or c.startswith("8"):
+        return 0.30
+    else:
+        return 0.10
+
+
+def build_ts_code(symbol: str) -> str:
+    """构造 ts_code（上海/深圳）（统一实现）"""
+    sym6 = str(symbol).zfill(6)
+    if sym6.startswith(("6", "5", "9", "688")):
+        return f"{sym6}.SH"
+    else:
+        return f"{sym6}.SZ"
 
 
 # ──────────────────────────────────────────────────────────────
@@ -98,18 +156,11 @@ class DataValidator:
         if "pct_chg" in df.columns and "ts_code" in df.columns:
             def _max_pct(row):
                 code = str(row["ts_code"])[:6]
-                if code.startswith("688") or code.startswith("30"):
-                    return 20
-                elif code.startswith("4") or code.startswith("8"):
-                    return 30
-                else:
-                    return 10
+                return detect_limit(code) * 100
             
             if hasattr(df, "pct_chg"):
                 max_pct = df.apply(_max_pct, axis=1)
                 abnormal = df[df["pct_chg"].abs() > max_pct]
-            else:
-                abnormal = df[(df["pct_chg"].abs() > 20)]
             if len(abnormal) > 0:
                 issues.append({
                     "type": "abnormal_change",
@@ -128,8 +179,8 @@ class DataValidator:
     def cross_validate(self,
                        primary: pd.DataFrame,
                        secondary: pd.DataFrame,
-                       tolerance: float = 0.005,
-                       sample_ratio: float = 0.05) -> Dict:
+                       tolerance: float = DEFAULT_ADJ_TOLERANCE,
+                       sample_ratio: float = DEFAULT_SAMPLE_RATIO) -> Dict:
         """
         多源交叉验证
         
@@ -433,36 +484,21 @@ class DataEngine:
     # ──────────────────────────────────────────────────────────
     @staticmethod
     def _detect_limit(code: str) -> float:
-        """根据股票代码返回涨跌停幅度
-        
-        科创板(688): 20%, 创业板(30): 20%, 北交所(4/8): 30%, 主板: 10%
-        """
-        c = str(code).zfill(6)
-        if c.startswith("688"):
-            return 0.20
-        elif c.startswith("30"):
-            return 0.20
-        elif c.startswith("4") or c.startswith("8"):
-            return 0.30
-        else:
-            return 0.10
+        """根据股票代码返回涨跌停幅度（委托到公共函数）"""
+        return detect_limit(code)
     
     @staticmethod
     def _apply_limit_flags(df: pd.DataFrame, code: str, pct_col: str = "pct_chg") -> pd.DataFrame:
         """统一应用涨跌停标记（容差0.01%避免浮点误差）"""
-        limit_pct = DataEngine._detect_limit(code)
+        limit_pct = detect_limit(code)
         df["limit_up"] = df[pct_col] >= (limit_pct * 100 - 0.01)
         df["limit_down"] = df[pct_col] <= -(limit_pct * 100 - 0.01)
         return df
     
     @staticmethod
     def _build_ts_code(symbol: str) -> str:
-        """构造 ts_code（上海/深圳）"""
-        sym6 = str(symbol).zfill(6)
-        if sym6.startswith(("6", "5", "9", "688")):
-            return f"{sym6}.SH"
-        else:
-            return f"{sym6}.SZ"
+        """构造 ts_code（委托到公共函数）"""
+        return build_ts_code(symbol)
     
     # ──────────────────────────────────────────────────────────
     # 幸存者偏差处理
@@ -487,9 +523,9 @@ class DataEngine:
             current["list_date"] = pd.NaT
             current["delist_date"] = pd.NaT
             stocks.append(current)
-            print(f"[INFO] Current stocks: {len(current)}")
-        except Exception as e:
-            print(f"[WARN] Failed to fetch current stocks: {e}")
+            logger.info(f"Current stocks: {len(current)}")
+        except (ValueError, KeyError, RuntimeError) as e:
+            logger.warning(f"Failed to fetch current stocks: {e}")
 
         # 2. 退市股票（关键：解决幸存者偏差）
         if include_delisted:
@@ -503,9 +539,9 @@ class DataEngine:
                     dl["total_mv"] = np.nan
                     dl["circ_mv"] = np.nan
                     stocks.append(dl)
-                    print(f"[INFO] Delisted stocks: {len(dl)}")
-            except Exception as e:
-                print(f"[WARN] Failed to fetch delisted stocks: {e}")
+                    logger.info(f"Delisted stocks: {len(dl)}")
+            except (ValueError, KeyError, RuntimeError) as e:
+                logger.warning(f"Failed to fetch delisted stocks: {e}")
 
         if not stocks:
             return self._get_local_stocks()
@@ -514,25 +550,9 @@ class DataEngine:
         df = df.drop_duplicates(subset=["symbol"], keep="first")
 
         # 构造 ts_code
-        df["ts_code"] = df["symbol"].apply(
-            lambda x: f"{str(x).zfill(6)}.SH" if str(x).startswith(("6", "5", "9"))
-            else f"{str(x).zfill(6)}.SZ"
-        )
+        df["ts_code"] = df["symbol"].apply(build_ts_code)
 
-        # 判断市场
-        def _market(s):
-            c = str(s).zfill(6)
-            if c.startswith("688"):
-                return "科创板"
-            if c.startswith("8") or c.startswith("4"):
-                return "北交所"
-            if c.startswith("3"):
-                return "创业板"
-            if c.startswith("002"):
-                return "中小板"
-            return "主板"
-
-        df["market"] = df["symbol"].apply(_market)
+        df["market"] = df["symbol"].apply(detect_board)
         return df
 
     # ──────────────────────────────────────────────────────────
@@ -549,31 +569,30 @@ class DataEngine:
             return
 
         with self.get_connection() as conn:
+            # 获取历史成分股（AkShare提供）
+            try:
+                if index_code == "000300.SH":
+                    # 沪深300成分股
+                    df = ak.index_stock_cons_csindex(symbol="000300")
+                    if df.empty:
+                        return
+                    df.columns = ["ts_code", "name", "in_date"]
+                    df["index_code"] = index_code
+                    df["trade_date"] = pd.Timestamp.now()
+                    df["out_date"] = pd.NaT
 
-        # 获取历史成分股（AkShare提供）
-        try:
-            if index_code == "000300.SH":
-                # 沪深300成分股
-                df = ak.index_stock_cons_csindex(symbol="000300")
-                if df.empty:
-                    return
-                df.columns = ["ts_code", "name", "in_date"]
-                df["index_code"] = index_code
-                df["trade_date"] = pd.Timestamp.now()
-                df["out_date"] = pd.NaT
-
-                # 写入数据库（使用DataFrame注册为临时表再INSERT，参数化查询防止SQL注入）
-                conn.execute("DELETE FROM index_constituents WHERE index_code = ?", [index_code])
-                df["index_code"] = index_code
-                conn.register('tmp_constituents', df)
-                conn.execute("""
-                    INSERT INTO index_constituents (index_code, ts_code, trade_date, in_date, out_date)
-                    SELECT index_code, ts_code, trade_date, in_date, out_date
-                    FROM tmp_constituents
-                """)
-                print(f"[OK] Synced {len(df)} constituents for {index_code}")
-        except Exception as e:
-            print(f"[WARN] Failed to sync index constituents: {e}")
+                    # 写入数据库（使用DataFrame注册为临时表再INSERT，参数化查询防止SQL注入）
+                    conn.execute("DELETE FROM index_constituents WHERE index_code = ?", [index_code])
+                    df["index_code"] = index_code
+                    conn.register('tmp_constituents', df)
+                    conn.execute("""
+                        INSERT INTO index_constituents (index_code, ts_code, trade_date, in_date, out_date)
+                        SELECT index_code, ts_code, trade_date, in_date, out_date
+                        FROM tmp_constituents
+                    """)
+                    logger.info(f"Synced {len(df)} constituents for {index_code}")
+            except Exception as e:
+                logger.warning(f"Failed to sync index constituents: {e}")
 
     def get_universe_at_date(self, index_code: str, trade_date: str) -> List[str]:
         """
@@ -647,9 +666,9 @@ class DataEngine:
                     ) sub
                 """)
                 conn.execute("DROP VIEW tmp_st_codes")
-                print("[OK] Synced ST status history")
-            except Exception as e:
-                print(f"[WARN] Failed to sync ST status: {e}")
+                logger.info("Synced ST status history")
+            except (ValueError, KeyError, RuntimeError) as e:
+                logger.warning(f"Failed to sync ST status: {e}")
 
     def is_st_at_date(self, ts_code: str, trade_date: str) -> bool:
         """检查某股票在某日期是否为ST
@@ -687,7 +706,7 @@ class DataEngine:
         """
         stats = {"success": 0, "failed": 0, "records": 0, "errors": []}
         if not HAS_AKSHARE:
-            print("[WARN] AkShare not available, financial fetch skipped")
+            logger.warning("AkShare not available, financial fetch skipped")
             return stats
 
         end_year = end_year or datetime.now().year
@@ -726,11 +745,11 @@ class DataEngine:
                 else:
                     stats["failed"] += 1
                 if done % 200 == 0:
-                    print(f"[PROGRESS] Financial: {done}/{len(symbols)} "
+                    logger.info(f"Financial progress: {done}/{len(symbols)} "
                           f"success={stats['success']} failed={stats['failed']}")
                 time.sleep(0.2)
 
-        print(f"[OK] Financial data done. success={stats['success']} "
+        logger.info(f"Financial data done. success={stats['success']} "
               f"failed={stats['failed']} records={stats['records']}")
         return stats
 
@@ -867,7 +886,7 @@ class DataEngine:
 
         # Baostock 补充 list_date / delist_date
         if HAS_BAOSTOCK:
-            print("[INFO] Enriching list/delist dates from Baostock...")
+            logger.info("Enriching list/delist dates from Baostock...")
             try:
                 bs.login()
                 try:
@@ -890,8 +909,8 @@ class DataEngine:
                         df["delist_date"] = df["symbol"].map(delist_map).pipe(
                             lambda s: pd.to_datetime(s, errors="coerce")
                         )
-            except Exception as e:
-                print(f"[WARN] Baostock list_date enrichment failed: {e}")
+            except (ValueError, KeyError, RuntimeError) as e:
+                logger.warning(f"Baostock list_date enrichment failed: {e}")
 
         # 写入基本信息
         cols = ["ts_code", "symbol", "name", "industry", "market",
@@ -908,7 +927,7 @@ class DataEngine:
             )
         finally:
             conn.close()
-        print(f"[OK] Synced {len(df)} stocks to database "
+        logger.info(f"Synced {len(df)} stocks to database "
               f"(list_date filled: {df['list_date'].notna().sum()})")
 
     # ──────────────────────────────────────────────────────────
@@ -991,7 +1010,7 @@ class DataEngine:
             # 验证
             val = self.validator.validate(df)
             if not val["ok"]:
-                print(f"[WARN] Data validation issues for {symbol}: {val['issues']}")
+                logger.warning(f"Data validation issues for {symbol}: {val['issues']}")
 
             cols = ["ts_code", "trade_date", "open", "high", "low", "close",
                     "pre_close", "volume", "amount", "pct_chg", "turnover",
@@ -999,7 +1018,8 @@ class DataEngine:
             return df[[c for c in cols if c in df.columns]]
 
         except Exception as e:
-            print(f"[ERROR] Failed to fetch {symbol}: {e}")
+        except (ValueError, KeyError, RuntimeError, ConnectionError) as e:
+            logger.error(f"Failed to fetch {symbol}: {e}")
             return pd.DataFrame()
 
     def save_quotes(self, df: pd.DataFrame, mode: str = "append"):
@@ -1097,7 +1117,7 @@ class DataEngine:
                                  start_date: str,
                                  end_date: str,
                                  adjust: Literal["qfq", "hfq", ""] = "qfq",
-                                 max_retries: int = 3) -> Tuple[pd.DataFrame, str]:
+                                 max_retries: int = DEFAULT_MAX_RETRIES) -> Tuple[pd.DataFrame, str]:
         """
         带指数退避重试的抓取（AkShare → Baostock → 失败）
         
@@ -1185,7 +1205,7 @@ class DataEngine:
             cols = ["ts_code", "trade_date", "open", "high", "low", "close",
                     "pre_close", "volume", "amount", "pct_chg", "turnover",
                     "adj_factor", "is_suspend", "limit_up", "limit_down", "data_source"]
-            return df[[c for c in cols if c in df.columns]].copy()
+            return df[[c for c in cols if c in df.columns]]
         except Exception as e:
             logger.debug(f"AkShare fetch failed for {symbol}: {e}")
             return pd.DataFrame()
@@ -1195,7 +1215,7 @@ class DataEngine:
                         start_date: str,
                         end_date: str,
                         adjust: Literal["qfq", "hfq", ""] = "qfq") -> pd.DataFrame:
-        """Baostock 抓取（备援用，login/logout 在调用方管理）"""
+        """Baostock 抓取（备援用，login/logout 在方法内部管理）"""
         if not HAS_BAOSTOCK:
             return pd.DataFrame()
         try:
@@ -1250,10 +1270,12 @@ class DataEngine:
             cols = ["ts_code", "trade_date", "open", "high", "low", "close",
                     "pre_close", "volume", "amount", "pct_chg", "turnover",
                     "adj_factor", "is_suspend", "limit_up", "limit_down", "data_source"]
-            return df[[c for c in cols if c in df.columns]].copy()
+            return df[[c for c in cols if c in df.columns]]
         except Exception as e:
             logger.debug(f"Baostock fetch failed for {symbol}: {e}")
-            return pd.DataFrame()(self,
+            return pd.DataFrame()
+
+    def update_daily_data(self,
                           symbols: List[str] = None,
                           adjust: Literal["qfq", "hfq", ""] = "qfq",
                           max_workers: int = 12,
@@ -1288,14 +1310,14 @@ class DataEngine:
         if latest_local:
             start_date = (pd.Timestamp(latest_local) + timedelta(days=1)).strftime("%Y-%m-%d")
         else:
-            start_date = "2018-01-01"
+            start_date = DEFAULT_START_DATE
 
         end_date = datetime.now().strftime("%Y-%m-%d")
         if start_date > end_date:
-            print("[INFO] Data is up-to-date.")
+            logger.info("Data is up-to-date.")
             return stats
 
-        print(f"[INFO] Incremental update: {start_date} ~ {end_date}, "
+        logger.info(f"Incremental update: {start_date} ~ {end_date}, "
               f"{len(symbols)} stocks, workers={max_workers}")
 
         def _download_one(sym: str) -> Tuple[str, pd.DataFrame, str, str]:
@@ -1347,7 +1369,7 @@ class DataEngine:
                         stats["errors"].append(f"{sym}: {err}")
 
                 if done % 200 == 0:
-                    print(f"[PROGRESS] {done}/{len(symbols)} ({done/len(symbols)*100:.1f}%) "
+                    logger.info(f"Progress: {done}/{len(symbols)} ({done/len(symbols)*100:.1f}%) "
                           f"success={stats['success']} failed={stats['failed']}")
                 time.sleep(delay)
 
@@ -1357,7 +1379,7 @@ class DataEngine:
 
         stats["elapsed_sec"] = time.time() - start_time
         rate = stats["success"] / stats["elapsed_sec"] if stats["elapsed_sec"] > 0 else 0
-        print(f"[OK] Done. success={stats['success']} failed={stats['failed']} "
+        logger.info(f"Update done. success={stats['success']} failed={stats['failed']} "
               f"records={stats['records']} time={stats['elapsed_sec']:.1f}s "
               f"({rate:.1f} stocks/s) dividend={stats['dividend_detected']} "
               f"validate_err={stats['cross_validate_errors']}")
@@ -1395,7 +1417,7 @@ class DataEngine:
 
         if old_adj > 0 and new_adj > 0:
             change_ratio = abs(new_adj / old_adj - 1)
-            if change_ratio > 0.05:  # 5% 以上变化
+            if change_ratio > DEFAULT_ADJ_CHANGE_THRESHOLD:  # 5% 以上变化
                 alert = {
                     "ts_code": ts_code,
                     "trade_date": new_data["trade_date"].iloc[0],
@@ -1512,7 +1534,7 @@ class DataEngine:
             symbol = str(code).zfill(6)
             ts_code = f"{symbol}.SH" if symbol.startswith(("6", "5", "9")) else f"{symbol}.SZ"
 
-        start_date = start_date or "2018-01-01"
+        start_date = start_date or DEFAULT_START_DATE
         end_date = end_date or datetime.now().strftime("%Y-%m-%d")
 
         # 查本地（参数化查询防止SQL注入）
@@ -1759,33 +1781,28 @@ class DataEngine:
         # 检查本地是否已有日历数据，有则跳过
         existing = self.query("SELECT COUNT(*) FROM trade_calendar WHERE is_open=TRUE")
         if existing.iloc[0, 0] > 100:
-            print(f"[INFO] Calendar exists ({existing.iloc[0, 0]} days), skip sync")
+            logger.info(f"Calendar exists ({existing.iloc[0, 0]} days), skip sync")
             return
 
         if not HAS_AKSHARE:
-            print("[INFO] AkShare unavailable, using existing calendar")
+            logger.info("AkShare unavailable, using existing calendar")
             return
 
-        print("[INFO] Fetching calendar from AkShare...")
+        logger.info("Fetching calendar from AkShare...")
         end_year = end_year or datetime.now().year
         with self.get_connection() as conn:
-
-        for year in range(start_year, end_year + 1):
-            try:
-                cal = ak.tool_trade_date_hist_sina()
-                cal.columns = ["cal_date", "is_open"]
-                cal["cal_date"] = pd.to_datetime(cal["cal_date"])
-                cal["pretrade_date"] = None
-                import tempfile, os as _os
-                tmpdir = self.db_path.parent / "_tmp_cal"
-                tmpdir.mkdir(exist_ok=True)
-                pq = tmpdir / "cal.parquet"
-                cal.to_parquet(str(pq), index=False)
-                conn.execute(f"COPY trade_calendar FROM '{pq}' (FORMAT PARQUET)")
-                _os.remove(pq)
-                print(f"[OK] Calendar {year} synced")
-            except Exception as e:
-                print(f"[WARN] Calendar {year} failed: {e}")
+            cal = ak.tool_trade_date_hist_sina()
+            cal.columns = ["cal_date", "is_open"]
+            cal["cal_date"] = pd.to_datetime(cal["cal_date"])
+            cal["pretrade_date"] = None
+            import os as _os
+            tmpdir = self.db_path.parent / "_tmp_cal"
+            tmpdir.mkdir(exist_ok=True)
+            pq = tmpdir / "cal.parquet"
+            cal.to_parquet(str(pq), index=False)
+            conn.execute(f"COPY trade_calendar FROM '{pq}' (FORMAT PARQUET)")
+            _os.remove(pq)
+            logger.info(f"Calendar synced: {len(cal)} days")
 
     def get_trade_dates(self,
                         start_date: str = None,
@@ -1825,7 +1842,7 @@ class DataEngine:
             raise ValueError(f"导出路径 '{output}' 不在允许的目录 '{self.parquet_dir}' 内")
         with self.get_connection() as conn:
             conn.execute(f"COPY (SELECT * FROM {table}) TO '{output}' (FORMAT PARQUET)")
-        print(f"[OK] Exported to {output}")
+        logger.info(f"Exported to {output}")
         return output
 
     def load_parquet(self, file_path: Path) -> pd.DataFrame:
