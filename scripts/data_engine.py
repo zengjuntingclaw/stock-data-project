@@ -1017,7 +1017,6 @@ class DataEngine:
                     "adj_factor", "is_suspend", "limit_up", "limit_down", "data_source"]
             return df[[c for c in cols if c in df.columns]]
 
-        except Exception as e:
         except (ValueError, KeyError, RuntimeError, ConnectionError) as e:
             logger.error(f"Failed to fetch {symbol}: {e}")
             return pd.DataFrame()
