@@ -13,9 +13,13 @@ from dataclasses import dataclass, asdict
 from enum import Enum
 import json
 import hashlib
+import threading
 import pandas as pd
 import numpy as np
 from loguru import logger
+
+# 延迟导入duckdb，避免循环依赖
+duckdb = None
 
 
 class DataVersionStatus(Enum):
@@ -130,15 +134,21 @@ class VersionedStorage:
         self._cache_ttl_seconds = 3600  # 1小时TTL
         self._cache_last_cleanup = datetime.now()
         
+        # 连接池（复用连接减少开销）
+        global duckdb
+        if duckdb is None:
+            import duckdb as _duckdb
+            duckdb = _duckdb
+        self._connection_pool: List = []
+        self._connection_pool_max = 5
+        self._connection_pool_lock = threading.Lock()
+        
         self._init_schema()
         logger.info(f"VersionedStorage initialized: {self.db_path}")
     
     def _init_schema(self):
         """初始化版本化存储表结构"""
-        import duckdb
-        
-        conn = duckdb.connect(str(self.db_path))
-        try:
+        with self._get_connection(read_only=False) as conn:
             # 版本化数据主表
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS versioned_data (
@@ -197,9 +207,6 @@ class VersionedStorage:
                     detail         VARCHAR
                 )
             """)
-            
-        finally:
-            conn.close()
     
     def store(self, 
               key: DataSnapshotKey, 
@@ -224,8 +231,6 @@ class VersionedStorage:
         -------
         DataSnapshot : 创建的快照对象
         """
-        import duckdb
-        
         # 获取下一个版本号
         next_version = self._get_next_version(key)
         
@@ -245,9 +250,8 @@ class VersionedStorage:
         if next_version > 1:
             self._supersede_previous(key, next_version)
         
-        # 写入数据库
-        conn = duckdb.connect(str(self.db_path))
-        try:
+        # 写入数据库 - 使用连接池
+        with self._get_connection(read_only=False) as conn:
             conn.execute("""
                 INSERT INTO versioned_data
                 (ts_code, data_type, trade_date, version, recorded_at, effective_at,
@@ -271,9 +275,6 @@ class VersionedStorage:
                 next_version - 1 if next_version > 1 else None,
                 next_version, 'insert', source
             ))
-            
-        finally:
-            conn.close()
         
         # 更新缓存 - 使用store:前缀区分存储操作缓存
         self._evict_cache_if_needed()
@@ -302,8 +303,6 @@ class VersionedStorage:
         -------
         DataSnapshot or None : 该时间点可见的最新数据
         """
-        import duckdb
-        
         # 缓存检查 - 使用key+as_of作为缓存键（不包含version，因为PIT查询只返回最新可见版本）
         self._evict_cache_if_needed()  # 先清理过期缓存
         cache_key = f"pit:{key}:{as_of.isoformat()}"
@@ -311,8 +310,8 @@ class VersionedStorage:
             snapshot, _ = self._cache[cache_key]
             return snapshot
         
-        conn = duckdb.connect(str(self.db_path), read_only=True)
-        try:
+        # 使用连接池
+        with self._get_connection(read_only=True) as conn:
             # PIT查询：effective_at < as_of 的最新版本（T日数据T+1才能见）
             # 关键：ann_date是公告日，T日收盘后公告，T+1日才能使用
             result = conn.execute("""
@@ -351,9 +350,6 @@ class VersionedStorage:
             self._cache[cache_key] = (snapshot, datetime.now())
             
             return snapshot
-            
-        finally:
-            conn.close()
     
     def get_pit_batch(self,
                       ts_codes: List[str],
@@ -367,13 +363,11 @@ class VersionedStorage:
         -------
         Dict[str, Dict] : {ts_code: data}
         """
-        import duckdb
-        
         if not ts_codes:
             return {}
         
-        conn = duckdb.connect(str(self.db_path), read_only=True)
-        try:
+        # 使用连接池查询
+        with self._get_connection(read_only=True) as conn:
             # 使用DuckDB的QUALIFY进行高效批量查询
             codes_df = pd.DataFrame({'ts_code': ts_codes})
             conn.register('tmp_codes', codes_df)
@@ -402,9 +396,6 @@ class VersionedStorage:
                 }
                 for _, row in result.iterrows()
             }
-            
-        finally:
-            conn.close()
     
     def correct(self,
                 key: DataSnapshotKey,
@@ -482,28 +473,27 @@ class VersionedStorage:
         """
         import duckdb
         
-        conn = duckdb.connect(str(self.db_path), read_only=True)
         issues = []
         
-        try:
-            # 构建查询条件
-            conditions = ["status = 'active'"]
-            params = []
-            if ts_code:
-                conditions.append("ts_code = ?")
-                params.append(ts_code)
-            if data_type:
-                conditions.append("data_type = ?")
-                params.append(data_type)
-            if start_date:
-                conditions.append("trade_date >= ?")
-                params.append(start_date)
-            if end_date:
-                conditions.append("trade_date <= ?")
-                params.append(end_date)
-            
-            where_clause = " AND ".join(conditions)
-            
+        # 构建查询条件
+        conditions = ["status = 'active'"]
+        params = []
+        if ts_code:
+            conditions.append("ts_code = ?")
+            params.append(ts_code)
+        if data_type:
+            conditions.append("data_type = ?")
+            params.append(data_type)
+        if start_date:
+            conditions.append("trade_date >= ?")
+            params.append(start_date)
+        if end_date:
+            conditions.append("trade_date <= ?")
+            params.append(end_date)
+        
+        where_clause = " AND ".join(conditions)
+        
+        with self._get_connection(read_only=True) as conn:
             # 获取待审计数据
             result = conn.execute(f"""
                 SELECT ts_code, data_type, trade_date, version, 
@@ -567,58 +557,39 @@ class VersionedStorage:
                 'warnings': len([i for i in issues if i['severity'] == 'warning']),
                 'issues': issues[:10]  # 只返回前10个
             }
-            
-        finally:
-            conn.close()
     
     def _get_next_version(self, key: DataSnapshotKey) -> int:
         """获取下一个版本号"""
-        import duckdb
-        
-        conn = duckdb.connect(str(self.db_path), read_only=True)
-        try:
+        with self._get_connection(read_only=True) as conn:
             result = conn.execute("""
                 SELECT MAX(version) FROM versioned_data
                 WHERE ts_code = ? AND data_type = ? AND trade_date = ?
             """, (key.ts_code, key.data_type, key.trade_date)).fetchone()
             
             return (result[0] or 0) + 1
-            
-        finally:
-            conn.close()
     
     def _supersede_previous(self, key: DataSnapshotKey, new_version: int):
         """标记旧版本为已替代"""
-        import duckdb
-        
-        conn = duckdb.connect(str(self.db_path))
-        try:
+        with self._get_connection(read_only=False) as conn:
             conn.execute("""
                 UPDATE versioned_data
                 SET status = 'superseded', superseded_by = ?
                 WHERE ts_code = ? AND data_type = ? AND trade_date = ?
                   AND version < ? AND status = 'active'
             """, (new_version, key.ts_code, key.data_type, key.trade_date, new_version))
-        finally:
-            conn.close()
     
     def _mark_status(self, 
                      key: DataSnapshotKey, 
                      status: DataVersionStatus,
                      note: Optional[str] = None):
         """标记数据状态"""
-        import duckdb
-        
-        conn = duckdb.connect(str(self.db_path))
-        try:
+        with self._get_connection(read_only=False) as conn:
             conn.execute("""
                 UPDATE versioned_data
                 SET status = ?, correction_note = ?
                 WHERE ts_code = ? AND data_type = ? AND trade_date = ?
                   AND status = 'active'
             """, (status.value, note, key.ts_code, key.data_type, key.trade_date))
-        finally:
-            conn.close()
     
     def _evict_cache_if_needed(self):
         """缓存淘汰 - 带TTL清理"""
@@ -644,6 +615,50 @@ class VersionedStorage:
             for k in keys_to_remove:
                 del self._cache[k]
             logger.debug(f"Cache LRU cleanup: {len(keys_to_remove)} evicted")
+    
+    def _get_connection(self, read_only: bool = False):
+        """从连接池获取连接（上下文管理器）"""
+        import contextlib
+        
+        @contextlib.contextmanager
+        def _conn():
+            conn = None
+            from_pool = False
+            
+            # 尝试从连接池获取
+            if not read_only:
+                with self._connection_pool_lock:
+                    if self._connection_pool:
+                        conn = self._connection_pool.pop()
+                        from_pool = True
+            
+            # 连接池为空或只读模式，创建新连接
+            if conn is None:
+                conn = duckdb.connect(str(self.db_path), read_only=read_only)
+            
+            try:
+                yield conn
+            finally:
+                if from_pool and not read_only and len(self._connection_pool) < self._connection_pool_max:
+                    # 归还到连接池
+                    with self._connection_pool_lock:
+                        self._connection_pool.append(conn)
+                else:
+                    # 关闭连接
+                    conn.close()
+        
+        return _conn()
+    
+    def close(self):
+        """关闭所有连接池连接"""
+        with self._connection_pool_lock:
+            for conn in self._connection_pool:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            self._connection_pool.clear()
+        logger.info("Connection pool closed")
 
 
 class FinancialDataPITManager:
@@ -699,16 +714,14 @@ class FinancialDataPITManager:
         """
         as_of = datetime.strptime(as_of_date, '%Y-%m-%d')
         
-        # 查询该股票所有财务数据版本
-        import duckdb
-        conn = duckdb.connect(str(self.storage.db_path), read_only=True)
-        try:
+        # 使用连接池查询
+        with self.storage._get_connection(read_only=True) as conn:
             result = conn.execute("""
                 SELECT trade_date, data_json, effective_at, version
                 FROM versioned_data
                 WHERE ts_code = ?
                   AND data_type = 'financial'
-                  AND effective_at <= ?
+                  AND effective_at < ?
                   AND status = 'active'
                 ORDER BY effective_at DESC, version DESC
                 LIMIT 1
@@ -723,9 +736,6 @@ class FinancialDataPITManager:
             data['_ann_date'] = row['effective_at'].isoformat() if hasattr(row['effective_at'], 'isoformat') else str(row['effective_at'])
             
             return data
-            
-        finally:
-            conn.close()
     
     def get_batch_financial_pit(self,
                                  ts_codes: List[str],
@@ -733,9 +743,8 @@ class FinancialDataPITManager:
         """批量获取PIT财务数据"""
         as_of = datetime.strptime(as_of_date, '%Y-%m-%d')
         
-        import duckdb
-        conn = duckdb.connect(str(self.storage.db_path), read_only=True)
-        try:
+        # 使用连接池查询
+        with self.storage._get_connection(read_only=True) as conn:
             codes_df = pd.DataFrame({'ts_code': ts_codes})
             conn.register('tmp_codes', codes_df)
             
@@ -762,9 +771,6 @@ class FinancialDataPITManager:
                 }
                 for _, row in result.iterrows()
             }
-            
-        finally:
-            conn.close()
 
 
 # 便捷函数
