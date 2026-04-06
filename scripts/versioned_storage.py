@@ -307,13 +307,14 @@ class VersionedStorage:
         
         conn = duckdb.connect(str(self.db_path), read_only=True)
         try:
-            # PIT查询：effective_at <= as_of 的最新版本
+            # PIT查询：effective_at < as_of 的最新版本（T日数据T+1才能见）
+            # 关键：ann_date是公告日，T日收盘后公告，T+1日才能使用
             result = conn.execute("""
                 SELECT * FROM versioned_data
                 WHERE ts_code = ?
                   AND data_type = ?
                   AND trade_date = ?
-                  AND effective_at <= ?
+                  AND effective_at < ?
                   AND status = 'active'
                 ORDER BY version DESC
                 LIMIT 1

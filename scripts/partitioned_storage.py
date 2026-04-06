@@ -274,29 +274,21 @@ class PartitionedStorage:
         
         dfs = []
         
-        # 查询热数据（DuckDB）
+        # 查询热数据（DuckDB）- 修正：确保日期范围不重叠
         if hot_years:
-            df_hot = self._query_duckdb(
-                table, 
-                max(start_date, f"{current_year - self.HOT_YEARS}-01-01"),
-                end_date,
-                ts_codes,
-                columns
-            )
+            hot_start = max(start_date, f"{current_year - self.HOT_YEARS}-01-01")
+            df_hot = self._query_duckdb(table, hot_start, end_date, ts_codes, columns)
             if not df_hot.empty:
                 dfs.append(df_hot)
         
-        # 查询冷数据（Parquet）
+        # 查询冷数据（Parquet）- 修正：确保日期范围不重叠
         if cold_years:
-            df_cold = self._query_parquet(
-                table,
-                start_date,
-                min(end_date, f"{current_year - self.HOT_YEARS - 1}-12-31"),
-                ts_codes,
-                columns
-            )
-            if not df_cold.empty:
-                dfs.append(df_cold)
+            cold_end = min(end_date, f"{current_year - self.HOT_YEARS - 1}-12-31")
+            # 如果热数据已覆盖，跳过冷数据查询
+            if not hot_years or cold_end >= start_date:
+                df_cold = self._query_parquet(table, start_date, cold_end, ts_codes, columns)
+                if not df_cold.empty:
+                    dfs.append(df_cold)
         
         if not dfs:
             return pd.DataFrame()
@@ -309,6 +301,12 @@ class PartitionedStorage:
         
         return result
     
+    # 允许的表白名单（防止SQL注入）
+    _ALLOWED_TABLES = frozenset({
+        'daily_quotes', 'stock_basic', 'financial_data', 'index_constituents',
+        'st_status_history', 'trade_calendar', 'daily_valuation'
+    })
+    
     def _query_duckdb(self,
                       table: str,
                       start_date: str,
@@ -318,10 +316,23 @@ class PartitionedStorage:
         """查询DuckDB热数据"""
         import duckdb
         
+        # 表名白名单校验
+        if table not in self._ALLOWED_TABLES:
+            raise ValueError(f"Table '{table}' not in allowed list: {sorted(self._ALLOWED_TABLES)}")
+        
         conn = duckdb.connect(str(self.db_path), read_only=True)
         try:
-            # 构建查询
-            col_str = ", ".join(columns) if columns else "*"
+            # 构建查询 - 列名白名单校验
+            if columns:
+                # 获取表的合法列名
+                schema_df = conn.execute(f"PRAGMA table_info({table})").fetchdf()
+                allowed_cols = set(schema_df['name'].tolist())
+                invalid_cols = set(columns) - allowed_cols
+                if invalid_cols:
+                    raise ValueError(f"Invalid columns: {invalid_cols}")
+                col_str = ", ".join(columns)
+            else:
+                col_str = "*"
             
             if ts_codes:
                 # 使用参数化查询防止SQL注入
@@ -355,6 +366,10 @@ class PartitionedStorage:
         """查询Parquet冷数据 - 使用DuckDB进行列式扫描"""
         import duckdb
         
+        # 表名白名单校验
+        if table not in self._ALLOWED_TABLES:
+            raise ValueError(f"Table '{table}' not in allowed list: {sorted(self._ALLOWED_TABLES)}")
+        
         start_year = int(start_date[:4])
         end_year = int(end_date[:4])
         
@@ -374,7 +389,16 @@ class PartitionedStorage:
             # 注册Parquet文件
             files_str = ", ".join([f"'{f}'" for f in parquet_files])
             
-            col_str = ", ".join(columns) if columns else "*"
+            # 列名白名单校验（Parquet列名从第一个文件推断）
+            if columns:
+                sample_df = pd.read_parquet(parquet_files[0], columns=None, n_rows=0)
+                allowed_cols = set(sample_df.columns.tolist())
+                invalid_cols = set(columns) - allowed_cols
+                if invalid_cols:
+                    raise ValueError(f"Invalid columns: {invalid_cols}")
+                col_str = ", ".join(columns)
+            else:
+                col_str = "*"
             
             if ts_codes:
                 codes_df = pd.DataFrame({'ts_code': ts_codes})
