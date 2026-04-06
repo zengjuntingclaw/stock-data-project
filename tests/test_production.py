@@ -56,9 +56,12 @@ class TestTradingRules(unittest.TestCase):
         # 主板规整到100倍数
         rounded = AShareTradingRules.round_shares('600000', datetime(2024, 1, 1), 550)
         self.assertEqual(rounded, 500)
-        # 科创板200股起
+        # 科创板200股起，不足200返回0（函数设计：不足最小手数不交易）
         rounded_kcb = AShareTradingRules.round_shares('688001', datetime(2024, 1, 1), 150)
-        self.assertEqual(rounded_kcb, 200)
+        self.assertEqual(rounded_kcb, 0)
+        # 科创板200股起，足200正常
+        rounded_kcb_ok = AShareTradingRules.round_shares('688001', datetime(2024, 1, 1), 250)
+        self.assertEqual(rounded_kcb_ok, 250)
 
 
 # ========== TradingCalendar Tests ==========

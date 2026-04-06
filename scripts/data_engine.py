@@ -1713,7 +1713,7 @@ class DataEngine:
         window_parts = []
         for w in windows:
             window_parts.append(f"""
-                ROUND(AVG({price_col}) OVER (PARTITION BY ts_code ORDER BY trade_date ROWS BETWEEN {w-1} PRECEDING AND CURRENT ROW), 2) as ma_{w}
+                ROUND(AVG({price_col}) OVER (PARTITION BY d.ts_code ORDER BY d.trade_date ROWS BETWEEN {w-1} PRECEDING AND CURRENT ROW), 2) as ma_{w}
             """)
 
         with self.get_connection() as conn:
@@ -1751,7 +1751,7 @@ class DataEngine:
         window_parts = []
         for w in windows:
             window_parts.append(f"""
-                ROUND(STDDEV(pct_chg) OVER (PARTITION BY ts_code ORDER BY trade_date ROWS BETWEEN {w-1} PRECEDING AND CURRENT ROW), 4) as vol_{w}
+                ROUND(STDDEV(pct_chg) OVER (PARTITION BY d.ts_code ORDER BY d.trade_date ROWS BETWEEN {w-1} PRECEDING AND CURRENT ROW), 4) as vol_{w}
             """)
 
         with self.get_connection() as conn:
