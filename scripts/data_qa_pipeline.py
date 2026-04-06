@@ -172,8 +172,26 @@ class DataQAPipeline:
                 results.append(result)
                 logger.info(f"  {check_name}: {result.checked_records} records, "
                           f"{len(result.issues)} issues ({result.duration_ms:.0f}ms)")
+            except (ValueError, KeyError, RuntimeError) as e:
+                # 已知异常类型：数据问题
+                logger.error(f"Check {check_name} data error: {e}")
+                results.append(QAResult(
+                    check_name=check_name,
+                    checked_records=0,
+                    passed=False,
+                    issues=[QAIssue(
+                        check_type=QACheckType.LOGIC,
+                        severity=QASeverity.ERROR,
+                        ts_code=None,
+                        trade_date=None,
+                        field=None,
+                        message=f"Data error in {check_name}: {str(e)}",
+                        suggestion="Check data source integrity"
+                    )]
+                ))
             except Exception as e:
-                logger.error(f"Check {check_name} failed: {e}")
+                # 未知异常：可能是代码bug
+                logger.exception(f"Check {check_name} unexpected error: {e}")
                 results.append(QAResult(
                     check_name=check_name,
                     checked_records=0,
@@ -184,7 +202,8 @@ class DataQAPipeline:
                         ts_code=None,
                         trade_date=None,
                         field=None,
-                        message=f"Checker failed: {str(e)}"
+                        message=f"Unexpected error in {check_name}: {type(e).__name__}: {str(e)}",
+                        suggestion="Review checker implementation"
                     )]
                 ))
         
@@ -404,10 +423,24 @@ class DataQAPipeline:
                 message="No trade dates found in calendar"
             )])
         
-        # 获取股票列表
+        # 获取股票列表 - 分层抽样确保覆盖
         if ts_codes is None:
-            stocks_df = self.data_engine.query("SELECT ts_code FROM stock_basic WHERE is_delisted = FALSE")
-            ts_codes = stocks_df['ts_code'].tolist() if not stocks_df.empty else []
+            stocks_df = self.data_engine.query("SELECT ts_code, industry FROM stock_basic WHERE is_delisted = FALSE")
+            if not stocks_df.empty:
+                # 分层抽样：按行业抽样，确保各行业都有代表
+                if 'industry' in stocks_df.columns and not stocks_df['industry'].isna().all():
+                    # 每个行业至少抽1只，最多抽该行业的10%
+                    sampled = []
+                    for industry, group in stocks_df.groupby('industry'):
+                        n_samples = max(1, min(len(group), len(group) // 10 + 1))
+                        sampled.extend(group.sample(n=min(n_samples, len(group)), random_state=42)['ts_code'].tolist())
+                    ts_codes = sampled
+                    logger.info(f"Stratified sampling: {len(ts_codes)} stocks from {stocks_df['industry'].nunique()} industries")
+                else:
+                    # 无行业信息时随机抽样200只
+                    ts_codes = stocks_df.sample(n=min(200, len(stocks_df)), random_state=42)['ts_code'].tolist()
+            else:
+                ts_codes = []
         
         # 检查每只股票的数据完整性
         missing_report = []

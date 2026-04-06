@@ -124,9 +124,11 @@ class VersionedStorage:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         
-        # 内存缓存（热数据）
-        self._cache: Dict[str, DataSnapshot] = {}
+        # 内存缓存（热数据）带TTL
+        self._cache: Dict[str, Tuple[DataSnapshot, datetime]] = {}
         self._cache_max_size = 10000
+        self._cache_ttl_seconds = 3600  # 1小时TTL
+        self._cache_last_cleanup = datetime.now()
         
         self._init_schema()
         logger.info(f"VersionedStorage initialized: {self.db_path}")
@@ -274,8 +276,9 @@ class VersionedStorage:
             conn.close()
         
         # 更新缓存 - 使用store:前缀区分存储操作缓存
+        self._evict_cache_if_needed()
         cache_key = f"store:{key}:v{snapshot.version}"
-        self._cache[cache_key] = snapshot
+        self._cache[cache_key] = (snapshot, datetime.now())
         
         logger.debug(f"Stored snapshot: {key} v{snapshot.version}")
         return snapshot
@@ -302,9 +305,11 @@ class VersionedStorage:
         import duckdb
         
         # 缓存检查 - 使用key+as_of作为缓存键（不包含version，因为PIT查询只返回最新可见版本）
+        self._evict_cache_if_needed()  # 先清理过期缓存
         cache_key = f"pit:{key}:{as_of.isoformat()}"
         if cache_key in self._cache:
-            return self._cache[cache_key]
+            snapshot, _ = self._cache[cache_key]
+            return snapshot
         
         conn = duckdb.connect(str(self.db_path), read_only=True)
         try:
@@ -342,9 +347,8 @@ class VersionedStorage:
                 correction_note=row['correction_note']
             )
             
-            # 缓存
-            self._cache[cache_key] = snapshot
-            self._evict_cache_if_needed()
+            # 缓存 - 带时间戳
+            self._cache[cache_key] = (snapshot, datetime.now())
             
             return snapshot
             
@@ -617,12 +621,29 @@ class VersionedStorage:
             conn.close()
     
     def _evict_cache_if_needed(self):
-        """缓存淘汰"""
+        """缓存淘汰 - 带TTL清理"""
+        now = datetime.now()
+        
+        # 每5分钟执行一次TTL清理
+        if (now - self._cache_last_cleanup).seconds > 300:
+            expired_keys = [
+                k for k, (snapshot, ts) in self._cache.items()
+                if (now - ts).seconds > self._cache_ttl_seconds
+            ]
+            for k in expired_keys:
+                del self._cache[k]
+            self._cache_last_cleanup = now
+            if expired_keys:
+                logger.debug(f"Cache TTL cleanup: {len(expired_keys)} expired")
+        
+        # 容量超限清理（LRU）
         if len(self._cache) > self._cache_max_size:
-            # 简单LRU：移除最早的10%
-            keys_to_remove = list(self._cache.keys())[:self._cache_max_size // 10]
+            # 按时间排序，移除最早的10%
+            sorted_items = sorted(self._cache.items(), key=lambda x: x[1][1])
+            keys_to_remove = [k for k, _ in sorted_items[:self._cache_max_size // 10]]
             for k in keys_to_remove:
                 del self._cache[k]
+            logger.debug(f"Cache LRU cleanup: {len(keys_to_remove)} evicted")
 
 
 class FinancialDataPITManager:
