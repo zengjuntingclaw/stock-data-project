@@ -10,6 +10,7 @@ DataEngine - 生产级数据治理与存储引擎
   6. 单股数据提取
 """
 
+import os
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -33,14 +34,16 @@ try:
     HAS_DUCKDB = True
 except ImportError:
     HAS_DUCKDB = False
-    print("[WARN] duckdb not installed. Run: pip install duckdb")
+    from loguru import logger as _fallback_logger
+    _fallback_logger.warning("duckdb not installed. Run: pip install duckdb")
 
 try:
     import akshare as ak
     HAS_AKSHARE = True
 except ImportError:
     HAS_AKSHARE = False
-    print("[WARN] akshare not installed. Run: pip install akshare")
+    from loguru import logger as _fallback_logger
+    _fallback_logger.warning("akshare not installed. Run: pip install akshare")
 
 try:
     import baostock as bs
@@ -48,7 +51,8 @@ try:
 except ImportError:
     HAS_BAOSTOCK = False
     bs = None
-    print("[WARN] baostock not installed. Run: pip install baostock")
+    from loguru import logger as _fallback_logger
+    _fallback_logger.warning("baostock not installed. Run: pip install baostock")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -198,10 +202,14 @@ class DataEngine:
     """
 
     def __init__(self,
-                 db_path: str = "data/stock_data.duckdb",
-                 parquet_dir: str = "data/parquet"):
-        self.db_path = Path(db_path)
-        self.parquet_dir = Path(parquet_dir)
+                 db_path: str = None,
+                 parquet_dir: str = None):
+        # 支持环境变量配置，未设置时使用相对路径默认值
+        project_root = Path(__file__).resolve().parent.parent
+        self.db_path = Path(db_path or os.environ.get(
+            'STOCK_DB_PATH', str(project_root / 'data' / 'stock_data.duckdb')))
+        self.parquet_dir = Path(parquet_dir or os.environ.get(
+            'STOCK_PARQUET_DIR', str(project_root / 'data' / 'parquet')))
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.parquet_dir.mkdir(parents=True, exist_ok=True)
         self.validator = DataValidator()
@@ -209,7 +217,7 @@ class DataEngine:
         if HAS_DUCKDB:
             self._init_schema()
         else:
-            print("[ERROR] DuckDB required but not installed.")
+            logger.error("DuckDB required but not installed.")
 
     # ──────────────────────────────────────────────────────────
     # 数据库初始化
@@ -378,28 +386,47 @@ class DataEngine:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_val_date ON daily_valuation(trade_date)")
 
         conn.close()
-        print(f"[OK] DataEngine schema initialized: {self.db_path}")
+        logger.info(f"DataEngine schema initialized: {self.db_path}")
 
     # ──────────────────────────────────────────────────────────
     # 查询接口
     # ──────────────────────────────────────────────────────────
-    def query(self, sql: str) -> pd.DataFrame:
-        """执行 SQL 查询"""
+    def query(self, sql: str, params: tuple = None) -> pd.DataFrame:
+        """执行 SQL 查询（支持参数化查询防止SQL注入）"""
         if not HAS_DUCKDB:
             return pd.DataFrame()
         conn = duckdb.connect(str(self.db_path), read_only=True)
-        df = conn.execute(sql).fetchdf()
-        conn.close()
-        return df
+        try:
+            if params:
+                df = conn.execute(sql, params).fetchdf()
+            else:
+                df = conn.execute(sql).fetchdf()
+            return df
+        finally:
+            conn.close()
 
     def execute(self, sql: str, params: tuple = None):
-        """执行写操作"""
+        """执行写操作（支持参数化查询防止SQL注入）"""
         conn = duckdb.connect(str(self.db_path))
-        if params:
-            conn.execute(sql, params)
-        else:
-            conn.execute(sql)
-        conn.close()
+        try:
+            if params:
+                conn.execute(sql, params)
+            else:
+                conn.execute(sql)
+        finally:
+            conn.close()
+
+    def get_connection(self, read_only: bool = False):
+        """获取数据库连接（上下文管理器，确保连接正确关闭）"""
+        import contextlib
+        @contextlib.contextmanager
+        def _conn():
+            conn = duckdb.connect(str(self.db_path), read_only=read_only)
+            try:
+                yield conn
+            finally:
+                conn.close()
+        return _conn()
 
     # ──────────────────────────────────────────────────────────
     # 工具方法
@@ -422,10 +449,10 @@ class DataEngine:
     
     @staticmethod
     def _apply_limit_flags(df: pd.DataFrame, code: str, pct_col: str = "pct_chg") -> pd.DataFrame:
-        """统一应用涨跌停标记"""
+        """统一应用涨跌停标记（容差0.01%避免浮点误差）"""
         limit_pct = DataEngine._detect_limit(code)
-        df["limit_up"] = df[pct_col] >= (limit_pct * 100 - 0.1)
-        df["limit_down"] = df[pct_col] <= -(limit_pct * 100 - 0.1)
+        df["limit_up"] = df[pct_col] >= (limit_pct * 100 - 0.01)
+        df["limit_down"] = df[pct_col] <= -(limit_pct * 100 - 0.01)
         return df
     
     @staticmethod
@@ -521,7 +548,7 @@ class DataEngine:
         if not HAS_AKSHARE:
             return
 
-        conn = duckdb.connect(str(self.db_path))
+        with self.get_connection() as conn:
 
         # 获取历史成分股（AkShare提供）
         try:
@@ -535,19 +562,18 @@ class DataEngine:
                 df["trade_date"] = pd.Timestamp.now()
                 df["out_date"] = pd.NaT
 
-                # 写入数据库（使用DataFrame注册为临时表再INSERT）
-                conn.execute(f"DELETE FROM index_constituents WHERE index_code = '{index_code}'")
+                # 写入数据库（使用DataFrame注册为临时表再INSERT，参数化查询防止SQL注入）
+                conn.execute("DELETE FROM index_constituents WHERE index_code = ?", [index_code])
+                df["index_code"] = index_code
                 conn.register('tmp_constituents', df)
-                conn.execute(f"""
+                conn.execute("""
                     INSERT INTO index_constituents (index_code, ts_code, trade_date, in_date, out_date)
-                    SELECT '{index_code}', ts_code, trade_date, in_date, out_date
+                    SELECT index_code, ts_code, trade_date, in_date, out_date
                     FROM tmp_constituents
                 """)
                 print(f"[OK] Synced {len(df)} constituents for {index_code}")
         except Exception as e:
             print(f"[WARN] Failed to sync index constituents: {e}")
-
-        conn.close()
 
     def get_universe_at_date(self, index_code: str, trade_date: str) -> List[str]:
         """
@@ -560,13 +586,12 @@ class DataEngine:
         if not HAS_DUCKDB:
             return []
 
-        sql = f"""
+        df = self.query("""
             SELECT ts_code FROM index_constituents
-            WHERE index_code = '{index_code}'
-            AND in_date <= '{trade_date}'
-            AND (out_date IS NULL OR out_date > '{trade_date}')
-        """
-        df = self.query(sql)
+            WHERE index_code = ?
+            AND in_date <= ?
+            AND (out_date IS NULL OR out_date > ?)
+        """, (index_code, trade_date, trade_date))
         return df["ts_code"].tolist() if not df.empty else []
 
     # ──────────────────────────────────────────────────────────
@@ -584,61 +609,63 @@ class DataEngine:
         if not HAS_DUCKDB:
             return
 
-        conn = duckdb.connect(str(self.db_path))
-
-        # 从 stock_basic 获取含 ST 的股票列表
-        try:
-            # 先找到所有历史上曾是 ST 的股票
-            st_stocks = conn.execute("""
-                SELECT ts_code, name FROM stock_basic 
-                WHERE name LIKE '%ST%' OR name LIKE '%*ST%'
-            """).fetchdf()
-            
-            if st_stocks.empty:
-                conn.close()
-                return
-            
-            st_codes = st_stocks['ts_code'].tolist()
-            code_list = "','".join(st_codes)
-            
-            # 从日线数据推断 ST 状态变化
-            conn.execute(f"""
-                INSERT OR REPLACE INTO st_status_history
-                (ts_code, trade_date, is_st, is_new_st)
-                SELECT 
-                    sub.ts_code,
-                    sub.trade_date,
-                    TRUE as is_st,
-                    CASE 
-                        WHEN sub.prev_st = 0 OR sub.prev_st IS NULL THEN TRUE 
-                        ELSE FALSE 
-                    END as is_new_st
-                FROM (
+        with self.get_connection() as conn:
+            # 从 stock_basic 获取含 ST 的股票列表
+            try:
+                # 先找到所有历史上曾是 ST 的股票
+                st_stocks = conn.execute("""
+                    SELECT ts_code, name FROM stock_basic 
+                    WHERE name LIKE '%ST%' OR name LIKE '%*ST%'
+                """).fetchdf()
+                
+                if st_stocks.empty:
+                    return
+                
+                st_codes = st_stocks['ts_code'].tolist()
+                
+                # 从日线数据推断 ST 状态变化（使用 register 避免大列表拼接 SQL 注入风险）
+                st_df = pd.DataFrame({"ts_code": st_codes})
+                conn.register('tmp_st_codes', st_df)
+                conn.execute("""
+                    INSERT OR REPLACE INTO st_status_history
+                    (ts_code, trade_date, is_st, is_new_st)
                     SELECT 
-                        d.ts_code,
-                        d.trade_date,
-                        LAG(1) OVER (PARTITION BY d.ts_code ORDER BY d.trade_date) as prev_st
-                    FROM daily_quotes d
-                    WHERE d.ts_code IN ('{code_list}')
-                ) sub
-            """)
-            print("[OK] Synced ST status history")
-        except Exception as e:
-            print(f"[WARN] Failed to sync ST status: {e}")
-
-        conn.close()
+                        sub.ts_code,
+                        sub.trade_date,
+                        TRUE as is_st,
+                        CASE 
+                            WHEN sub.prev_st = 0 OR sub.prev_st IS NULL THEN TRUE 
+                            ELSE FALSE 
+                        END as is_new_st
+                    FROM (
+                        SELECT 
+                            d.ts_code,
+                            d.trade_date,
+                            LAG(1) OVER (PARTITION BY d.ts_code ORDER BY d.trade_date) as prev_st
+                        FROM daily_quotes d
+                        INNER JOIN tmp_st_codes t ON d.ts_code = t.ts_code
+                    ) sub
+                """)
+                conn.execute("DROP VIEW tmp_st_codes")
+                print("[OK] Synced ST status history")
+            except Exception as e:
+                print(f"[WARN] Failed to sync ST status: {e}")
 
     def is_st_at_date(self, ts_code: str, trade_date: str) -> bool:
-        """检查某股票在某日期是否为ST（时间序列特征）"""
-        sql = f"""
+        """检查某股票在某日期是否为ST
+        
+        注意：st_status_history 只记录 ST 期间的数据行。
+        如果该股在查询日没有记录，说明不是 ST（正常/已摘帽）。
+        """
+        df = self.query("""
             SELECT is_st FROM st_status_history
-            WHERE ts_code = '{ts_code}'
-            AND trade_date <= '{trade_date}'
+            WHERE ts_code = ?
+            AND trade_date <= ?
             ORDER BY trade_date DESC
             LIMIT 1
-        """
-        df = self.query(sql)
-        return not df.empty and df.iloc[0, 0] is True
+        """, (ts_code, trade_date))
+        # 如果没有记录，说明该股从未被 ST 或已摘帽，返回 False
+        return not df.empty and bool(df.iloc[0, 0])
 
     # ──────────────────────────────────────────────────────────
     # 财务数据抓取（PIT 约束）
@@ -733,8 +760,8 @@ class DataEngine:
                     time.sleep(0.1)
             finally:
                 bs.logout()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Baostock financial fetch failed for {symbol}: {e}")
 
         # 估值快照（用 AkShare）
         try:
@@ -743,8 +770,8 @@ class DataEngine:
                 df_val = df_val.rename(columns={"代码": "symbol"})
                 for _, row in df_val.iterrows():
                     records.append(self._ak_indicator_row(row, symbol))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"AkShare indicator fetch failed for {symbol}: {e}")
 
         if not records:
             return pd.DataFrame()
@@ -796,28 +823,30 @@ class DataEngine:
         """保存财务数据到数据库"""
         if df.empty or not HAS_DUCKDB:
             return
-        conn = duckdb.connect(str(self.db_path))
-        # 财务数据用 REPLACE（可重复更新）
-        try:
-            conn.execute("""
-                INSERT OR REPLACE INTO financial_data
-                (ts_code, ann_date, end_date, report_type, revenue,
-                 net_profit, total_assets, total_equity, roe, roa,
-                 eps, gross_margin, data_source)
-                SELECT
-                    ts_code, ann_date, end_date, report_type,
-                    revenue, net_profit, total_assets, total_equity,
-                    roe, roa, eps, gp, data_source
-                FROM df
-            """)
-        except Exception:
-            # 字段不全时用原始列
-            cols = [c for c in df.columns if c in
-                    ["ts_code", "ann_date", "end_date", "report_type",
-                     "revenue", "net_profit", "roe", "roa", "eps",
-                     "total_assets", "total_equity", "gross_margin", "data_source"]]
-            conn.execute(f"INSERT OR IGNORE INTO financial_data ({','.join(cols)}) SELECT {','.join(cols)} FROM df")
-        conn.close()
+        with self.get_connection() as conn:
+            # 财务数据用 REPLACE（可重复更新）
+            try:
+                conn.execute("""
+                    INSERT OR REPLACE INTO financial_data
+                    (ts_code, ann_date, end_date, report_type, revenue,
+                     net_profit, total_assets, total_equity, roe, roa,
+                     eps, gross_margin, data_source)
+                    SELECT
+                        ts_code, ann_date, end_date, report_type,
+                        revenue, net_profit, total_assets, total_equity,
+                        roe, roa, eps, gp, data_source
+                    FROM df
+                """)
+            except Exception as e:
+                logger.warning(f"Financial data UPSERT failed, trying fallback: {e}")
+                # 字段不全时用原始列（列名来自 DataFrame 列列表，非用户输入，安全）
+                cols = [c for c in df.columns if c in
+                        ["ts_code", "ann_date", "end_date", "report_type",
+                         "revenue", "net_profit", "roe", "roa", "eps",
+                         "total_assets", "total_equity", "gross_margin", "data_source"]]
+                if cols:
+                    col_str = ','.join(cols)
+                    conn.execute(f"INSERT OR IGNORE INTO financial_data ({col_str}) SELECT {col_str} FROM df")
 
     def _get_local_stocks(self) -> pd.DataFrame:
         """从本地数据库获取股票列表"""
@@ -841,8 +870,10 @@ class DataEngine:
             print("[INFO] Enriching list/delist dates from Baostock...")
             try:
                 bs.login()
-                bs_stocks = bs.query_all_stock(day=datetime.now().strftime("%Y-%m-%d"))
-                bs.logout()
+                try:
+                    bs_stocks = bs.query_all_stock(day=datetime.now().strftime("%Y-%m-%d"))
+                finally:
+                    bs.logout()
                 if bs_stocks is not None and not bs_stocks.empty:
                     date_map = dict(zip(
                         bs_stocks["code"].str.replace("sh.", "6", regex=False).str.replace("sz.", "", regex=False),
@@ -870,11 +901,13 @@ class DataEngine:
             if col in df.columns:
                 df[col] = pd.to_datetime(df[col], errors="coerce")
 
-        conn.execute("DELETE FROM stock_basic")
-        conn.execute(
-            f"INSERT INTO stock_basic ({','.join(write_cols)}) SELECT {','.join(write_cols)} FROM df"
-        )
-        conn.close()
+        try:
+            conn.execute("DELETE FROM stock_basic")
+            conn.execute(
+                f"INSERT INTO stock_basic ({','.join(write_cols)}) SELECT {','.join(write_cols)} FROM df"
+            )
+        finally:
+            conn.close()
         print(f"[OK] Synced {len(df)} stocks to database "
               f"(list_date filled: {df['list_date'].notna().sum()})")
 
@@ -978,42 +1011,44 @@ class DataEngine:
         """
         if df.empty or not HAS_DUCKDB:
             return
-        conn = duckdb.connect(str(self.db_path))
-        if mode == "overwrite":
-            codes = df["ts_code"].unique().tolist()
-            dates_min = df["trade_date"].min()
-            dates_max = df["trade_date"].max()
-            if codes and not (pd.isna(dates_min) or pd.isna(dates_max)):
-                code_list = "','".join(codes)
-                conn.execute(f"""
-                    DELETE FROM daily_quotes
-                    WHERE ts_code IN ('{code_list}')
-                    AND trade_date BETWEEN '{dates_min}' AND '{dates_max}'
+        with self.get_connection() as conn:
+            if mode == "overwrite":
+                codes = df["ts_code"].unique().tolist()
+                dates_min = df["trade_date"].min()
+                dates_max = df["trade_date"].max()
+                if codes and not (pd.isna(dates_min) or pd.isna(dates_max)):
+                    # 使用 register 避免大列表拼接 SQL 注入
+                    codes_df = pd.DataFrame({"ts_code": codes})
+                    conn.register('tmp_codes', codes_df)
+                    conn.execute("""
+                        DELETE FROM daily_quotes
+                        WHERE ts_code IN (SELECT ts_code FROM tmp_codes)
+                        AND trade_date BETWEEN ? AND ?
+                    """, (dates_min, dates_max))
+                    conn.execute("DROP VIEW tmp_codes")
+            try:
+                # 原子性 UPSERT（覆盖已存在的 ts_code+trade_date 组合）
+                conn.execute("""
+                    INSERT OR REPLACE INTO daily_quotes
+                    (ts_code, trade_date, open, high, low, close, pre_close,
+                     volume, amount, pct_chg, turnover, adj_factor,
+                     is_suspend, limit_up, limit_down, data_source)
+                    SELECT
+                        ts_code, trade_date,
+                        COALESCE(open, 0), COALESCE(high, 0),
+                        COALESCE(low, 0), COALESCE(close, 0),
+                        COALESCE(pre_close, 0), COALESCE(volume, 0),
+                        COALESCE(amount, 0), COALESCE(pct_chg, 0),
+                        COALESCE(turnover, 0), COALESCE(adj_factor, 1),
+                        COALESCE(is_suspend, FALSE),
+                        COALESCE(limit_up, FALSE),
+                        COALESCE(limit_down, FALSE),
+                        COALESCE(data_source, 'unknown')
+                    FROM df
                 """)
-        try:
-            # 原子性 UPSERT（覆盖已存在的 ts_code+trade_date 组合）
-            conn.execute("""
-                INSERT OR REPLACE INTO daily_quotes
-                (ts_code, trade_date, open, high, low, close, pre_close,
-                 volume, amount, pct_chg, turnover, adj_factor,
-                 is_suspend, limit_up, limit_down, data_source)
-                SELECT
-                    ts_code, trade_date,
-                    COALESCE(open, 0), COALESCE(high, 0),
-                    COALESCE(low, 0), COALESCE(close, 0),
-                    COALESCE(pre_close, 0), COALESCE(volume, 0),
-                    COALESCE(amount, 0), COALESCE(pct_chg, 0),
-                    COALESCE(turnover, 0), COALESCE(adj_factor, 1),
-                    COALESCE(is_suspend, FALSE),
-                    COALESCE(limit_up, FALSE),
-                    COALESCE(limit_down, FALSE),
-                    COALESCE(data_source, 'unknown')
-                FROM df
-            """)
-        except Exception:
-            # 字段不匹配时降级为普通 INSERT（可能产生重复，报错可接受）
-            conn.execute("INSERT INTO daily_quotes SELECT * FROM df")
-        conn.close()
+            except Exception as e:
+                logger.warning(f"UPSERT failed, trying INSERT OR IGNORE: {e}")
+                conn.execute("INSERT OR IGNORE INTO daily_quotes SELECT * FROM df")
 
     # ──────────────────────────────────────────────────────────
     # 增量更新（多线程 + 重试 + 断点续传）
@@ -1024,11 +1059,13 @@ class DataEngine:
             return None
 
         # 先尝试获取最新日期
-        sql = (
-            "SELECT MAX(trade_date) as md FROM daily_quotes"
-            + (f" WHERE ts_code = '{ts_code}'" if ts_code else "")
-        )
-        result = self.query(sql)
+        if ts_code:
+            result = self.query(
+                "SELECT MAX(trade_date) as md FROM daily_quotes WHERE ts_code = ?",
+                (ts_code,)
+            )
+        else:
+            result = self.query("SELECT MAX(trade_date) as md FROM daily_quotes")
         val = result.iloc[0, 0] if not result.empty else None
         if val is None or pd.isna(val):
             return None
@@ -1037,19 +1074,19 @@ class DataEngine:
 
         # 断点续传加固：检查最新日期数据是否完整（close>0 且 volume>=0）
         if ts_code:
-            check = self.query(f"""
+            check = self.query("""
                 SELECT COUNT(*) as cnt FROM daily_quotes
-                WHERE ts_code = '{ts_code}' AND trade_date = '{latest}'
+                WHERE ts_code = ? AND trade_date = ?
                 AND close > 0 AND volume >= 0
-            """)
+            """, (ts_code, latest))
             if check.empty or check.iloc[0, 0] == 0:
                 # 数据损坏/不完整，回退到前一天
                 prev = (pd.Timestamp(latest) - timedelta(days=1)).strftime("%Y-%m-%d")
-                prev_check = self.query(f"""
+                prev_check = self.query("""
                     SELECT COUNT(*) as cnt FROM daily_quotes
-                    WHERE ts_code = '{ts_code}' AND trade_date = '{prev}'
+                    WHERE ts_code = ? AND trade_date = ?
                     AND close > 0 AND volume >= 0
-                """)
+                """, (ts_code, prev))
                 if prev_check.empty or prev_check.iloc[0, 0] == 0:
                     return None  # 数据彻底损坏
                 return prev
@@ -1139,7 +1176,8 @@ class DataEngine:
                         df.drop(columns=["td2", "close_raw"], inplace=True, errors="ignore")
                     else:
                         df["adj_factor"] = 1.0
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"adj_factor calc failed for {symbol}: {e}")
                     df["adj_factor"] = 1.0
             else:
                 df["adj_factor"] = 1.0
@@ -1148,7 +1186,8 @@ class DataEngine:
                     "pre_close", "volume", "amount", "pct_chg", "turnover",
                     "adj_factor", "is_suspend", "limit_up", "limit_down", "data_source"]
             return df[[c for c in cols if c in df.columns]].copy()
-        except Exception:
+        except Exception as e:
+            logger.debug(f"AkShare fetch failed for {symbol}: {e}")
             return pd.DataFrame()
 
     def _fetch_baostock(self,
@@ -1156,7 +1195,9 @@ class DataEngine:
                         start_date: str,
                         end_date: str,
                         adjust: Literal["qfq", "hfq", ""] = "qfq") -> pd.DataFrame:
-        """Baostock 抓取（备援用）"""
+        """Baostock 抓取（备援用，login/logout 在调用方管理）"""
+        if not HAS_BAOSTOCK:
+            return pd.DataFrame()
         try:
             adjflag_map = {"qfq": "2", "hfq": "1", "": "3"}
             adjflag = adjflag_map.get(adjust, "2")
@@ -1168,16 +1209,18 @@ class DataEngine:
             else:
                 bs_code = f"sz.{sym6}"
 
-            bs.login()
-            rs = bs.query_history_k_data_plus(
-                bs_code,
-                "date,open,high,low,close,volume,amount,adjustflag",
-                start_date=start_date.replace("-", ""),
-                end_date=end_date.replace("-", ""),
-                frequency="d",
-                adjustflag=adjflag
-            )
-            bs.logout()
+            try:
+                bs.login()
+                rs = bs.query_history_k_data_plus(
+                    bs_code,
+                    "date,open,high,low,close,volume,amount,adjustflag",
+                    start_date=start_date.replace("-", ""),
+                    end_date=end_date.replace("-", ""),
+                    frequency="d",
+                    adjustflag=adjflag
+                )
+            finally:
+                bs.logout()
             if rs is None or rs.error_code != "0":
                 return pd.DataFrame()
 
@@ -1208,10 +1251,9 @@ class DataEngine:
                     "pre_close", "volume", "amount", "pct_chg", "turnover",
                     "adj_factor", "is_suspend", "limit_up", "limit_down", "data_source"]
             return df[[c for c in cols if c in df.columns]].copy()
-        except Exception:
-            return pd.DataFrame()
-
-    def incremental_update(self,
+        except Exception as e:
+            logger.debug(f"Baostock fetch failed for {symbol}: {e}")
+            return pd.DataFrame()(self,
                           symbols: List[str] = None,
                           adjust: Literal["qfq", "hfq", ""] = "qfq",
                           max_workers: int = 12,
@@ -1337,13 +1379,13 @@ class DataEngine:
         ts_code = new_data["ts_code"].iloc[0]
 
         # 获取本地最近的复权因子
-        local = self.query(f"""
+        local = self.query("""
             SELECT trade_date, adj_factor
             FROM daily_quotes
-            WHERE ts_code = '{ts_code}'
+            WHERE ts_code = ?
             ORDER BY trade_date DESC
             LIMIT 5
-        """)
+        """, (ts_code,))
 
         if local.empty:
             return []
@@ -1363,14 +1405,13 @@ class DataEngine:
                 }
                 alerts.append(alert)
 
-                # 记录到日志表
-                conn = duckdb.connect(str(self.db_path))
-                conn.execute(f"""
-                    INSERT INTO adj_factor_log
-                    (ts_code, trade_date, adj_factor_old, adj_factor_new, change_ratio)
-                    VALUES ('{ts_code}', '{alert["trade_date"]}', {old_adj}, {new_adj}, {change_ratio})
-                """)
-                conn.close()
+                # 记录到日志表（参数化查询防止SQL注入）
+                with self.get_connection() as log_conn:
+                    log_conn.execute("""
+                        INSERT INTO adj_factor_log
+                        (ts_code, trade_date, adj_factor_old, adj_factor_new, change_ratio)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (ts_code, str(alert["trade_date"]), old_adj, new_adj, change_ratio))
 
         return alerts
 
@@ -1392,13 +1433,13 @@ class DataEngine:
                 sym6 = str(sym).zfill(6)
                 bs_code = f"sh.{sym6}" if sym6.startswith("6") else f"sz.{sym6}"
 
-                # AkShare 数据
-                ak_data = self.query(f"""
+                # AkShare 数据（参数化查询防止SQL注入）
+                ak_data = self.query("""
                     SELECT pct_chg FROM daily_quotes
-                    WHERE ts_code LIKE '{sym6}%'
-                    AND trade_date = '{trade_date}'
+                    WHERE ts_code LIKE ?
+                    AND trade_date = ?
                     LIMIT 1
-                """)
+                """, (f"{sym6}%", trade_date))
                 if ak_data.empty:
                     continue
 
@@ -1428,14 +1469,13 @@ class DataEngine:
 
                     if diff > 0.5:  # 偏差超过 0.5%
                         stats["cross_validate_errors"] += 1
-                        conn = duckdb.connect(str(self.db_path))
-                        conn.execute(f"""
-                            INSERT INTO data_quality_alert
-                            (alert_type, ts_code, trade_date, detail)
-                            VALUES ('cross_validate', '{sym6}', '{trade_date}',
-                                    'AkShare={ak_pct:.2f}% vs Baostock={bs_pct:.2f}%, diff={diff:.2f}%')
-                        """)
-                        conn.close()
+                        with self.get_connection() as conn:
+                            conn.execute("""
+                                INSERT INTO data_quality_alert
+                                (alert_type, ts_code, trade_date, detail)
+                                VALUES (?, ?, ?, ?)
+                            """, ('cross_validate', sym6, trade_date,
+                                  f'AkShare={ak_pct:.2f}% vs Baostock={bs_pct:.2f}%, diff={diff:.2f}%'))
                 except Exception as e:
                     logger.debug(f"Cross-validate error for {sym6}: {e}")
         finally:
@@ -1475,13 +1515,13 @@ class DataEngine:
         start_date = start_date or "2018-01-01"
         end_date = end_date or datetime.now().strftime("%Y-%m-%d")
 
-        # 查本地
-        local = self.query(f"""
+        # 查本地（参数化查询防止SQL注入）
+        local = self.query("""
             SELECT * FROM daily_quotes
-            WHERE ts_code = '{ts_code}'
-            AND trade_date BETWEEN '{start_date}' AND '{end_date}'
+            WHERE ts_code = ?
+            AND trade_date BETWEEN ? AND ?
             ORDER BY trade_date
-        """)
+        """, (ts_code, start_date, end_date))
         if not local.empty:
             local_latest = local["trade_date"].max()
             today = datetime.now().strftime("%Y-%m-%d")
@@ -1514,14 +1554,13 @@ class DataEngine:
         这是防止未来函数的关键方法。
         """
         cutoff = (pd.Timestamp(trade_date) - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
-        sql = f"""
+        return self.query("""
             SELECT * FROM financial_data
-            WHERE ts_code = '{ts_code}'
-            AND ann_date <= '{trade_date}'
-            AND ann_date >= '{cutoff}'
+            WHERE ts_code = ?
+            AND ann_date <= ?
+            AND ann_date >= ?
             ORDER BY end_date DESC
-        """
-        return self.query(sql)
+        """, (ts_code, trade_date, cutoff))
 
     def get_latest_ann_financial(self,
                                   ts_code: str,
@@ -1557,26 +1596,24 @@ class DataEngine:
             if prev_date:
                 trade_date = prev_date
         
-        sql = f"""
+        df = self.query("""
             SELECT ts_code, circ_mv, total_mv
             FROM daily_valuation
-            WHERE trade_date = '{trade_date}'
-        """
-        df = self.query(sql)
+            WHERE trade_date = ?
+        """, (trade_date,))
         if df.empty:
             return pd.Series(dtype=float)
         return df.set_index("ts_code")["circ_mv"]
 
     def get_previous_trade_date(self, trade_date: str) -> Optional[str]:
         """获取指定日期的前一个交易日"""
-        sql = f"""
+        df = self.query("""
             SELECT cal_date FROM trade_calendar
             WHERE is_open = TRUE
-            AND cal_date < '{trade_date}'
+            AND cal_date < ?
             ORDER BY cal_date DESC
             LIMIT 1
-        """
-        df = self.query(sql)
+        """, (trade_date,))
         if df.empty:
             return None
         return df.iloc[0, 0].strftime("%Y-%m-%d")
@@ -1598,7 +1635,9 @@ class DataEngine:
         if not ts_codes:
             return pd.DataFrame()
 
-        code_list = "','".join(ts_codes)
+        # 使用 register 避免大列表拼接 SQL 注入风险
+        codes_df = pd.DataFrame({"ts_code": ts_codes})
+        max_window = max(windows)
 
         # 构建窗口函数SQL（使用复利乘积计算滚动收益率）
         window_parts = []
@@ -1607,28 +1646,31 @@ class DataEngine:
                 ROUND(EXP(SUM(LN(1 + pct_chg / 100.0)) OVER (PARTITION BY ts_code ORDER BY trade_date ROWS BETWEEN {w-1} PRECEDING AND CURRENT ROW)) - 1, 4) as window_{w}
             """)
 
-        sql = f"""
-            WITH ranked AS (
+        with self.get_connection() as conn:
+            conn.register('tmp_codes_ret', codes_df)
+            sql = f"""
+                WITH ranked AS (
+                    SELECT 
+                        d.ts_code,
+                        d.trade_date,
+                        d.pct_chg,
+                        ROW_NUMBER() OVER (PARTITION BY d.ts_code ORDER BY d.trade_date) as rn
+                    FROM daily_quotes d
+                    INNER JOIN tmp_codes_ret t ON d.ts_code = t.ts_code
+                    AND d.trade_date BETWEEN ? AND ?
+                    AND d.volume > 0
+                )
                 SELECT 
                     ts_code,
                     trade_date,
-                    pct_chg,
-                    ROW_NUMBER() OVER (PARTITION BY ts_code ORDER BY trade_date) as rn
-                FROM daily_quotes
-                WHERE ts_code IN ('{code_list}')
-                AND trade_date BETWEEN '{start_date}' AND '{end_date}'
-                AND volume > 0
-            )
-            SELECT 
-                ts_code,
-                trade_date,
-                {','.join(window_parts)}
-            FROM ranked
-            WHERE rn >= {max(windows)}
-            ORDER BY ts_code, trade_date
-        """
-
-        return self.query(sql)
+                    {','.join(window_parts)}
+                FROM ranked
+                WHERE rn >= {max_window}
+                ORDER BY ts_code, trade_date
+            """
+            df = conn.execute(sql, (start_date, end_date)).fetchdf()
+            conn.execute("DROP VIEW tmp_codes_ret")
+            return df
 
     def compute_rolling_ma(self,
                             ts_codes: List[str],
@@ -1644,7 +1686,8 @@ class DataEngine:
         if not ts_codes:
             return pd.DataFrame()
 
-        code_list = "','".join(ts_codes)
+        # 使用 register 避免大列表拼接 SQL 注入风险
+        codes_df = pd.DataFrame({"ts_code": ts_codes})
 
         window_parts = []
         for w in windows:
@@ -1652,20 +1695,23 @@ class DataEngine:
                 ROUND(AVG({price_col}) OVER (PARTITION BY ts_code ORDER BY trade_date ROWS BETWEEN {w-1} PRECEDING AND CURRENT ROW), 2) as ma_{w}
             """)
 
-        sql = f"""
-            SELECT 
-                ts_code,
-                trade_date,
-                {price_col},
-                {','.join(window_parts)}
-            FROM daily_quotes
-            WHERE ts_code IN ('{code_list}')
-            AND trade_date BETWEEN '{start_date}' AND '{end_date}'
-            AND volume > 0
-            ORDER BY ts_code, trade_date
-        """
-
-        return self.query(sql)
+        with self.get_connection() as conn:
+            conn.register('tmp_codes_ma', codes_df)
+            sql = f"""
+                SELECT 
+                    d.ts_code,
+                    d.trade_date,
+                    d.{price_col},
+                    {','.join(window_parts)}
+                FROM daily_quotes d
+                INNER JOIN tmp_codes_ma t ON d.ts_code = t.ts_code
+                AND d.trade_date BETWEEN ? AND ?
+                AND d.volume > 0
+                ORDER BY d.ts_code, d.trade_date
+            """
+            df = conn.execute(sql, (start_date, end_date)).fetchdf()
+            conn.execute("DROP VIEW tmp_codes_ma")
+            return df
 
     def compute_rolling_volatility(self,
                                     ts_codes: List[str],
@@ -1678,7 +1724,8 @@ class DataEngine:
         if not ts_codes:
             return pd.DataFrame()
 
-        code_list = "','".join(ts_codes)
+        # 使用 register 避免大列表拼接 SQL 注入风险
+        codes_df = pd.DataFrame({"ts_code": ts_codes})
 
         window_parts = []
         for w in windows:
@@ -1686,20 +1733,23 @@ class DataEngine:
                 ROUND(STDDEV(pct_chg) OVER (PARTITION BY ts_code ORDER BY trade_date ROWS BETWEEN {w-1} PRECEDING AND CURRENT ROW), 4) as vol_{w}
             """)
 
-        sql = f"""
-            SELECT 
-                ts_code,
-                trade_date,
-                pct_chg,
-                {','.join(window_parts)}
-            FROM daily_quotes
-            WHERE ts_code IN ('{code_list}')
-            AND trade_date BETWEEN '{start_date}' AND '{end_date}'
-            AND volume > 0
-            ORDER BY ts_code, trade_date
-        """
-
-        return self.query(sql)
+        with self.get_connection() as conn:
+            conn.register('tmp_codes_vol', codes_df)
+            sql = f"""
+                SELECT 
+                    d.ts_code,
+                    d.trade_date,
+                    d.pct_chg,
+                    {','.join(window_parts)}
+                FROM daily_quotes d
+                INNER JOIN tmp_codes_vol t ON d.ts_code = t.ts_code
+                AND d.trade_date BETWEEN ? AND ?
+                AND d.volume > 0
+                ORDER BY d.ts_code, d.trade_date
+            """
+            df = conn.execute(sql, (start_date, end_date)).fetchdf()
+            conn.execute("DROP VIEW tmp_codes_vol")
+            return df
 
     # ──────────────────────────────────────────────────────────
     # 交易日历
@@ -1718,7 +1768,7 @@ class DataEngine:
 
         print("[INFO] Fetching calendar from AkShare...")
         end_year = end_year or datetime.now().year
-        conn = duckdb.connect(str(self.db_path))
+        with self.get_connection() as conn:
 
         for year in range(start_year, end_year + 1):
             try:
@@ -1736,19 +1786,21 @@ class DataEngine:
                 print(f"[OK] Calendar {year} synced")
             except Exception as e:
                 print(f"[WARN] Calendar {year} failed: {e}")
-        conn.close()
 
     def get_trade_dates(self,
                         start_date: str = None,
                         end_date: str = None) -> List[str]:
         """获取交易日列表"""
+        params = []
         sql = "SELECT cal_date FROM trade_calendar WHERE is_open = TRUE"
         if start_date:
-            sql += f" AND cal_date >= '{start_date}'"
+            sql += " AND cal_date >= ?"
+            params.append(start_date)
         if end_date:
-            sql += f" AND cal_date <= '{end_date}'"
+            sql += " AND cal_date <= ?"
+            params.append(end_date)
         sql += " ORDER BY cal_date"
-        df = self.query(sql)
+        df = self.query(sql, tuple(params) if params else None)
         if df.empty:
             return []
         return df["cal_date"].dt.strftime("%Y-%m-%d").tolist()
@@ -1756,12 +1808,23 @@ class DataEngine:
     # ──────────────────────────────────────────────────────────
     # Parquet 导出
     # ──────────────────────────────────────────────────────────
+    # 允许导出的表白名单（防止路径遍历和SQL注入）
+    _EXPORT_TABLE_WHITELIST = frozenset({
+        'daily_quotes', 'stock_basic', 'financial_data', 'index_constituents',
+        'st_status_history', 'trade_calendar', 'daily_valuation',
+        'update_log', 'adj_factor_log', 'data_quality_alert',
+    })
+
     def export_parquet(self, table: str = "daily_quotes") -> Path:
-        """导出表到 Parquet 格式"""
+        """导出表到 Parquet 格式（仅允许白名单表名）"""
+        if table not in self._EXPORT_TABLE_WHITELIST:
+            raise ValueError(f"表 '{table}' 不在导出白名单中，允许的表: {sorted(self._EXPORT_TABLE_WHITELIST)}")
         output = self.parquet_dir / f"{table}.parquet"
-        conn = duckdb.connect(str(self.db_path))
-        conn.execute(f"COPY (SELECT * FROM {table}) TO '{output}' (FORMAT PARQUET)")
-        conn.close()
+        # 路径安全检查：确保输出在 parquet_dir 内
+        if not str(output.resolve()).startswith(str(self.parquet_dir.resolve())):
+            raise ValueError(f"导出路径 '{output}' 不在允许的目录 '{self.parquet_dir}' 内")
+        with self.get_connection() as conn:
+            conn.execute(f"COPY (SELECT * FROM {table}) TO '{output}' (FORMAT PARQUET)")
         print(f"[OK] Exported to {output}")
         return output
 
@@ -1774,16 +1837,16 @@ class DataEngine:
     # ──────────────────────────────────────────────────────────
     def quality_report(self, start_date: str, end_date: str) -> Dict:
         """生成数据质量报告"""
-        total = self.query(f"""
+        total = self.query("""
             SELECT COUNT(*) as cnt FROM daily_quotes
-            WHERE trade_date BETWEEN '{start_date}' AND '{end_date}'
-        """).iloc[0, 0]
+            WHERE trade_date BETWEEN ? AND ?
+        """, (start_date, end_date)).iloc[0, 0]
 
-        anomaly = self.query(f"""
+        anomaly = self.query("""
             SELECT COUNT(*) as cnt FROM daily_quotes
-            WHERE trade_date BETWEEN '{start_date}' AND '{end_date}'
+            WHERE trade_date BETWEEN ? AND ?
             AND (close <= 0 OR volume < 0 OR adj_factor <= 0)
-        """).iloc[0, 0]
+        """, (start_date, end_date)).iloc[0, 0]
 
         delisted = self.query(
             "SELECT COUNT(*) FROM stock_basic WHERE is_delisted = TRUE"
@@ -1797,9 +1860,64 @@ class DataEngine:
         }
 
 
-# ──────────────────────────────────────────────────────────────
-# 便捷函数
-# ──────────────────────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────
+    # 批量数据获取（优化 N+1 查询问题）
+    # ──────────────────────────────────────────────────────────
+    def get_batch_stock_data(self,
+                              symbols: List[str],
+                              trade_date: str) -> pd.DataFrame:
+        """
+        批量获取多只股票在指定日期的日线数据
+        
+        用单条 SQL 替代 N 次循环查询，大幅减少数据库 I/O。
+        
+        Parameters
+        ----------
+        symbols : List[str]
+            6位股票代码列表
+        trade_date : str
+            交易日期 YYYY-MM-DD
+            
+        Returns
+        -------
+        pd.DataFrame: 合并后的日线数据
+        """
+        if not symbols or not HAS_DUCKDB:
+            return pd.DataFrame()
+        
+        # 构造 ts_code 列表
+        ts_codes = []
+        for sym in symbols:
+            sym6 = str(sym).zfill(6)
+            if sym6.startswith(("6", "5", "9", "688")):
+                ts_codes.append(f"{sym6}.SH")
+            else:
+                ts_codes.append(f"{sym6}.SZ")
+        
+        # 使用 register 避免 SQL 注入
+        codes_df = pd.DataFrame({"ts_code": ts_codes})
+        with self.get_connection() as conn:
+            conn.register('tmp_batch_codes', codes_df)
+            df = conn.execute("""
+                SELECT d.ts_code, d.trade_date, d.open, d.high, d.low, d.close,
+                       d.volume, d.amount, d.pct_chg, d.pre_close,
+                       d.is_suspend, d.limit_up, d.limit_down
+                FROM daily_quotes d
+                INNER JOIN tmp_batch_codes t ON d.ts_code = t.ts_code
+                WHERE d.trade_date = ?
+            """, (trade_date,)).fetchdf()
+            conn.execute("DROP VIEW tmp_batch_codes")
+        
+        if df.empty:
+            return pd.DataFrame()
+        
+        # 提取6位代码作为 symbol 列
+        df["symbol"] = df["ts_code"].str.split(".").str[0]
+        return df
+
+    # ──────────────────────────────────────────────────────────
+    # 便捷函数
+    # ──────────────────────────────────────────────────────────
 def load_stock(code: str,
                start: str = None,
                end: str = None,

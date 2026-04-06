@@ -133,7 +133,9 @@ class ExecutionEngineV3:
                 pos.shares * prices.get(sym, 0) 
                 for sym, pos in self.positions.items()
             )
-            total_value = self.cash.available + position_value
+            # 计算总资产时应包含待结算资金
+            pending_amount = sum(amount for _, amount in self.cash.pending_settlements)
+            total_value = self.cash.available + position_value + pending_amount
         
         orders = []
         signal_date = current_date
@@ -293,8 +295,13 @@ class ExecutionEngineV3:
         limit_down_price = prev_close * (1 - price_limit)
         
         # 成交量判断（无量涨跌停才无法交易）
-        avg_volume = r.get('avg_volume_20', r.get('volume', 0))
-        is_low_volume = r.get('volume', 0) < avg_volume * 0.1  # 成交量低于20日均量10%
+        avg_volume = r.get('avg_volume_20', None)
+        if avg_volume is None or avg_volume <= 0:
+            # avg_volume_20 缺失时，无法准确判断无量，保守跳过低量判断
+            is_low_volume = False
+            logger.debug(f"avg_volume_20 missing for {order.symbol} at {date}, skipping low-volume check")
+        else:
+            is_low_volume = r.get('volume', 0) < avg_volume * 0.1  # 成交量低于20日均量10%
         
         if order.side == OrderSide.BUY:
             # 买入被阻：涨停且无量（无法买入）
@@ -345,14 +352,23 @@ class ExecutionEngineV3:
         )
     
     def _update_position_and_cash(self, order: Order, trade: Trade):
-        """更新持仓和资金"""
+        """更新持仓和资金
+        
+        资金会计规则：
+        - 买入：可用资金减少（股票价值+佣金+滑点），总资产减少（仅手续费）
+          买入的股票市值已体现在 position_value 中，不额外减少 total
+        - 卖出：持仓减少，所得资金T+1可用
+          总资产减少（仅手续费），卖出所得通过 pending_settlements 追踪
+        """
         symbol = order.symbol
         
         if order.side == OrderSide.BUY:
-            # 买入：减少可用资金，增加持仓
+            # 买入：减少可用资金（股票价值+费用），总资产不变
+            # 资金从 available 转为持仓市值，只有手续费是损失
             total_cost = trade.shares * trade.price + trade.commission + trade.slippage
             self.cash.available -= total_cost
-            self.cash.total -= trade.commission + trade.slippage  # 手续费减少总资产
+            # 总资产减少手续费（佣金+滑点）
+            self.cash.total -= (trade.commission + trade.slippage)
             
             # 更新持仓
             if symbol not in self.positions:
@@ -375,12 +391,12 @@ class ExecutionEngineV3:
                 if pos.shares <= 0:
                     del self.positions[symbol]
             
-            # 卖出所得资金T+1可用
+            # 卖出所得资金T+1可用（扣除手续费后的净额）
             net_proceeds = trade.shares * trade.price - trade.commission - trade.stamp_tax - trade.slippage
             settle_date = self.calendar.next_trading_day(trade.date)
             self.cash.pending_settlements.append((settle_date, net_proceeds))
             
-            # 总资产减少手续费
+            # 总资产仅减少手续费（卖出本身是资产形态转换，不是损失）
             self.cash.total -= (trade.commission + trade.stamp_tax + trade.slippage)
     
     def update_position_available(self, current_date: datetime):
@@ -398,14 +414,25 @@ class ExecutionEngineV3:
             pos.available_shares = pos.shares
     
     def get_portfolio_value(self, prices: Dict[str, float]) -> Dict[str, float]:
-        """获取组合市值"""
+        """获取组合市值
+        
+        total_value 计算逻辑：
+        - 可用资金 + 持仓市值 + 待结算资金（T+1可用但尚未结算的资金）
+        - 确保在卖出当天 total_value 不会因 pending_settlements 而虚减
+        """
         position_value = sum(
             pos.shares * prices.get(sym, 0)
             for sym, pos in self.positions.items()
         )
+        # 待结算资金（已卖出但尚未到账的部分）
+        pending_amount = sum(amount for _, amount in self.cash.pending_settlements)
+        
+        total_value = self.cash.available + position_value + pending_amount
+        
         return {
             'cash_available': self.cash.available,
             'cash_withdrawable': self.cash.withdrawable,
             'position_value': position_value,
-            'total_value': self.cash.available + position_value,
+            'pending_settlements': pending_amount,
+            'total_value': total_value,
         }

@@ -20,12 +20,13 @@ class PITDataAligner:
         if self._data is None: raise ValueError("Data not loaded")
         mask = self._data['ann_date'] <= date
         if symbols: mask &= self._data['symbol'].isin(symbols)
-        filtered = self._data[mask]
+        filtered = self._data[mask].copy()
         if filtered.empty:
             return pd.Series(dtype=float, name=name)
         # 按每个 symbol 取 ann_date 最大的那一行（PIT 约束）
-        idx = filtered.groupby('symbol')['ann_date'].idxmax()
-        result = filtered.loc[idx].set_index('symbol')[name]
+        # 先排序确保确定性：同一天多条公告时取最后一行
+        filtered = filtered.sort_values(['symbol', 'ann_date'])
+        result = filtered.groupby('symbol').last()[name]
         return result
     
     def get_factors(self, names: List[str], date: datetime, symbols: Optional[List[str]] = None) -> pd.DataFrame:

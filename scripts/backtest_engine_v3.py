@@ -7,6 +7,7 @@
 - PITDataAligner: 未来函数防护
 """
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Dict, List, Optional, Callable, Any
 from dataclasses import dataclass, field
 import pandas as pd
@@ -246,29 +247,26 @@ class ProductionBacktestEngine:
         """
         # 获取上一交易日数据（避免未来函数）
         prev_date = self.calendar.prev_trading_day(date)
+        prev_date_str = prev_date.strftime("%Y-%m-%d") if isinstance(prev_date, datetime) else str(prev_date)
         
         try:
-            # 从data_engine获取T-1日数据
+            # 获取T-1日的股票池
             universe = self.survivorship.get_universe(prev_date, include_delisted=True)
+            if not universe:
+                return None
             
-            # 批量获取数据（性能优化：预分配list）
-            data = []
-            for symbol in universe[:self.config.universe_size]:
-                # 使用T-1日数据计算信号，避免未来函数
-                df = self.data_engine.get_stock_data(symbol, prev_date, prev_date)
-                if df is not None and not df.empty:
-                    data.append({
-                        'symbol': symbol,
-                        'open': df['open'].iloc[0],
-                        'high': df['high'].iloc[0],
-                        'low': df['low'].iloc[0],
-                        'close': df['close'].iloc[0],
-                        'volume': df['volume'].iloc[0],
-                        'prev_close': df.get('prev_close', df['close']).iloc[0],
-                        'is_suspended': df.get('is_suspended', False).iloc[0],
-                    })
+            # 批量获取数据（单条SQL替代N次查询，大幅减少数据库I/O）
+            batch_df = self.data_engine.get_batch_stock_data(
+                universe[:self.config.universe_size], prev_date_str
+            )
             
-            return pd.DataFrame(data) if data else None
+            if batch_df.empty:
+                return None
+            
+            # 标准化列名
+            result = batch_df[["symbol", "open", "high", "low", "close", "volume", "prev_close"]].copy()
+            result["is_suspended"] = batch_df.get("is_suspend", False)
+            return result
             
         except Exception as e:
             logger.error(f"Failed to get market data for {date}: {e}")
@@ -380,16 +378,29 @@ class ProductionBacktestEngine:
         return report
     
     def _save_checkpoint(self, path: str):
-        """保存检查点"""
+        """保存检查点（含完整状态，支持断点续传）"""
         import json
-        with open(path, 'w') as f:
-            json.dump(self.state.to_dict(), f)
-    
+        state_data = self.state.to_dict()
+        # 序列化 trade_history（每条交易记录为 dict）
+        state_data['trade_history'] = self.state.trade_history
+        # 序列化 daily_values（daily_records 同步保存）
+        state_data['daily_records'] = self.daily_records
+        # 同步 execution engine 的内部状态（pending_settlements 等）
+        state_data['execution'] = {
+            'pending_settlements': [
+                {'symbol': ps['symbol'], 'amount': ps['amount'], 'settle_date': ps['settle_date'].isoformat()}
+                for ps in getattr(self.execution, 'pending_settlements', [])
+            ],
+        }
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(state_data, f, default=str, ensure_ascii=False)
+
     def _load_checkpoint(self, path: str) -> bool:
-        """加载检查点"""
+        """加载检查点（恢复完整状态，避免丢失历史记录）"""
         try:
             import json
-            with open(path, 'r') as f:
+            with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             # 恢复状态
             self.state = BacktestState(
@@ -397,9 +408,25 @@ class ProductionBacktestEngine:
                 cash=CashAccount(**data['cash']),
                 positions={sym: Position(sym, **pos) for sym, pos in data['positions'].items()},
                 pending_orders=[],
-                trade_history=[],
-                daily_values=[],
+                trade_history=data.get('trade_history', []),
+                daily_values=data.get('daily_records', []),
             )
+            # 恢复 daily_records（外部列表与 BacktestState 同步）
+            self.daily_records = data.get('daily_records', [])
+            # 恢复 execution engine 的 pending_settlements
+            exec_data = data.get('execution', {})
+            if exec_data and hasattr(self.execution, 'pending_settlements'):
+                self.execution.pending_settlements = [
+                    {
+                        'symbol': ps['symbol'],
+                        'amount': ps['amount'],
+                        'settle_date': datetime.fromisoformat(ps['settle_date']),
+                    }
+                    for ps in exec_data.get('pending_settlements', [])
+                ]
+            logger.info(f"Checkpoint restored: date={data['current_date']}, "
+                       f"trades={len(self.state.trade_history)}, "
+                       f"records={len(self.daily_records)}")
             return True
         except Exception as e:
             logger.error(f"Failed to load checkpoint: {e}")
