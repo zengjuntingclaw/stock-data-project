@@ -172,6 +172,180 @@ class AShareTradingRules:
         return (target_shares // lot_base) * lot_base
 
 
+class TradingFilter:
+    """
+    交易过滤器 - 精确处理停牌与可交易状态
+    
+    在回测数据导出模块中增加is_tradable布尔值，
+    如果当天停牌或一字涨跌停导致无法成交，该标志位应准确反映。
+    """
+    
+    def __init__(self, trading_rules: AShareTradingRules = None):
+        self.rules = trading_rules or AShareTradingRules()
+    
+    def check_tradable(self,
+                      symbol: str,
+                      date: datetime,
+                      market_data: Dict[str, Any],
+                      position: Optional[Dict] = None) -> Dict[str, Any]:
+        """
+        检查股票在指定日期的可交易状态
+        
+        Parameters
+        ----------
+        symbol : str
+            股票代码
+        date : datetime
+            交易日期
+        market_data : Dict
+            市场数据，包含：
+            - open, high, low, close: 价格
+            - volume: 成交量
+            - pre_close: 昨收
+            - is_suspend: 是否停牌
+        position : Dict, optional
+            当前持仓信息（用于判断能否卖出）
+            
+        Returns
+        -------
+        Dict: {
+            'is_tradable': bool,        # 是否可交易（综合判断）
+            'can_buy': bool,            # 是否可买入
+            'can_sell': bool,           # 是否可卖出
+            'is_suspend': bool,         # 是否停牌
+            'is_limit_up': bool,        # 是否涨停
+            'is_limit_down': bool,      # 是否跌停
+            'limit_up_price': Optional[float],   # 涨停价格
+            'limit_down_price': Optional[float], # 跌停价格
+            'reason': str,              # 不可交易原因
+        }
+        """
+        result = {
+            'is_tradable': False,
+            'can_buy': False,
+            'can_sell': False,
+            'is_suspend': False,
+            'is_limit_up': False,
+            'is_limit_down': False,
+            'limit_up_price': None,
+            'limit_down_price': None,
+            'reason': ''
+        }
+        
+        # 1. 停牌检查
+        if market_data.get('is_suspend', False) or market_data.get('volume', 0) == 0:
+            result['is_suspend'] = True
+            result['reason'] = '停牌'
+            return result
+        
+        # 2. 计算涨跌停价格
+        pre_close = market_data.get('pre_close', market_data.get('close', 0))
+        if pre_close <= 0:
+            result['reason'] = '无效前收盘价'
+            return result
+        
+        limit_pct = self.rules.get_price_limit(symbol, date)
+        
+        # 新股首日或特殊情形无涨跌幅限制
+        if limit_pct == float('inf'):
+            result['is_tradable'] = True
+            result['can_buy'] = True
+            result['can_sell'] = True
+            result['reason'] = '无涨跌幅限制'
+            return result
+        
+        result['limit_up_price'] = round(pre_close * (1 + limit_pct), 2)
+        result['limit_down_price'] = round(pre_close * (1 - limit_pct), 2)
+        
+        # 3. 涨跌停检查
+        high = market_data.get('high', 0)
+        low = market_data.get('low', 0)
+        open_price = market_data.get('open', 0)
+        
+        # 涨停判断：最高价触及涨停价且最低价也接近涨停价（一字涨停）
+        if high >= result['limit_up_price'] * 0.999:
+            if low >= result['limit_up_price'] * 0.999:  # 一字涨停
+                result['is_limit_up'] = True
+                result['can_sell'] = True  # 可以卖出
+                result['can_buy'] = False  # 无法买入
+                result['reason'] = '一字涨停，无法买入'
+            else:
+                # 盘中触及涨停但打开，可以交易
+                result['can_buy'] = True
+                result['can_sell'] = True
+        
+        # 跌停判断
+        elif low <= result['limit_down_price'] * 1.001:
+            if high <= result['limit_down_price'] * 1.001:  # 一字跌停
+                result['is_limit_down'] = True
+                result['can_buy'] = True   # 可以买入
+                result['can_sell'] = False # 无法卖出
+                result['reason'] = '一字跌停，无法卖出'
+            else:
+                # 盘中触及跌停但打开，可以交易
+                result['can_buy'] = True
+                result['can_sell'] = True
+        else:
+            # 正常交易
+            result['can_buy'] = True
+            result['can_sell'] = True
+        
+        # 4. 综合判断
+        result['is_tradable'] = result['can_buy'] or result['can_sell']
+        
+        if result['is_tradable'] and not result['reason']:
+            result['reason'] = '正常交易'
+        
+        return result
+    
+    def filter_tradable_stocks(self,
+                               symbols: List[str],
+                               date: datetime,
+                               market_data_dict: Dict[str, Dict]) -> List[str]:
+        """
+        批量过滤可交易股票
+        
+        Returns
+        -------
+        List[str]: 可交易股票列表
+        """
+        tradable = []
+        for symbol in symbols:
+            if symbol in market_data_dict:
+                status = self.check_tradable(symbol, date, market_data_dict[symbol])
+                if status['is_tradable']:
+                    tradable.append(symbol)
+        return tradable
+    
+    def get_execution_price(self,
+                           symbol: str,
+                           date: datetime,
+                           market_data: Dict[str, Any],
+                           side: str,  # 'buy' or 'sell'
+                           order_type: str = 'market'  # 'market', 'limit'
+                           ) -> Optional[float]:
+        """
+        获取执行价格
+        
+        考虑涨跌停限制：
+        - 买入时如果涨停，无法成交
+        - 卖出时如果跌停，无法成交
+        """
+        status = self.check_tradable(symbol, date, market_data)
+        
+        if side == 'buy' and not status['can_buy']:
+            return None
+        if side == 'sell' and not status['can_sell']:
+            return None
+        
+        if order_type == 'market':
+            # 市价单使用开盘价或VWAP
+            return market_data.get('open')
+        else:
+            # 限价单需要检查价格是否在涨跌停范围内
+            return market_data.get('close')
+
+
 class TradingCalendar:
     """A股交易日历管理
     
