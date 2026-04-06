@@ -273,8 +273,9 @@ class VersionedStorage:
         finally:
             conn.close()
         
-        # 更新缓存
-        self._cache[str(key)] = snapshot
+        # 更新缓存 - 使用store:前缀区分存储操作缓存
+        cache_key = f"store:{key}:v{snapshot.version}"
+        self._cache[cache_key] = snapshot
         
         logger.debug(f"Stored snapshot: {key} v{snapshot.version}")
         return snapshot
@@ -300,8 +301,8 @@ class VersionedStorage:
         """
         import duckdb
         
-        # 缓存检查
-        cache_key = f"{key}:{as_of.isoformat()}"
+        # 缓存检查 - 使用key+as_of作为缓存键（不包含version，因为PIT查询只返回最新可见版本）
+        cache_key = f"pit:{key}:{as_of.isoformat()}"
         if cache_key in self._cache:
             return self._cache[cache_key]
         
@@ -379,7 +380,7 @@ class VersionedStorage:
                 INNER JOIN tmp_codes c ON v.ts_code = c.ts_code
                 WHERE v.data_type = ?
                   AND v.trade_date = ?
-                  AND v.effective_at <= ?
+                  AND v.effective_at < ?
                   AND v.status = 'active'
                 QUALIFY ROW_NUMBER() OVER (PARTITION BY v.ts_code ORDER BY v.version DESC) = 1
             """, (data_type, trade_date, as_of)).fetchdf()
@@ -722,7 +723,7 @@ class FinancialDataPITManager:
                 FROM versioned_data v
                 INNER JOIN tmp_codes c ON v.ts_code = c.ts_code
                 WHERE v.data_type = 'financial'
-                  AND v.effective_at <= ?
+                  AND v.effective_at < ?
                   AND v.status = 'active'
                 QUALIFY ROW_NUMBER() OVER (PARTITION BY v.ts_code ORDER BY v.effective_at DESC, v.version DESC) = 1
             """, (as_of,)).fetchdf()
