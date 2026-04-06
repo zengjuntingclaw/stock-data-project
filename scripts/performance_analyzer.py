@@ -100,7 +100,8 @@ class PerformanceAnalyzer:
                   returns: pd.Series,
                   benchmark: Optional[pd.Series] = None,
                   turnover: Optional[pd.Series] = None,
-                  yearly: bool = True) -> PerformanceMetrics:
+                  yearly: bool = True,
+                  factor_series: Optional[pd.Series] = None) -> PerformanceMetrics:
         """
         计算完整绩效指标
         
@@ -114,6 +115,8 @@ class PerformanceAnalyzer:
             每日换手率
         yearly : bool
             是否计算年度分解
+        factor_series : Series, optional
+            因子值时间序列（月频），用于自相关性检验
             
         Returns
         -------
@@ -217,6 +220,89 @@ class PerformanceAnalyzer:
             max_days = max(max_days, len(dd) - dd_start)
         return max_days
     
+    def _calc_dd_recovery_stats(self, returns: pd.Series) -> Dict:
+        """
+        计算回撤恢复统计
+        
+        Returns
+        -------
+        dict: {
+            "max_recovery_days": 最长恢复天数,
+            "avg_recovery_days": 平均恢复天数,
+            "recovery_count": 回撤次数,
+            "current_dd": 当前回撤深度,
+            "current_dd_days": 当前回撤持续天数
+        }
+        """
+        cum = (1 + returns).cumprod()
+        running_max = cum.expanding().max()
+        dd = (cum - running_max) / running_max
+        
+        recovery_periods = []
+        in_dd = False
+        dd_start = 0
+        
+        for i, d in enumerate(dd):
+            if d < 0 and not in_dd:
+                in_dd, dd_start = True, i
+            elif d == 0 and in_dd:
+                recovery_days = i - dd_start
+                recovery_periods.append(recovery_days)
+                in_dd = False
+        
+        # 当前仍在回撤中
+        if in_dd:
+            current_dd_days = len(dd) - dd_start
+            recovery_periods.append(current_dd_days)
+        else:
+            current_dd_days = 0
+        
+        return {
+            "max_recovery_days": max(recovery_periods) if recovery_periods else 0,
+            "avg_recovery_days": np.mean(recovery_periods) if recovery_periods else 0,
+            "recovery_count": len(recovery_periods),
+            "current_dd": dd.iloc[-1] if len(dd) > 0 else 0,
+            "current_dd_days": current_dd_days
+        }
+    
+    def _calc_factor_autocorr(self, factor_series: pd.Series, lags: int = 12) -> Dict:
+        """
+        计算因子自相关性（持久性检验）
+        
+        Parameters
+        ----------
+        factor_series : Series
+            因子时间序列（月频）
+        lags : int
+            滞后期数
+            
+        Returns
+        -------
+        dict: {
+            "lag_1": 1期自相关,
+            "lag_3": 3期自相关,
+            "lag_12": 12期自相关,
+            "is_persistent": 是否持久（lag_1 > 0.3）
+        }
+        """
+        if factor_series.empty:
+            return {"lag_1": np.nan, "lag_3": np.nan, "lag_12": np.nan, "is_persistent": False}
+        
+        # 计算各期自相关
+        autocorr_1 = factor_series.autocorr(lag=1) if len(factor_series) > 1 else np.nan
+        autocorr_3 = factor_series.autocorr(lag=3) if len(factor_series) > 3 else np.nan
+        autocorr_12 = factor_series.autocorr(lag=12) if len(factor_series) > 12 else np.nan
+        
+        # 判断持久性（A股价值因子一般lag_1 > 0.3视为持久）
+        is_persistent = not np.isnan(autocorr_1) and autocorr_1 > 0.3
+        
+        return {
+            "lag_1": autocorr_1,
+            "lag_3": autocorr_3,
+            "lag_12": autocorr_12,
+            "is_persistent": is_persistent
+        }
+    
     def _calc_beta_alpha(self, returns: pd.Series, benchmark: pd.Series) -> Tuple[float, float]:
         """回归计算 Beta 和 Alpha"""
         X = np.column_stack([np.ones(len(benchmark)), benchmark])
@@ -278,6 +364,95 @@ class PerformanceAnalyzer:
             lines.append("=" * 60)
         
         return "\n".join(lines)
+    
+    def full_report(self,
+                     returns: pd.Series,
+                     benchmark: Optional[pd.Series] = None,
+                     turnover: Optional[pd.Series] = None,
+                     factor_series: Optional[pd.Series] = None,
+                     port_weights: Optional[pd.DataFrame] = None,
+                     port_returns: Optional[pd.Series] = None,
+                     bench_weights: Optional[pd.DataFrame] = None,
+                     bench_returns: Optional[pd.Series] = None) -> str:
+        """
+        生成完整分析报告（含归因分析和因子持久性）
+        
+        Parameters
+        ----------
+        returns : Series
+            策略日收益率
+        benchmark : Series, optional
+            基准收益率
+        turnover : Series, optional
+            换手率
+        factor_series : Series, optional
+            因子值时间序列（月频）
+        port_weights : DataFrame, optional
+            组合行业权重（用于Brinson归因）
+        port_returns : Series, optional
+            组合股票收益率
+        bench_weights : DataFrame, optional
+            基准行业权重
+        bench_returns : Series, optional
+            基准成分股收益率
+            
+        Returns
+        -------
+        str
+            完整文本报告
+        """
+        # 基础绩效
+        metrics = self.calculate(returns, benchmark, turnover, 
+                                  factor_series=factor_series)
+        base_report = self.report(metrics)
+        
+        # 回撤恢复统计
+        dd_stats = self._calc_dd_recovery_stats(returns)
+        dd_report = f"""
+回撤恢复统计:
+{'='*60}
+最大恢复天数: {dd_stats['max_recovery_days']:>10}天
+平均恢复天数: {dd_stats['avg_recovery_days']:>10.1f}天
+回撤次数:     {dd_stats['recovery_count']:>10}次
+当前回撤深度: {dd_stats['current_dd']:>10.2%}
+当前回撤天数: {dd_stats['current_dd_days']:>10}天
+{'='*60}
+"""
+        
+        # 因子持久性
+        factor_report = ""
+        if factor_series is not None:
+            autocorr = self._calc_factor_autocorr(factor_series)
+            factor_report = f"""
+因子持久性分析:
+{'='*60}
+1期自相关:   {autocorr['lag_1']:>10.3f}
+3期自相关:   {autocorr['lag_3']:>10.3f}
+12期自相关:  {autocorr['lag_12']:>10.3f}
+持久性判定:   {'是 ✓' if autocorr['is_persistent'] else '否 ✗'}
+{'='*60}
+"""
+        
+        # Brinson归因
+        attribution_report = ""
+        if all([port_weights is not None, port_returns is not None,
+                bench_weights is not None, bench_returns is not None]):
+            brinson = BrinsonAttribution()
+            attr_result = brinson.analyze(port_weights, port_returns,
+                                          bench_weights, bench_returns)
+            attribution_report = f"""
+Brinson归因分析:
+{'='*60}
+配置效应:     {attr_result['allocation']:>10.2%}
+选股效应:     {attr_result['selection']:>10.2%}
+交互效应:     {attr_result['interaction']:>10.2%}
+总超额收益:   {attr_result['total']:>10.2%}
+配置贡献占比: {attr_result['alloc_pct']:>10.1%}
+选股贡献占比: {attr_result['select_pct']:>10.1%}
+{'='*60}
+"""
+        
+        return base_report + dd_report + factor_report + attribution_report
 
 
 # ──────────────────────────────────────────────────────────────

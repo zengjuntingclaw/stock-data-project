@@ -79,13 +79,58 @@ class PerformanceMetrics:
 
 @dataclass
 class TradingCostConfig:
+    """
+    交易成本配置（支持历史时间感知）
+    
+    A股印花税历史调整：
+    - 2023-08-28之前：卖方 1‰
+    - 2023-08-28及之后：卖方 0.5‰（减半征收）
+    """
     commission_rate: float = 0.0003
     min_commission: float = 5.0
-    stamp_tax_rate: float = 0.001
+    stamp_tax_rate: float = 0.001  # 默认值（旧税率）
     slippage_rate: float = 0.001
     
-    def calculate_cost(self, side: OrderSide, amount: float) -> Tuple[float, float, float]:
+    # 印花税调整关键日期
+    STAMP_TAX_REFORM_DATE = datetime(2023, 8, 28)
+    STAMP_TAX_RATE_OLD = 0.001   # 1‰
+    STAMP_TAX_RATE_NEW = 0.0005  # 0.5‰
+    
+    def get_stamp_tax_rate(self, trade_date: Optional[datetime] = None) -> float:
+        """
+        获取指定日期的印花税率
+        
+        Parameters
+        ----------
+        trade_date : datetime, optional
+            交易日期。如不提供，返回当前配置的税率
+        """
+        if trade_date is None:
+            return self.stamp_tax_rate
+        
+        # 2023-08-28起减半征收
+        if trade_date >= self.STAMP_TAX_REFORM_DATE:
+            return self.STAMP_TAX_RATE_NEW
+        return self.STAMP_TAX_RATE_OLD
+    
+    def calculate_cost(self, side: OrderSide, amount: float, 
+                       trade_date: Optional[datetime] = None) -> Tuple[float, float, float]:
+        """
+        计算交易成本
+        
+        Parameters
+        ----------
+        side : OrderSide
+            买卖方向
+        amount : float
+            成交金额
+        trade_date : datetime, optional
+            交易日期（用于确定印花税率）
+        """
         commission = max(amount * self.commission_rate, self.min_commission)
-        stamp_tax = amount * self.stamp_tax_rate if side == OrderSide.SELL else 0.0
+        stamp_tax = 0.0
+        if side == OrderSide.SELL:
+            stamp_tax_rate = self.get_stamp_tax_rate(trade_date)
+            stamp_tax = amount * stamp_tax_rate
         slippage = amount * self.slippage_rate
         return commission, stamp_tax, slippage

@@ -536,13 +536,13 @@ class ExecutionEngineV2:
                 trade = self._execute_sell(sym, sell_shares, price, trade_date)
                 trades.append(trade)
         
-        # 执行买入
+        # 执行买入（考虑手数约束）
         for sym, target in target_shares.items():
             current = self.positions.get(sym, Position(sym, 0, 0, 0, trade_date, trade_date))
             
             if target > current.shares:
-                # 买入
-                buy_shares = target - current.shares
+                # 需要买入
+                buy_needed = target - current.shares
                 price = self._get_price(market_data, sym, "open")
                 
                 # 检查涨停
@@ -550,13 +550,20 @@ class ExecutionEngineV2:
                     logger.warning(f"{trade_date} | {sym} 涨停，无法买入")
                     continue
                 
-                # 检查资金（使用available_cash而非cash）
-                amount = buy_shares * price
-                if amount > self.available_cash:
-                    buy_shares = int(self.available_cash / price / 100) * 100
+                # A股手数约束：必须是100股整数倍
+                max_shares_by_cash = int(self.available_cash / price / 100) * 100
+                buy_shares = min(buy_needed, max_shares_by_cash)
                 
-                if buy_shares > 0:
-                    trade = self._execute_buy(sym, buy_shares, price, trade_date)
+                # 再次检查手数约束
+                buy_shares = (buy_shares // 100) * 100
+                
+                if buy_shares < 100:
+                    # 资金不足以买1手，跳过
+                    logger.debug(f"{trade_date} | {sym} 资金不足，无法买入1手")
+                    continue
+                
+                trade = self._execute_buy(sym, buy_shares, price, trade_date)
+                if trade:
                     trades.append(trade)
         
         return {
@@ -566,10 +573,30 @@ class ExecutionEngineV2:
         }
     
     def _execute_buy(self, symbol: str, shares: int, price: float, date: datetime) -> Dict:
-        """执行买入"""
+        """
+        执行买入
+        
+        A股交易规则：
+        - 买入必须是100股（1手）的整数倍
+        - 最小佣金5元
+        """
+        # 强制手数约束
+        shares = (shares // 100) * 100
+        if shares <= 0:
+            return None
+        
         amount = shares * price
-        commission = max(amount * self.cost_config["commission"], self.cost_config["min_commission"])
-        slippage = amount * self.cost_config["slippage"]
+        
+        # 使用时间感知的成本计算
+        from scripts.data_classes import TradingCostConfig, OrderSide
+        cost_config = TradingCostConfig()
+        commission, stamp_tax, slippage = cost_config.calculate_cost(
+            OrderSide.BUY, amount, date
+        )
+        
+        # 确保最小佣金
+        commission = max(commission, 5.0)
+        
         total_cost = amount + commission + slippage
         
         if symbol in self.positions:
@@ -612,24 +639,45 @@ class ExecutionEngineV2:
         return trade
     
     def _execute_sell(self, symbol: str, shares: int, price: float, date: datetime) -> Dict:
-        """执行卖出"""
+        """
+        执行卖出
+        
+        A股交易规则：
+        - 卖出可以卖出全部持仓（包括碎股）
+        - 剩余股数<100股时，强制清仓（不能保留碎股）
+        - 印花税：2023-08-28前1‰，之后0.5‰
+        """
+        pos = self.positions[symbol]
+        
+        # 检查是否需要碎股清仓
+        remaining = pos.shares - shares
+        if 0 < remaining < 100:
+            # 剩余不足1手，强制清仓
+            shares = pos.shares
+            logger.debug(f"{date} | {symbol} 剩余{remaining}股不足1手，强制清仓")
+        
         amount = shares * price
-        commission = max(amount * self.cost_config["commission"], self.cost_config["min_commission"])
-        stamp_tax = amount * self.cost_config["stamp_tax"]
-        slippage = amount * self.cost_config["slippage"]
+        
+        # 使用时间感知的成本计算
+        from scripts.data_classes import TradingCostConfig, OrderSide
+        cost_config = TradingCostConfig()
+        commission, stamp_tax, slippage = cost_config.calculate_cost(
+            OrderSide.SELL, amount, date
+        )
+        
+        # 确保最小佣金
+        commission = max(commission, 5.0)
+        
         net_proceeds = amount - commission - stamp_tax - slippage
         
-        pos = self.positions[symbol]
         pos.shares -= shares
         pos.available_shares -= shares
         pos.last_update = date
         
-        if pos.shares == 0:
+        if pos.shares <= 0:
             del self.positions[symbol]
         
-        # A股资金结算：
-        # - 卖出所得当日可买（加到available_cash）
-        # - 但不可取（记录到pending_withdraw，次日可取）
+        # A股资金结算：卖出所得当日可买，但不可取
         self.cash += net_proceeds
         self.available_cash += net_proceeds
         self.pending_withdraw += net_proceeds
