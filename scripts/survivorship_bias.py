@@ -84,7 +84,7 @@ class SurvivorshipBiasHandler:
                     if rs.error_code != '0':
                         continue
                     
-                    while (rs.error_code == '0') & rs.next():
+                    while rs.next() and rs.error_code == '0':
                         row = rs.get_row_data()
                         symbol = row[0].split('.')[1]  # sh.600000 -> 600000
                         

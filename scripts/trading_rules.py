@@ -83,17 +83,15 @@ class AShareTradingRules:
     
     @classmethod
     def get_board(cls, symbol: str) -> str:
-        """根据股票代码识别板块"""
-        import re
-        # 注意：股票代码都是6位数字
-        if re.match(r'^688[0-9]{3}$', symbol):  # 科创板 688xxx
-            return cls.BOARD_STAR
-        elif re.match(r'^30[0-9]{4}$', symbol):  # 创业板 300xxx-309xxx
-            return cls.BOARD_CHINEXT
-        elif re.match(r'^8[0-9]{5}$', symbol) or re.match(r'^4[0-9]{5}$', symbol):  # 北交所 8xxxxx/4xxxxx
-            return cls.BOARD_BSE
-        else:  # 主板 60xxxx, 00xxxx, 68xxxx(非688)
-            return cls.BOARD_MAIN
+        """根据股票代码识别板块（委托到 data_engine.detect_board 的映射）"""
+        from scripts.data_engine import detect_board
+        board_map = {
+            '主板': cls.BOARD_MAIN,
+            '创业板': cls.BOARD_CHINEXT,
+            '科创板': cls.BOARD_STAR,
+            '北交所': cls.BOARD_BSE,
+        }
+        return board_map.get(detect_board(symbol), cls.BOARD_MAIN)
     
     @classmethod
     def get_price_limit(cls, symbol: str, date: datetime, list_date: datetime = None) -> float:
@@ -278,13 +276,24 @@ class TradingCalendar:
         '2026-10-01', '2026-10-02', '2026-10-03', '2026-10-04', '2026-10-05', '2026-10-06', '2026-10-07', '2026-10-08',  # 国庆+中秋
     ]
     
+    # 2027年节假日（预估，具体以国务院公告为准）
+    HOLIDAYS_2027 = [
+        '2027-01-01',  # 元旦
+        '2027-02-06', '2027-02-07', '2027-02-08', '2027-02-09', '2027-02-10', '2027-02-11', '2027-02-12',  # 春节（预估）
+        '2027-04-05',  # 清明
+        '2027-05-01', '2027-05-02', '2027-05-03',  # 劳动节
+        '2027-06-09', '2027-06-10', '2027-06-11',  # 端午
+        '2027-10-01', '2027-10-02', '2027-10-03', '2027-10-04', '2027-10-05', '2027-10-06', '2027-10-07',  # 国庆
+    ]
+    
     def __init__(self):
         self._holidays = set()
-        # 加载所有已知节假日（2018-2026）
+        # 加载所有已知节假日（2018-2027）
         for year_holidays in [
             self.HOLIDAYS_2018, self.HOLIDAYS_2019, self.HOLIDAYS_2020,
             self.HOLIDAYS_2021, self.HOLIDAYS_2022, self.HOLIDAYS_2023,
             self.HOLIDAYS_2024, self.HOLIDAYS_2025, self.HOLIDAYS_2026,
+            self.HOLIDAYS_2027,
         ]:
             self.add_holidays(year_holidays)
     

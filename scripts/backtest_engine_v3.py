@@ -68,7 +68,7 @@ class BacktestState:
                 'withdrawable': self.cash.withdrawable,
             },
             'positions': {
-                sym: {'shares': pos.shares, 'avg_cost': pos.avg_cost}
+                sym: {'shares': pos.shares, 'available_shares': pos.available_shares, 'avg_cost': pos.avg_cost}
                 for sym, pos in self.positions.items()
             },
         }
@@ -386,12 +386,21 @@ class ProductionBacktestEngine:
         # 序列化 daily_values（daily_records 同步保存）
         state_data['daily_records'] = self.daily_records
         # 同步 execution engine 的内部状态（pending_settlements 等）
-        state_data['execution'] = {
-            'pending_settlements': [
-                {'symbol': ps['symbol'], 'amount': ps['amount'], 'settle_date': ps['settle_date'].isoformat()}
-                for ps in getattr(self.execution, 'pending_settlements', [])
-            ],
-        }
+        pending_settles = getattr(self.execution, 'pending_settlements', [])
+        if pending_settles:
+            # pending_settlements 是 List[Tuple[datetime, float]]
+            state_data['execution'] = {
+                'pending_settlements': [
+                    {'settle_date': item[0].isoformat(), 'amount': item[1]}
+                    for item in pending_settles
+                ],
+                'pending_withdrawals': [
+                    {'withdrawable_date': item[0].isoformat(), 'amount': item[1]}
+                    for item in getattr(self.execution.cash, 'pending_withdrawals', [])
+                ],
+            }
+        else:
+            state_data['execution'] = {}
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(state_data, f, default=str, ensure_ascii=False)
@@ -415,14 +424,14 @@ class ProductionBacktestEngine:
             self.daily_records = data.get('daily_records', [])
             # 恢复 execution engine 的 pending_settlements
             exec_data = data.get('execution', {})
-            if exec_data and hasattr(self.execution, 'pending_settlements'):
-                self.execution.pending_settlements = [
-                    {
-                        'symbol': ps['symbol'],
-                        'amount': ps['amount'],
-                        'settle_date': datetime.fromisoformat(ps['settle_date']),
-                    }
+            if exec_data and hasattr(self.execution.cash, 'pending_settlements'):
+                self.execution.cash.pending_settlements = [
+                    (datetime.fromisoformat(ps['settle_date']), ps['amount'])
                     for ps in exec_data.get('pending_settlements', [])
+                ]
+                self.execution.cash.pending_withdrawals = [
+                    (datetime.fromisoformat(pw['withdrawable_date']), pw['amount'])
+                    for pw in exec_data.get('pending_withdrawals', [])
                 ]
             logger.info(f"Checkpoint restored: date={data['current_date']}, "
                        f"trades={len(self.state.trade_history)}, "

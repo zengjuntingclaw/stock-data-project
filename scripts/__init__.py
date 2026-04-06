@@ -27,6 +27,9 @@ from scripts.performance import EnhancedPerformanceAnalyzer, BrinsonAttribution
 # 数据引擎（v1兼容）
 from scripts.data_engine import DataEngine, detect_board, detect_limit, build_ts_code
 
+# 数据验证器
+from scripts.data_validator import DataValidator
+
 __version__ = "3.0.0"
 __all__ = [
     # 数据类
@@ -46,4 +49,6 @@ __all__ = [
     "EnhancedPerformanceAnalyzer", "BrinsonAttribution",
     # 数据引擎
     "DataEngine", "detect_board", "detect_limit", "build_ts_code",
+    # 数据验证器
+    "DataValidator",
 ]

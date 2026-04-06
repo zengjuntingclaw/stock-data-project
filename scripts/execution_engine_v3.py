@@ -96,7 +96,7 @@ class ExecutionEngineV3:
         self.commission_rate = commission_rate
         self.min_commission = min_commission
         self.slippage_rate = slippage_rate
-        self.adv_limit = adv_limit
+        self.adv_limit = adv_limit  # ADV 流动性限制：单笔交易不超过日均成交量的此比例（默认10%）
         
         self.calendar = TradingCalendar()
         self.cash = CashAccount(total=initial_cash, available=initial_cash, withdrawable=initial_cash)
@@ -133,7 +133,7 @@ class ExecutionEngineV3:
                 pos.shares * prices.get(sym, 0) 
                 for sym, pos in self.positions.items()
             )
-            # 计算总资产时应包含待结算资金
+            # 总资产 = 可用资金 + 持仓市值 + 待结算资金（已卖出但T+1未到账）
             pending_amount = sum(amount for _, amount in self.cash.pending_settlements)
             total_value = self.cash.available + position_value + pending_amount
         
@@ -402,15 +402,12 @@ class ExecutionEngineV3:
     def update_position_available(self, current_date: datetime):
         """T+1持仓可卖数量更新
         
-        买入的股票在下一个交易日变为可卖状态。
-        所有持仓的 available_shares 应在 T+1 日同步为 shares（减去今日新买入的部分）。
+        规则：
+        - 每个交易日开始时，所有持仓的 available_shares 同步为 shares
+        - 当日买入的股票不可卖（T+1），因为买入发生在本方法之后
+        - 当日卖出的股票已从 available_shares 扣减
         """
         for sym, pos in self.positions.items():
-            # available_shares 应始终等于 shares 减去今日买入的
-            # 简化处理：每日结算时同步 available_shares = shares
-            # 因为买入是在 execute 时执行，下一个交易日才释放
-            # 但如果今日有卖出，available_shares 已经被减少
-            # 所以正确的逻辑是：每个交易日开始时，把昨天的冻结释放
             pos.available_shares = pos.shares
     
     def get_portfolio_value(self, prices: Dict[str, float]) -> Dict[str, float]:
