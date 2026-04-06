@@ -285,9 +285,9 @@ class ProductionBacktestEngine:
         
         try:
             # 从pit_aligner获取PIT对齐的因子数据
-            # 只获取ann_date <= prev_date的数据
-            factor_df = self.pit_aligner.get_factors_at_date(
-                factor_names=['roe', 'pe_ttm', 'pb', 'market_cap'],
+            # 使用正确的方法名：get_factors（复数形式）
+            factor_df = self.pit_aligner.get_factors(
+                factor_names=['roe', 'pe_ttm', 'pb'],
                 date=prev_date,
                 symbols=None  # 获取全市场
             )
