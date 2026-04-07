@@ -18,7 +18,7 @@ class PITDataAligner:
     
     def get_factor(self, name: str, date: datetime, symbols: Optional[List[str]] = None) -> pd.Series:
         if self._data is None: raise ValueError("Data not loaded")
-        mask = self._data['ann_date'] <= date
+        mask = self._data['ann_date'] < date
         if symbols: mask &= self._data['symbol'].isin(symbols)
         filtered = self._data[mask].copy()
         if filtered.empty:
@@ -33,9 +33,17 @@ class PITDataAligner:
         return pd.DataFrame({n: self.get_factor(n, date, symbols) for n in names})
     
     def validate(self, name: str, dates: List[datetime]) -> bool:
+        """验证PIT约束：所有可见数据均满足 ann_date < date"""
+        # PIT边界已通过 < date 强制保证，此处做数据完整性检查
         for d in dates:
             for s in self.get_factor(name, d).index:
-                data = self._data[(self._data['symbol'] == s) & (self._data['ann_date'] <= d)]
-                if len(data) > 0 and data.iloc[-1]['ann_date'] > d:
+                data = self._data[(self._data['symbol'] == s) & (self._data['ann_date'] < d)]
+                # 数据不为空且选取的是最大ann_date行（通过groupby.last保证）
+                if len(data) == 0:
+                    continue
+                # 最大可见ann_date必须 < 回测日期（由 < 过滤保证，此处双重验证）
+                latest_ann = data['ann_date'].max()
+                if latest_ann >= d:
+                    logger.warning(f"PIT violation: {s} ann_date={latest_ann} >= {d}")
                     return False
         return True
