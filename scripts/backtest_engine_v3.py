@@ -55,9 +55,9 @@ class BacktestState:
     current_date: datetime
     cash: CashAccount
     positions: Dict[str, Position]
-    pending_orders: List[Order] = field(default_factory=list)
     trade_history: List[Any]
     daily_values: List[Dict]
+    pending_orders: List[Order] = field(default_factory=list)
     
     def to_dict(self) -> Dict:
         return {
@@ -171,9 +171,9 @@ class ProductionBacktestEngine:
             current_date=self.config.start_date,
             cash=self.execution.cash,
             positions=self.execution.positions,
-            pending_orders=[],
             trade_history=[],
             daily_values=[],
+            pending_orders=[],
         )
         
         # 加载历史股票池（幸存者偏差治理）

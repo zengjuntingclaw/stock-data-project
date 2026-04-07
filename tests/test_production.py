@@ -167,12 +167,14 @@ class TestSurvivorshipBias(unittest.TestCase):
         self.handler._stocks['TEST001'] = StockLifetime(
             symbol='TEST001',
             name='Test Stock',
+            ts_code='TEST001.SZ',
             list_date=datetime(2020, 1, 1),
             delist_date=datetime(2023, 6, 1),
         )
         self.handler._stocks['TEST002'] = StockLifetime(
             symbol='TEST002',
             name='Active Stock',
+            ts_code='TEST002.SZ',
             list_date=datetime(2020, 1, 1),
             delist_date=None,
         )
