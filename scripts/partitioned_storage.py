@@ -107,10 +107,9 @@ class PartitionedStorage:
     
     def _ensure_directory_structure(self):
         """确保目录结构存在"""
-        # Parquet目录结构
-        (self.parquet_root / "daily").mkdir(parents=True, exist_ok=True)
-        (self.parquet_root / "financial").mkdir(parents=True, exist_ok=True)
-        (self.parquet_root / "valuation").mkdir(parents=True, exist_ok=True)
+        # Parquet目录结构（使用显式映射）
+        for table in self._ALLOWED_TABLES:
+            self._get_parquet_dir(table).mkdir(parents=True, exist_ok=True)
         (self.parquet_root / "archive").mkdir(parents=True, exist_ok=True)
         
         # 元数据目录
@@ -185,13 +184,12 @@ class PartitionedStorage:
         
         # 确定输出路径
         tier = self._determine_tier(year)
-        output_dir = self.parquet_root / table.replace('_', '') / str(year)
+        output_dir = self._get_parquet_dir(table) / str(year)
         output_dir.mkdir(parents=True, exist_ok=True)
         output_file = output_dir / f"{table}_{year}.parquet"
         
-        # 从DuckDB导出
-        conn = duckdb.connect(str(self.db_path))
-        try:
+        # 从DuckDB导出（连接池）
+        with self._get_connection(read_only=True) as conn:
             start_date = f"{year}-01-01"
             end_date = f"{year}-12-31"
             
@@ -228,9 +226,6 @@ class PartitionedStorage:
             logger.info(f"Archived {table} {year}: {count_result[0]} records, {file_size:.1f} MB")
             
             return output_file
-            
-        finally:
-            conn.close()
     
     def load_from_parquet(self,
                          table: str,
@@ -246,7 +241,7 @@ class PartitionedStorage:
         
         dfs = []
         for year in range(start_year, end_year + 1):
-            parquet_file = self.parquet_root / table.replace('_', '') / str(year) / f"{table}_{year}.parquet"
+            parquet_file = self._get_parquet_dir(table) / str(year) / f"{table}_{year}.parquet"
             
             if parquet_file.exists():
                 df = pd.read_parquet(parquet_file)
@@ -314,6 +309,21 @@ class PartitionedStorage:
         'daily_quotes', 'stock_basic', 'financial_data', 'index_constituents',
         'st_status_history', 'trade_calendar', 'daily_valuation'
     })
+    
+    # Parquet目录映射（表名 → 目录名，显式映射避免下划线规则歧义）
+    _PARQUET_DIR_MAP = {
+        'daily_quotes': 'daily',
+        'stock_basic': 'basic',
+        'financial_data': 'financial',
+        'index_constituents': 'index',
+        'st_status_history': 'status',
+        'trade_calendar': 'calendar',
+        'daily_valuation': 'valuation',
+    }
+    
+    def _get_parquet_dir(self, table: str) -> Path:
+        """获取表对应的Parquet目录"""
+        return self.parquet_root / self._PARQUET_DIR_MAP.get(table, table.replace('_', ''))
     
     def _get_connection(self, read_only: bool = False):
         """从连接池获取连接（上下文管理器，读写分离）"""
@@ -411,9 +421,7 @@ class PartitionedStorage:
                        end_date: str,
                        ts_codes: Optional[List[str]] = None,
                        columns: Optional[List[str]] = None) -> pd.DataFrame:
-        """查询Parquet冷数据 - 使用DuckDB进行列式扫描"""
-        import duckdb
-        
+        """查询Parquet冷数据 - 使用DuckDB进行列式扫描（连接池）"""
         # 表名白名单校验
         if table not in self._ALLOWED_TABLES:
             raise ValueError(f"Table '{table}' not in allowed list: {sorted(self._ALLOWED_TABLES)}")
@@ -424,7 +432,7 @@ class PartitionedStorage:
         # 收集需要读取的Parquet文件
         parquet_files = []
         for year in range(start_year, end_year + 1):
-            pf = self.parquet_root / table.replace('_', '') / str(year) / f"{table}_{year}.parquet"
+            pf = self._get_parquet_dir(table) / str(year) / f"{table}_{year}.parquet"
             if pf.exists():
                 parquet_files.append(str(pf))
         
@@ -432,8 +440,7 @@ class PartitionedStorage:
             return pd.DataFrame()
         
         # 使用DuckDB读取Parquet（支持谓词下推）
-        conn = duckdb.connect()
-        try:
+        with self._get_connection(read_only=True) as conn:
             # 注册Parquet文件
             files_str = ", ".join([f"'{f}'" for f in parquet_files])
             
@@ -466,9 +473,6 @@ class PartitionedStorage:
                 """, (start_date, end_date)).fetchdf()
             
             return result
-            
-        finally:
-            conn.close()
     
     def get_partition_stats(self) -> Dict:
         """获取分区统计信息"""

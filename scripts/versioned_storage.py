@@ -134,14 +134,16 @@ class VersionedStorage:
         self._cache_ttl_seconds = 3600  # 1小时TTL
         self._cache_last_cleanup = datetime.now()
         
-        # 连接池（复用连接减少开销）
+        # 连接池（读写分离，减少开销）
+        # 延迟导入duckdb，避免循环依赖；使用类级别锁保证线程安全
         global duckdb
         if duckdb is None:
             import duckdb as _duckdb
             duckdb = _duckdb
-        self._connection_pool: List = []
-        self._connection_pool_max = 5
-        self._connection_pool_lock = threading.Lock()
+        self._write_pool: List = []    # 写连接池（可复用）
+        self._read_pool: List = []      # 读连接池（可复用）
+        self._pool_max = 5
+        self._pool_lock = threading.Lock()
         
         self._init_schema()
         logger.info(f"VersionedStorage initialized: {self.db_path}")
@@ -426,8 +428,7 @@ class VersionedStorage:
         """获取数据版本历史"""
         import duckdb
         
-        conn = duckdb.connect(str(self.db_path), read_only=True)
-        try:
+        with self._get_connection(read_only=True) as conn:
             result = conn.execute("""
                 SELECT * FROM versioned_data
                 WHERE ts_code = ? AND data_type = ? AND trade_date = ?
@@ -454,9 +455,6 @@ class VersionedStorage:
                 ))
             
             return snapshots
-            
-        finally:
-            conn.close()
     
     def audit_data_integrity(self, 
                             ts_code: Optional[str] = None,
@@ -471,8 +469,6 @@ class VersionedStorage:
         2. 未来数据（effective_at > recorded_at超过合理阈值）
         3. 数据缺失
         """
-        import duckdb
-        
         issues = []
         
         # 构建查询条件
@@ -493,70 +489,73 @@ class VersionedStorage:
         
         where_clause = " AND ".join(conditions)
         
+        # 读操作：查询待审计数据
         with self._get_connection(read_only=True) as conn:
-            # 获取待审计数据
             result = conn.execute(f"""
                 SELECT ts_code, data_type, trade_date, version, 
                        data_hash, data_json, effective_at, recorded_at
                 FROM versioned_data
                 WHERE {where_clause}
             """, params).fetchdf()
+        
+        # 计算哈希（内存操作）
+        for _, row in result.iterrows():
+            data = json.loads(row['data_json'])
+            computed_hash = hashlib.sha256(
+                json.dumps(data, sort_keys=True, default=str).encode()
+            ).hexdigest()[:16]
             
-            for _, row in result.iterrows():
-                data = json.loads(row['data_json'])
-                computed_hash = hashlib.sha256(
-                    json.dumps(data, sort_keys=True, default=str).encode()
-                ).hexdigest()[:16]
+            # 检查哈希
+            if computed_hash != row['data_hash']:
+                issues.append({
+                    'type': 'hash_mismatch',
+                    'ts_code': row['ts_code'],
+                    'data_type': row['data_type'],
+                    'trade_date': row['trade_date'],
+                    'severity': 'critical',
+                    'detail': f"Hash mismatch: stored={row['data_hash']}, computed={computed_hash}"
+                })
+            
+            # 检查未来数据（财务数据公告日通常不会比报告日晚超过120天）
+            if row['data_type'] == 'financial':
+                effective = row['effective_at']
+                recorded = row['recorded_at']
+                if hasattr(effective, 'to_pydatetime'):
+                    effective = effective.to_pydatetime()
+                if hasattr(recorded, 'to_pydatetime'):
+                    recorded = recorded.to_pydatetime()
                 
-                # 检查哈希
-                if computed_hash != row['data_hash']:
+                days_diff = (effective - recorded).days
+                if days_diff > 120:
                     issues.append({
-                        'type': 'hash_mismatch',
+                        'type': 'suspicious_future_data',
                         'ts_code': row['ts_code'],
                         'data_type': row['data_type'],
                         'trade_date': row['trade_date'],
-                        'severity': 'critical',
-                        'detail': f"Hash mismatch: stored={row['data_hash']}, computed={computed_hash}"
+                        'severity': 'warning',
+                        'detail': f"Effective date {days_diff} days after recorded"
                     })
-                
-                # 检查未来数据（财务数据公告日通常不会比报告日晚超过120天）
-                if row['data_type'] == 'financial':
-                    effective = row['effective_at']
-                    recorded = row['recorded_at']
-                    if hasattr(effective, 'to_pydatetime'):
-                        effective = effective.to_pydatetime()
-                    if hasattr(recorded, 'to_pydatetime'):
-                        recorded = recorded.to_pydatetime()
-                    
-                    days_diff = (effective - recorded).days
-                    if days_diff > 120:
-                        issues.append({
-                            'type': 'suspicious_future_data',
-                            'ts_code': row['ts_code'],
-                            'data_type': row['data_type'],
-                            'trade_date': row['trade_date'],
-                            'severity': 'warning',
-                            'detail': f"Effective date {days_diff} days after recorded"
-                        })
-            
-            # 记录审计结果
-            for issue in issues:
-                conn.execute("""
-                    INSERT INTO data_audit
-                    (ts_code, data_type, trade_date, audit_type, severity, detail)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, (
-                    issue['ts_code'], issue['data_type'], issue['trade_date'],
-                    issue['type'], issue['severity'], issue['detail']
-                ))
-            
-            return {
-                'total_checked': len(result),
-                'issues_found': len(issues),
-                'critical': len([i for i in issues if i['severity'] == 'critical']),
-                'warnings': len([i for i in issues if i['severity'] == 'warning']),
-                'issues': issues[:10]  # 只返回前10个
-            }
+        
+        # 写操作：记录审计结果
+        if issues:
+            with self._get_connection(read_only=False) as conn:
+                for issue in issues:
+                    conn.execute("""
+                        INSERT INTO data_audit
+                        (ts_code, data_type, trade_date, audit_type, severity, detail)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (
+                        issue['ts_code'], issue['data_type'], issue['trade_date'],
+                        issue['type'], issue['severity'], issue['detail']
+                    ))
+        
+        return {
+            'total_checked': len(result),
+            'issues_found': len(issues),
+            'critical': len([i for i in issues if i['severity'] == 'critical']),
+            'warnings': len([i for i in issues if i['severity'] == 'warning']),
+            'issues': issues[:10]  # 只返回前10个
+        }
     
     def _get_next_version(self, key: DataSnapshotKey) -> int:
         """获取下一个版本号"""
@@ -617,48 +616,58 @@ class VersionedStorage:
             logger.debug(f"Cache LRU cleanup: {len(keys_to_remove)} evicted")
     
     def _get_connection(self, read_only: bool = False):
-        """从连接池获取连接（上下文管理器）"""
+        """从连接池获取连接（上下文管理器）
+        
+        读写分离：写连接和读连接各自独立池，完全隔离，避免 read_only=True 的连接
+        被错误地用于写入操作导致崩溃。
+        """
         import contextlib
         
         @contextlib.contextmanager
         def _conn():
-            conn = None
-            from_pool = False
+            pool = self._read_pool if read_only else self._write_pool
             
             # 尝试从连接池获取
-            if not read_only:
-                with self._connection_pool_lock:
-                    if self._connection_pool:
-                        conn = self._connection_pool.pop()
-                        from_pool = True
+            conn = None
+            from_pool = False
+            with self._pool_lock:
+                if pool:
+                    conn = pool.pop()
+                    from_pool = True
             
-            # 连接池为空或只读模式，创建新连接
+            # 池为空，创建新连接
             if conn is None:
                 conn = duckdb.connect(str(self.db_path), read_only=read_only)
             
             try:
                 yield conn
             finally:
-                if from_pool and not read_only and len(self._connection_pool) < self._connection_pool_max:
-                    # 归还到连接池
-                    with self._connection_pool_lock:
-                        self._connection_pool.append(conn)
-                else:
-                    # 关闭连接
-                    conn.close()
+                with self._pool_lock:
+                    if from_pool and len(pool) < self._pool_max:
+                        # 归还到对应池
+                        pool.append(conn)
+                    else:
+                        # 关闭连接
+                        conn.close()
         
         return _conn()
     
     def close(self):
         """关闭所有连接池连接"""
-        with self._connection_pool_lock:
-            for conn in self._connection_pool:
+        with self._pool_lock:
+            for conn in self._write_pool:
                 try:
                     conn.close()
                 except Exception:
                     pass
-            self._connection_pool.clear()
-        logger.info("Connection pool closed")
+            self._write_pool.clear()
+            for conn in self._read_pool:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            self._read_pool.clear()
+        logger.info("Connection pools closed")
 
 
 class FinancialDataPITManager:

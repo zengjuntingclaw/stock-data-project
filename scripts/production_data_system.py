@@ -17,7 +17,7 @@
     
     # 查询PIT数据
     data = pds.get_financial_pit('000001.SZ', '2026-01-15')  # 返回None（年报未公告）
-    data = pds.get_financial_pit('0000001.SZ', '2026-04-01')  # 返回年报数据
+    data = pds.get_financial_pit('000001.SZ', '2026-04-01')  # 返回年报数据
     
     # 运行数据QA
     report = pds.run_qa_check()
