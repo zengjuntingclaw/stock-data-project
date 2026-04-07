@@ -1,0 +1,77 @@
+[project]
+name = "stock-data-project"
+version = "3.0.0"
+description = "A股多因子回测框架 - 生产级量化投资系统"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    { name = "zengjuntingclaw", email = "mini_zeng233@users.noreply.github.com" },
+]
+license = { text = "MIT" }
+keywords = ["quantitative", "backtesting", "a-share", "stock", "multi-factor"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "numpy>=1.26.4",
+    "pandas>=2.2.3",
+    "scipy>=1.13.1",
+    "akshare>=1.18.50",
+    "baostock>=0.8.8",
+    "duckdb>=1.1.3",
+    "pyarrow>=17.0.0",
+    "empyrical-reloaded>=0.5.12",
+    "matplotlib>=3.9.3",
+    "seaborn>=0.13.2",
+    "loguru>=0.7.3",
+    "tqdm>=4.67.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.5",
+    "pytest-cov>=6.0.0",
+]
+all = [
+    "pytest>=8.3.5",
+    "pytest-cov>=6.0.0",
+]
+
+[project.scripts]
+run-backtest = "run_backtest:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+
+[tool.coverage.run]
+source = ["scripts"]
+branch = true
+omit = [
+    "scripts/__init__.py",
+    "scripts/*_bak.py",
+    "*/tests/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["scripts"]

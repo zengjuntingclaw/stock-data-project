@@ -23,7 +23,6 @@ import random
 
 from loguru import logger
 
-warnings.filterwarnings("ignore")
 
 # ──────────────────────────────────────────────────────────────
 # 全局常量

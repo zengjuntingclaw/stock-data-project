@@ -1,36 +1,62 @@
-﻿# Python
+# ── Python ──────────────────────────────────────────
 __pycache__/
 *.py[cod]
-*.class
+*.pyo
+*.pyd
 *.so
-.Python
 *.egg-info/
 .eggs/
+*.egg
 
-# 数据文件（不上传）
-*.duckdb
-*.parquet
-*.csv
-*.h5
-*.hdf5
+# ── Virtualenv / Build ───────────────────────────────
+.venv/
+venv/
+ENV/
+env/
+build/
+dist/
+*.whl
 
-# 日志
-logs/
-*.log
-
-# 输出文件
-_output/
-
-# 临时文件
-_tmp_parquet/
-data/_tmp_parquet/
-
-# IDE
+# ── IDE ─────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
 *.swo
+*.swn
+.project
+.settings/
 
-# 系统文件
+# ── Data files (local, never upload) ─────────────────
+*.duckdb
+*.duckdb.wal
+*.parquet
+*.csv
+*.h5
+*.hdf5
+data/*.db
+data/*.parquet
+
+# ── Logs ────────────────────────────────────────────
+logs/
+*.log
+
+# ── Output / Temp ──────────────────────────────────
+_output/
+_tmp_parquet/
+data/_tmp_parquet/
+
+# ── OS ──────────────────────────────────────────────
 .DS_Store
 Thumbs.db
+desktop.ini
+
+# ── CI / Env secrets (never commit) ─────────────────
+.env
+.env.local
+*.pem
+*.key
+
+# ── Checkpoint / Cache ──────────────────────────────
+*.ckpt
+*.checkpoint
+.cache/

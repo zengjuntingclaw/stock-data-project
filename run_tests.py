@@ -1,55 +1,53 @@
-"""测试运行脚本
+"""Test runner for A股多因子回测框架 v3.0
 
-用法：
-    python run_tests.py              # 运行所有测试
-    python run_tests.py -v           # 详细输出
-    python run_tests.py test_core    # 只运行核心测试
-    python run_tests.py test_production  # 只运行生产级测试
+Usage:
+    python run_tests.py              # Run all tests
+    python run_tests.py -v           # Verbose
+    python run_tests.py test_core    # Core tests only
+    python run_tests.py test_production
+    python run_tests.py --cov        # With coverage report
 """
+from __future__ import annotations
+
 import sys
 import subprocess
 from pathlib import Path
 
 
-def run_tests(pattern=None, verbose=False):
-    """运行测试"""
-    test_dir = Path(__file__).parent / "tests"
-    
-    cmd = ["python", "-m", "pytest"]
-    
+def run_tests(pattern: str = None, verbose: bool = False, coverage: bool = False) -> int:
+    """Run pytest via sys.executable (portable across venv/CI/Windows)."""
+    project_root = Path(__file__).parent
+    cmd = [sys.executable, "-m", "pytest"]
+
     if verbose:
         cmd.append("-v")
-    
+
+    if coverage:
+        cmd.extend(["--cov=scripts", "--cov-report=term-missing"])
+
     if pattern:
         cmd.append(f"tests/{pattern}.py")
     else:
         cmd.append("tests/")
-    
-    # 添加覆盖率报告（如果安装了pytest-cov）
-    # cmd.extend(["--cov=scripts", "--cov-report=term-missing"])
-    
+
+    # Show Python version and pytest version for reproducibility
+    print(f"Python: {sys.executable}")
     print(f"Running: {' '.join(cmd)}")
     print("=" * 60)
-    
-    result = subprocess.run(cmd, cwd=Path(__file__).parent)
-    return result.returncode
+
+    return subprocess.run(cmd, cwd=project_root).returncode
 
 
-def main():
-    """主函数"""
+def main() -> None:
+    """CLI entry point."""
     args = sys.argv[1:]
-    
     verbose = "-v" in args or "--verbose" in args
-    
-    # 查找测试模式
-    pattern = None
-    for arg in args:
-        if not arg.startswith("-"):
-            pattern = arg
-            break
-    
-    return_code = run_tests(pattern, verbose)
-    sys.exit(return_code)
+    coverage = "--cov" in args
+    args = [a for a in args if a not in ("-v", "--verbose", "--cov")]
+
+    pattern = args[0] if args else None
+    code = run_tests(pattern=pattern, verbose=verbose, coverage=coverage)
+    sys.exit(code)
 
 
 if __name__ == "__main__":
