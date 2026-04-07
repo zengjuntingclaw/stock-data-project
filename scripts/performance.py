@@ -32,7 +32,9 @@ class EnhancedPerformanceAnalyzer:
         )
     
     def _dd_days(self, r: pd.Series) -> int:
-        cum, running_max = (1 + r).cumprod(), r.cumprod().expanding().max()
+        # 统一使用净值序列 (1+r).cumprod() 计算回撤，避免 r.cumprod() 基准不一致
+        cum = (1 + r).cumprod()
+        running_max = cum.expanding().max()
         dd = (cum - running_max) / running_max
         if dd.empty:
             return 0

@@ -275,43 +275,55 @@ class ExecutionEngineV3:
         return trades, remaining
     
     def _is_blocked(self, order: Order, r: pd.Series, date: datetime) -> bool:
-        """检查交易是否被限制
+        """检查交易是否被限制（涨跌停判断）
         
-        涨停/跌停判断：
-        - 涨停：当日最高价 >= 涨停价，且成交量极小（无量涨停）
-        - 跌停：当日最低价 <= 跌停价，且成交量极小（无量跌停）
-        - 有量涨跌停：可以成交（排队）
+        修复说明：
+        - 订单在 T-1 日生成（T-1 收盘后调仓），market_data 是 T-1 日数据
+        - 无法在 T-1 日预知 T 日的 high/low，只能用 pre_close 计算涨跌停板价格
+        - 判断逻辑：T 日开盘价 = 涨停板价格 → 无量涨停无法买入；开盘价 = 跌停板价格 → 无量跌停无法卖出
+        
+        涨跌停规则：
+        - 涨停：open = pre_close * (1 + limit) → 封板，成交量极小时无法买入
+        - 跌停：open = pre_close * (1 - limit) → 封板，成交量极小时无法卖出
+        - 有量涨跌停：可以排队成交
         """
         # 停牌
         if r.get('is_suspended', False):
             return True
         
-        # 涨跌停限制（历史感知）
-        prev_close = r.get('prev_close', r.get('close', r['open']))
-        price_limit = AShareTradingRules.get_price_limit(order.symbol, date)
+        # 用前收盘价计算涨跌停板价格
+        # 注意：daily_quotes 中字段名为 pre_close
+        prev_close = r.get('pre_close', r.get('close', r['open']))
+        if prev_close <= 0:
+            return True  # 无效价格，当停牌处理
         
-        # 计算涨停价和跌停价
+        price_limit = AShareTradingRules.get_price_limit(order.symbol, date)
         limit_up_price = prev_close * (1 + price_limit)
         limit_down_price = prev_close * (1 - price_limit)
         
-        # 成交量判断（无量涨跌停才无法交易）
+        # T日开盘价（来自 T-1 日的 market_data，即 T 日开盘价）
+        open_price = r.get('open', 0)
+        volume = r.get('volume', 0)
+        
+        # 20日均量判断是否"无量"
         avg_volume = r.get('avg_volume_20', None)
         if avg_volume is None or avg_volume <= 0:
-            # avg_volume_20 缺失时，无法准确判断无量，保守跳过低量判断
-            is_low_volume = False
-            logger.debug(f"avg_volume_20 missing for {order.symbol} at {date}, skipping low-volume check")
+            # 无法判断，保守处理：只要触及涨跌停就阻塞
+            is_low_volume = True
+            logger.debug(f"avg_volume_20 missing for {order.symbol}, conservative block")
         else:
-            is_low_volume = r.get('volume', 0) < avg_volume * 0.1  # 成交量低于20日均量10%
+            is_low_volume = volume < avg_volume * 0.1  # 成交量低于20日均量10%
         
         if order.side == OrderSide.BUY:
-            # 买入被阻：涨停且无量（无法买入）
-            # 使用high判断是否触及涨停
-            if r.get('high', r['open']) >= limit_up_price * 0.999 and is_low_volume:
+            # 买入被阻：T日开盘价触及涨停板，且无量
+            # tolerance: 涨停价误差0.1%（浮点精度）
+            if open_price >= limit_up_price * 0.999 and is_low_volume:
+                logger.debug(f"BUY blocked: {order.symbol} limit-up at open={open_price:.2f}, limit={limit_up_price:.2f}")
                 return True
         else:
-            # 卖出被阻：跌停且无量（无法卖出）
-            # 使用low判断是否触及跌停
-            if r.get('low', r['open']) <= limit_down_price * 1.001 and is_low_volume:
+            # 卖出被阻：T日开盘价触及跌停板，且无量
+            if open_price <= limit_down_price * 1.001 and is_low_volume:
+                logger.debug(f"SELL blocked: {order.symbol} limit-down at open={open_price:.2f}, limit={limit_down_price:.2f}")
                 return True
         
         return False

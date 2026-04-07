@@ -255,6 +255,8 @@ class DataEngine:
                 roic           DOUBLE,
                 gross_margin   DOUBLE,
                 debt_ratio     DOUBLE,
+                eps            DOUBLE,        -- 基本每股收益（_bs_profit_row / _ak_indicator_row 提供）
+                data_source    VARCHAR,       -- 数据来源标识（akshare / baostock）
                 PRIMARY KEY (ts_code, end_date, report_type)
             )
         """)
@@ -527,6 +529,10 @@ class DataEngine:
                 st_codes = st_stocks['ts_code'].tolist()
                 
                 # 从日线数据推断 ST 状态变化（使用 register 避免大列表拼接 SQL 注入风险）
+                # 注意：daily_quotes 无 is_st 字段，只能用"ST股是否出现第一条记录"来标记新ST日。
+                # is_new_st = TRUE 当且仅当该股在 daily_quotes 中的当前记录之前没有紧邻的交易记录，
+                # 即 prev_trade_date IS NULL 或与当前日期间隔 > 1个交易日（被退市/停牌再上市）。
+                # 如需精确ST摘帽历史，应接入 AkShare stock_zh_a_st_em 接口。
                 st_df = pd.DataFrame({"ts_code": st_codes})
                 conn.register('tmp_st_codes', st_df)
                 conn.execute("""
@@ -537,14 +543,15 @@ class DataEngine:
                         sub.trade_date,
                         TRUE as is_st,
                         CASE 
-                            WHEN sub.prev_st = 0 OR sub.prev_st IS NULL THEN TRUE 
+                            WHEN sub.prev_trade_date IS NULL THEN TRUE
+                            WHEN datediff('day', sub.prev_trade_date, sub.trade_date) > 7 THEN TRUE
                             ELSE FALSE 
                         END as is_new_st
                     FROM (
                         SELECT 
                             d.ts_code,
                             d.trade_date,
-                            LAG(1) OVER (PARTITION BY d.ts_code ORDER BY d.trade_date) as prev_st
+                            LAG(d.trade_date) OVER (PARTITION BY d.ts_code ORDER BY d.trade_date) as prev_trade_date
                         FROM daily_quotes d
                         INNER JOIN tmp_st_codes t ON d.ts_code = t.ts_code
                     ) sub
@@ -697,7 +704,7 @@ class DataEngine:
             "roe": float(row.get("avg_roe", 0) or 0),
             "roa": float(row.get("roe", 0) or 0),
             "eps": float(row.get("basic_eps", 0) or 0),
-            "gp": float(row.get("gross_profit_margin", 0) or 0),
+            "gross_margin": float(row.get("gross_profit_margin", 0) or 0),  # 与DDL字段名对齐
             "data_source": "baostock",
         }
 
@@ -716,7 +723,7 @@ class DataEngine:
             "roe": float(row.get("净资产收益率(%)", 0) or 0),
             "roa": float(row.get("资产报酬率(%)", 0) or 0),
             "eps": float(row.get("基本每股收益", 0) or 0),
-            "gp": float(row.get("销售毛利率(%)", 0) or 0),
+            "gross_margin": float(row.get("销售毛利率(%)", 0) or 0),  # 与DDL字段名对齐
             "pe_ttm": float(row.get("市盈率(TTM)", 0) or 0),
             "pb": float(row.get("市净率", 0) or 0),
             "data_source": "akshare",
@@ -737,7 +744,7 @@ class DataEngine:
                     SELECT
                         ts_code, ann_date, end_date, report_type,
                         revenue, net_profit, total_assets, total_equity,
-                        roe, roa, eps, gp, data_source
+                        roe, roa, eps, gross_margin, data_source
                     FROM df
                 """)
             except Exception as e:

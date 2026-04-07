@@ -264,7 +264,8 @@ class ProductionBacktestEngine:
                 return None
             
             # 标准化列名
-            result = batch_df[["symbol", "open", "high", "low", "close", "volume", "prev_close"]].copy()
+            # 注意：daily_quotes DDL 中字段名为 pre_close，而非 prev_close
+            result = batch_df[["symbol", "open", "high", "low", "close", "volume", "pre_close"]].copy()
             result["is_suspended"] = batch_df.get("is_suspend", False)
             return result
             

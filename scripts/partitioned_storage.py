@@ -93,6 +93,14 @@ class PartitionedStorage:
         self._partition_cache: Dict[int, PartitionInfo] = {}
         self._refresh_partition_index()
         
+        # 连接池（读写分离）
+        import duckdb
+        self._duckdb = duckdb
+        self._write_pool: List = []
+        self._read_pool: List = []
+        self._pool_max = 5
+        self._pool_lock = __import__('threading').Lock()
+        
         logger.info(f"PartitionedStorage initialized")
         logger.info(f"  DB: {self.db_path}")
         logger.info(f"  Parquet: {self.parquet_root}")
@@ -149,7 +157,7 @@ class PartitionedStorage:
     def archive_to_parquet(self, 
                           table: str = "daily_quotes",
                           year: Optional[int] = None,
-                          compress: bool = True) -> Path:
+                          compress: bool = True) -> Optional[Path]:
         """
         将DuckDB数据归档到Parquet
         
@@ -158,13 +166,13 @@ class PartitionedStorage:
         table : str
             表名
         year : int, optional
-            指定年份，默认归档所有历史数据
+            指定年份，默认归档所有历史数据（year=None 时批量归档，返回 None）
         compress : bool
             是否使用压缩
             
         Returns
         -------
-        Path : 生成的Parquet文件路径
+        Optional[Path] : 生成的Parquet文件路径；year=None 时批量归档并返回 None
         """
         import duckdb
         
@@ -173,7 +181,7 @@ class PartitionedStorage:
             current_year = datetime.now().year
             for y in range(current_year - self.HOT_YEARS - 5, current_year - self.HOT_YEARS):
                 self.archive_to_parquet(table, y, compress)
-            return
+            return None  # 显式返回 None，与类型注解 Optional[Path] 对齐
         
         # 确定输出路径
         tier = self._determine_tier(year)
@@ -307,21 +315,64 @@ class PartitionedStorage:
         'st_status_history', 'trade_calendar', 'daily_valuation'
     })
     
+    def _get_connection(self, read_only: bool = False):
+        """从连接池获取连接（上下文管理器，读写分离）"""
+        import contextlib
+        
+        @contextlib.contextmanager
+        def _conn():
+            pool = self._read_pool if read_only else self._write_pool
+            
+            conn = None
+            from_pool = False
+            with self._pool_lock:
+                if pool:
+                    conn = pool.pop()
+                    from_pool = True
+            
+            if conn is None:
+                conn = self._duckdb.connect(str(self.db_path), read_only=read_only)
+            
+            try:
+                yield conn
+            finally:
+                with self._pool_lock:
+                    if from_pool and len(pool) < self._pool_max:
+                        pool.append(conn)
+                    else:
+                        conn.close()
+        
+        return _conn()
+    
+    def close(self):
+        """关闭所有连接池连接"""
+        with self._pool_lock:
+            for conn in self._write_pool:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            self._write_pool.clear()
+            for conn in self._read_pool:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            self._read_pool.clear()
+        logger.info("PartitionedStorage connection pools closed")
+    
     def _query_duckdb(self,
                       table: str,
                       start_date: str,
                       end_date: str,
                       ts_codes: Optional[List[str]] = None,
                       columns: Optional[List[str]] = None) -> pd.DataFrame:
-        """查询DuckDB热数据"""
-        import duckdb
-        
+        """查询DuckDB热数据（连接池）"""
         # 表名白名单校验
         if table not in self._ALLOWED_TABLES:
             raise ValueError(f"Table '{table}' not in allowed list: {sorted(self._ALLOWED_TABLES)}")
         
-        conn = duckdb.connect(str(self.db_path), read_only=True)
-        try:
+        with self._get_connection(read_only=True) as conn:
             # 构建查询 - 列名白名单校验
             if columns:
                 # 获取表的合法列名
@@ -353,9 +404,6 @@ class PartitionedStorage:
                 """, (start_date, end_date)).fetchdf()
             
             return result
-            
-        finally:
-            conn.close()
     
     def _query_parquet(self,
                        table: str,
