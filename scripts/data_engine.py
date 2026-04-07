@@ -1,13 +1,13 @@
-"""
-DataEngine - 生产级数据治理与存储引擎
+﻿"""
+DataEngine - 鐢熶骇绾ф暟鎹不鐞嗕笌瀛樺偍寮曟搸
 =====================================
-核心功能：
-  1. 消除幸存者偏差（全量历史成分股含退市）
-  2. DuckDB + Parquet 双存储
-  3. 增量更新（断点续传）
-  4. 多源交叉验证
-  5. Point-in-Time 数据约束
-  6. 单股数据提取
+鏍稿績鍔熻兘锛?
+  1. 娑堥櫎骞稿瓨鑰呭亸宸紙鍏ㄩ噺鍘嗗彶鎴愬垎鑲″惈閫€甯傦級
+  2. DuckDB + Parquet 鍙屽瓨鍌?
+  3. 澧為噺鏇存柊锛堟柇鐐圭画浼狅級
+  4. 澶氭簮浜ゅ弶楠岃瘉
+  5. Point-in-Time 鏁版嵁绾︽潫
+  6. 鍗曡偂鏁版嵁鎻愬彇
 """
 
 import os
@@ -25,21 +25,21 @@ from loguru import logger
 
 warnings.filterwarnings("ignore")
 
-# ──────────────────────────────────────────────────────────────
-# 全局常量
-# ──────────────────────────────────────────────────────────────
-DEFAULT_START_DATE = "2018-01-01"     # 默认数据起始日期
-DEFAULT_ADJ_TOLERANCE = 0.005         # 交叉验证容差 0.5%
-DEFAULT_SAMPLE_RATIO = 0.05           # 交叉验证抽样比例 5%
-DEFAULT_ADJ_CHANGE_THRESHOLD = 0.05   # 复权因子变化告警阈值 5%
-DEFAULT_LIMIT_TOLERANCE = 0.01        # 涨跌停判定容差 0.01%
-DEFAULT_MAX_WORKERS = 12              # 默认多线程数
-DEFAULT_FETCH_DELAY = 0.2             # 默认请求延迟(秒)
-DEFAULT_MAX_RETRIES = 3               # 默认最大重试次数
+# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# 鍏ㄥ眬甯搁噺
+# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+DEFAULT_START_DATE = "2018-01-01"     # 榛樿鏁版嵁璧峰鏃ユ湡
+DEFAULT_ADJ_TOLERANCE = 0.005         # 浜ゅ弶楠岃瘉瀹瑰樊 0.5%
+DEFAULT_SAMPLE_RATIO = 0.05           # 浜ゅ弶楠岃瘉鎶芥牱姣斾緥 5%
+DEFAULT_ADJ_CHANGE_THRESHOLD = 0.05   # 澶嶆潈鍥犲瓙鍙樺寲鍛婅闃堝€?5%
+DEFAULT_LIMIT_TOLERANCE = 0.01        # 娑ㄨ穼鍋滃垽瀹氬宸?0.01%
+DEFAULT_MAX_WORKERS = 12              # 榛樿澶氱嚎绋嬫暟
+DEFAULT_FETCH_DELAY = 0.2             # 榛樿璇锋眰寤惰繜(绉?
+DEFAULT_MAX_RETRIES = 3               # 榛樿鏈€澶ч噸璇曟鏁?
 
-# ──────────────────────────────────────────────────────────────
-# 依赖导入
-# ──────────────────────────────────────────────────────────────
+# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# 渚濊禆瀵煎叆
+# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 try:
     import duckdb
     HAS_DUCKDB = True
@@ -66,32 +66,32 @@ except ImportError:
     _fallback_logger.warning("baostock not installed. Run: pip install baostock")
 
 
-# ──────────────────────────────────────────────────────────────
-# 公共工具函数
-# ──────────────────────────────────────────────────────────────
+# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# 鍏叡宸ュ叿鍑芥暟
+# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 def detect_board(symbol: str) -> str:
-    """根据股票代码识别板块（统一实现，供所有模块复用）
+    """鏍规嵁鑲＄エ浠ｇ爜璇嗗埆鏉垮潡锛堢粺涓€瀹炵幇锛屼緵鎵€鏈夋ā鍧楀鐢級
     
-    科创板(688xxx): 科创板, 创业板(30xxxx): 创业板,
-    北交所(8xxxxx/4xxxxx): 北交所, 其余: 主板
+    绉戝垱鏉?688xxx): 绉戝垱鏉? 鍒涗笟鏉?30xxxx): 鍒涗笟鏉?
+    鍖椾氦鎵€(8xxxxx/4xxxxx): 鍖椾氦鎵€, 鍏朵綑: 涓绘澘
     """
     import re
     s = str(symbol).zfill(6)
     if re.match(r'^688[0-9]{3}$', s):
-        return '科创板'
+        return '绉戝垱鏉?
     elif re.match(r'^30[0-9]{4}$', s):
-        return '创业板'
+        return '鍒涗笟鏉?
     elif re.match(r'^8[0-9]{5}$', s) or re.match(r'^4[0-9]{5}$', s):
-        return '北交所'
+        return '鍖椾氦鎵€'
     else:
-        return '主板'
+        return '涓绘澘'
 
 
 def detect_limit(code: str) -> float:
-    """根据股票代码返回涨跌停幅度（统一实现）
+    """鏍规嵁鑲＄エ浠ｇ爜杩斿洖娑ㄨ穼鍋滃箙搴︼紙缁熶竴瀹炵幇锛?
     
-    科创板(688): 20%, 创业板(30): 20%, 北交所(4/8): 30%, 主板: 10%
+    绉戝垱鏉?688): 20%, 鍒涗笟鏉?30): 20%, 鍖椾氦鎵€(4/8): 30%, 涓绘澘: 10%
     """
     c = str(code).zfill(6)
     if c.startswith("688"):
@@ -105,7 +105,7 @@ def detect_limit(code: str) -> float:
 
 
 def build_ts_code(symbol: str) -> str:
-    """构造 ts_code（上海/深圳）（统一实现）"""
+    """鏋勯€?ts_code锛堜笂娴?娣卞湷锛夛紙缁熶竴瀹炵幇锛?""
     sym6 = str(symbol).zfill(6)
     if sym6.startswith(("6", "5", "9", "688")):
         return f"{sym6}.SH"
@@ -113,33 +113,33 @@ def build_ts_code(symbol: str) -> str:
         return f"{sym6}.SZ"
 
 
-# ──────────────────────────────────────────────────────────────
-# 数据验证器（已拆分到 data_validator.py，保留向后兼容导入）
-# ──────────────────────────────────────────────────────────────
+# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# 鏁版嵁楠岃瘉鍣紙宸叉媶鍒嗗埌 data_validator.py锛屼繚鐣欏悜鍚庡吋瀹瑰鍏ワ級
+# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 from scripts.data_validator import DataValidator
 
 
-# ──────────────────────────────────────────────────────────────
-# 核心 DataEngine
-# ──────────────────────────────────────────────────────────────
+# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# 鏍稿績 DataEngine
+# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 class DataEngine:
     """
-    数据引擎 - 统一数据管理入口
+    鏁版嵁寮曟搸 - 缁熶竴鏁版嵁绠＄悊鍏ュ彛
     
     Attributes
     ----------
     db_path : Path
-        DuckDB 数据库路径
+        DuckDB 鏁版嵁搴撹矾寰?
     parquet_dir : Path
-        Parquet 存储目录
+        Parquet 瀛樺偍鐩綍
     validator : DataValidator
-        数据验证器
+        鏁版嵁楠岃瘉鍣?
     """
 
     def __init__(self,
                  db_path: str = None,
                  parquet_dir: str = None):
-        # 支持环境变量配置，未设置时使用相对路径默认值
+        # 鏀寔鐜鍙橀噺閰嶇疆锛屾湭璁剧疆鏃朵娇鐢ㄧ浉瀵硅矾寰勯粯璁ゅ€?
         project_root = Path(__file__).resolve().parent.parent
         self.db_path = Path(db_path or os.environ.get(
             'STOCK_DB_PATH', str(project_root / 'data' / 'stock_data.duckdb')))
@@ -154,15 +154,15 @@ class DataEngine:
         else:
             logger.error("DuckDB required but not installed.")
 
-    # ──────────────────────────────────────────────────────────
-    # 数据库初始化
-    # ──────────────────────────────────────────────────────────
+    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # 鏁版嵁搴撳垵濮嬪寲
+    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     def _init_schema(self):
-        """初始化表结构"""
+        """鍒濆鍖栬〃缁撴瀯"""
         conn = duckdb.connect(str(self.db_path))
         cur = conn.cursor()
 
-        # 股票基本信息（含退市标记）
+        # 鑲＄エ鍩烘湰淇℃伅锛堝惈閫€甯傛爣璁帮級
         cur.execute("""
             CREATE TABLE IF NOT EXISTS stock_basic (
                 ts_code    VARCHAR PRIMARY KEY,
@@ -180,30 +180,30 @@ class DataEngine:
             )
         """)
 
-        # 指数成分股动态表（解决幸存者偏差）
+        # 鎸囨暟鎴愬垎鑲″姩鎬佽〃锛堣В鍐冲垢瀛樿€呭亸宸級
         cur.execute("""
             CREATE TABLE IF NOT EXISTS index_constituents (
-                index_code   VARCHAR,      -- 指数代码如 '000300.SH'
-                ts_code      VARCHAR,      -- 成分股代码
-                trade_date   DATE,         -- 成分股生效日期
-                in_date      DATE,         -- 加入日期
-                out_date     DATE,         -- 退出日期（NULL表示仍在）
+                index_code   VARCHAR,      -- 鎸囨暟浠ｇ爜濡?'000300.SH'
+                ts_code      VARCHAR,      -- 鎴愬垎鑲′唬鐮?
+                trade_date   DATE,         -- 鎴愬垎鑲＄敓鏁堟棩鏈?
+                in_date      DATE,         -- 鍔犲叆鏃ユ湡
+                out_date     DATE,         -- 閫€鍑烘棩鏈燂紙NULL琛ㄧず浠嶅湪锛?
                 PRIMARY KEY (index_code, ts_code, trade_date)
             )
         """)
 
-        # ST状态历史表（时间序列特征）
+        # ST鐘舵€佸巻鍙茶〃锛堟椂闂村簭鍒楃壒寰侊級
         cur.execute("""
             CREATE TABLE IF NOT EXISTS st_status_history (
                 ts_code      VARCHAR,
                 trade_date   DATE,
-                is_st        BOOLEAN,     -- 当日是否ST
-                is_new_st    BOOLEAN,     -- 当日是否新加入ST
+                is_st        BOOLEAN,     -- 褰撴棩鏄惁ST
+                is_new_st    BOOLEAN,     -- 褰撴棩鏄惁鏂板姞鍏T
                 PRIMARY KEY (ts_code, trade_date)
             )
         """)
 
-        # 日线行情（含涨跌停标记）
+        # 鏃ョ嚎琛屾儏锛堝惈娑ㄨ穼鍋滄爣璁帮級
         cur.execute("""
             CREATE TABLE IF NOT EXISTS daily_quotes (
                 ts_code       VARCHAR,
@@ -226,7 +226,7 @@ class DataEngine:
             )
         """)
 
-        # 交易日历
+        # 浜ゆ槗鏃ュ巻
         cur.execute("""
             CREATE TABLE IF NOT EXISTS trade_calendar (
                 cal_date       DATE PRIMARY KEY,
@@ -235,12 +235,12 @@ class DataEngine:
             )
         """)
 
-        # 财务数据（Point-in-Time：含 ann_date）
+        # 璐㈠姟鏁版嵁锛圥oint-in-Time锛氬惈 ann_date锛?
         cur.execute("""
             CREATE TABLE IF NOT EXISTS financial_data (
                 ts_code        VARCHAR,
-                ann_date       DATE,          -- 公告日（PIT 约束用）
-                end_date       DATE,          -- 报告期
+                ann_date       DATE,          -- 鍏憡鏃ワ紙PIT 绾︽潫鐢級
+                end_date       DATE,          -- 鎶ュ憡鏈?
                 report_type    VARCHAR,       -- 'Q1'/'Q2'/'Q3'/'Q4'
                 revenue        DOUBLE,
                 net_profit     DOUBLE,
@@ -255,13 +255,13 @@ class DataEngine:
                 roic           DOUBLE,
                 gross_margin   DOUBLE,
                 debt_ratio     DOUBLE,
-                eps            DOUBLE,        -- 基本每股收益（_bs_profit_row / _ak_indicator_row 提供）
-                data_source    VARCHAR,       -- 数据来源标识（akshare / baostock）
+                eps            DOUBLE,        -- 鍩烘湰姣忚偂鏀剁泭锛坃bs_profit_row / _ak_indicator_row 鎻愪緵锛?
+                data_source    VARCHAR,       -- 鏁版嵁鏉ユ簮鏍囪瘑锛坅kshare / baostock锛?
                 PRIMARY KEY (ts_code, end_date, report_type)
             )
         """)
 
-        # 市值数据（每日快照）
+        # 甯傚€兼暟鎹紙姣忔棩蹇収锛?
         cur.execute("""
             CREATE TABLE IF NOT EXISTS daily_valuation (
                 ts_code       VARCHAR,
@@ -276,7 +276,7 @@ class DataEngine:
             )
         """)
 
-        # 数据更新日志
+        # 鏁版嵁鏇存柊鏃ュ織
         cur.execute("""
             CREATE TABLE IF NOT EXISTS update_log (
                 id            INTEGER PRIMARY KEY,
@@ -291,7 +291,7 @@ class DataEngine:
             )
         """)
 
-        # 复权因子变化日志（用于检测分红/拆股）
+        # 澶嶆潈鍥犲瓙鍙樺寲鏃ュ織锛堢敤浜庢娴嬪垎绾?鎷嗚偂锛?
         cur.execute("""
             CREATE TABLE IF NOT EXISTS adj_factor_log (
                 ts_code       VARCHAR,
@@ -304,7 +304,7 @@ class DataEngine:
             )
         """)
 
-        # 数据质量报警表
+        # 鏁版嵁璐ㄩ噺鎶ヨ琛?
         cur.execute("""
             CREATE TABLE IF NOT EXISTS data_quality_alert (
                 id            INTEGER PRIMARY KEY,
@@ -316,7 +316,7 @@ class DataEngine:
             )
         """)
 
-        # 索引
+        # 绱㈠紩
         cur.execute("CREATE INDEX IF NOT EXISTS idx_quotes_code ON daily_quotes(ts_code)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_quotes_date ON daily_quotes(trade_date)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_fin_ann ON financial_data(ann_date)")
@@ -325,11 +325,11 @@ class DataEngine:
         conn.close()
         logger.info(f"DataEngine schema initialized: {self.db_path}")
 
-    # ──────────────────────────────────────────────────────────
-    # 查询接口
-    # ──────────────────────────────────────────────────────────
+    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # 鏌ヨ鎺ュ彛
+    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     def query(self, sql: str, params: tuple = None) -> pd.DataFrame:
-        """执行 SQL 查询（支持参数化查询防止SQL注入）"""
+        """鎵ц SQL 鏌ヨ锛堟敮鎸佸弬鏁板寲鏌ヨ闃叉SQL娉ㄥ叆锛?""
         if not HAS_DUCKDB:
             return pd.DataFrame()
         conn = duckdb.connect(str(self.db_path), read_only=True)
@@ -343,7 +343,7 @@ class DataEngine:
             conn.close()
 
     def execute(self, sql: str, params: tuple = None):
-        """执行写操作（支持参数化查询防止SQL注入）"""
+        """鎵ц鍐欐搷浣滐紙鏀寔鍙傛暟鍖栨煡璇㈤槻姝QL娉ㄥ叆锛?""
         conn = duckdb.connect(str(self.db_path))
         try:
             if params:
@@ -354,7 +354,7 @@ class DataEngine:
             conn.close()
 
     def get_connection(self, read_only: bool = False):
-        """获取数据库连接（上下文管理器，确保连接正确关闭）"""
+        """鑾峰彇鏁版嵁搴撹繛鎺ワ紙涓婁笅鏂囩鐞嗗櫒锛岀‘淇濊繛鎺ユ纭叧闂級"""
         import contextlib
         @contextlib.contextmanager
         def _conn():
@@ -365,17 +365,17 @@ class DataEngine:
                 conn.close()
         return _conn()
 
-    # ──────────────────────────────────────────────────────────
-    # 工具方法
-    # ──────────────────────────────────────────────────────────
+    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # 宸ュ叿鏂规硶
+    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     @staticmethod
     def _detect_limit(code: str) -> float:
-        """根据股票代码返回涨跌停幅度（委托到公共函数）"""
+        """鏍规嵁鑲＄エ浠ｇ爜杩斿洖娑ㄨ穼鍋滃箙搴︼紙濮旀墭鍒板叕鍏卞嚱鏁帮級"""
         return detect_limit(code)
     
     @staticmethod
     def _apply_limit_flags(df: pd.DataFrame, code: str, pct_col: str = "pct_chg") -> pd.DataFrame:
-        """统一应用涨跌停标记（容差0.01%避免浮点误差）"""
+        """缁熶竴搴旂敤娑ㄨ穼鍋滄爣璁帮紙瀹瑰樊0.01%閬垮厤娴偣璇樊锛?""
         limit_pct = detect_limit(code)
         df["limit_up"] = df[pct_col] >= (limit_pct * 100 - 0.01)
         df["limit_down"] = df[pct_col] <= -(limit_pct * 100 - 0.01)
@@ -383,27 +383,27 @@ class DataEngine:
     
     @staticmethod
     def _build_ts_code(symbol: str) -> str:
-        """构造 ts_code（委托到公共函数）"""
+        """鏋勯€?ts_code锛堝鎵樺埌鍏叡鍑芥暟锛?""
         return build_ts_code(symbol)
     
-    # ──────────────────────────────────────────────────────────
-    # 幸存者偏差处理
-    # ──────────────────────────────────────────────────────────
+    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # 骞稿瓨鑰呭亸宸鐞?
+    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     def get_all_stocks(self, include_delisted: bool = True) -> pd.DataFrame:
         """
-        获取全量股票列表（含退市股）
+        鑾峰彇鍏ㄩ噺鑲＄エ鍒楄〃锛堝惈閫€甯傝偂锛?
         
-        解决幸存者偏差的关键入口。
+        瑙ｅ喅骞稿瓨鑰呭亸宸殑鍏抽敭鍏ュ彛銆?
         """
         if not HAS_AKSHARE:
             return self._get_local_stocks()
 
         stocks = []
 
-        # 1. 当前上市股票
+        # 1. 褰撳墠涓婂競鑲＄エ
         try:
             spot = ak.stock_zh_a_spot_em()
-            current = spot[["代码", "名称", "板块", "总市值", "流通市值"]].copy()
+            current = spot[["浠ｇ爜", "鍚嶇О", "鏉垮潡", "鎬诲競鍊?, "娴侀€氬競鍊?]].copy()
             current.columns = ["symbol", "name", "industry", "total_mv", "circ_mv"]
             current["is_delisted"] = False
             current["list_date"] = pd.NaT
@@ -413,15 +413,15 @@ class DataEngine:
         except (ValueError, KeyError, RuntimeError) as e:
             logger.warning(f"Failed to fetch current stocks: {e}")
 
-        # 2. 退市股票（关键：解决幸存者偏差）
+        # 2. 閫€甯傝偂绁紙鍏抽敭锛氳В鍐冲垢瀛樿€呭亸宸級
         if include_delisted:
             try:
-                delisted = ak.stock_zh_a_delist(symbol="退市")
-                if not delisted.empty and "证券代码" in delisted.columns:
-                    dl = delisted[["证券代码", "证券名称"]].copy()
+                delisted = ak.stock_zh_a_delist(symbol="閫€甯?)
+                if not delisted.empty and "璇佸埜浠ｇ爜" in delisted.columns:
+                    dl = delisted[["璇佸埜浠ｇ爜", "璇佸埜鍚嶇О"]].copy()
                     dl.columns = ["symbol", "name"]
                     dl["is_delisted"] = True
-                    dl["industry"] = "退市"
+                    dl["industry"] = "閫€甯?
                     dl["total_mv"] = np.nan
                     dl["circ_mv"] = np.nan
                     stocks.append(dl)
@@ -435,30 +435,30 @@ class DataEngine:
         df = pd.concat(stocks, ignore_index=True)
         df = df.drop_duplicates(subset=["symbol"], keep="first")
 
-        # 构造 ts_code
+        # 鏋勯€?ts_code
         df["ts_code"] = df["symbol"].apply(build_ts_code)
 
         df["market"] = df["symbol"].apply(detect_board)
         return df
 
-    # ──────────────────────────────────────────────────────────
-    # 动态股票池（沪深300成分股时点对齐）
-    # ──────────────────────────────────────────────────────────
+    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # 鍔ㄦ€佽偂绁ㄦ睜锛堟勃娣?00鎴愬垎鑲℃椂鐐瑰榻愶級
+    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     def sync_index_constituents(self, index_code: str = "000300.SH") -> None:
         """
-        同步指数成分股历史（解决幸存者偏差）
+        鍚屾鎸囨暟鎴愬垎鑲″巻鍙诧紙瑙ｅ喅骞稿瓨鑰呭亸宸級
         
-        记录每个股票何时被加入/退出指数，确保回测时只使用
-        该时点真实属于指数成分的股票。
+        璁板綍姣忎釜鑲＄エ浣曟椂琚姞鍏?閫€鍑烘寚鏁帮紝纭繚鍥炴祴鏃跺彧浣跨敤
+        璇ユ椂鐐圭湡瀹炲睘浜庢寚鏁版垚鍒嗙殑鑲＄エ銆?
         """
         if not HAS_AKSHARE:
             return
 
         with self.get_connection() as conn:
-            # 获取历史成分股（AkShare提供）
+            # 鑾峰彇鍘嗗彶鎴愬垎鑲★紙AkShare鎻愪緵锛?
             try:
                 if index_code == "000300.SH":
-                    # 沪深300成分股
+                    # 娌繁300鎴愬垎鑲?
                     df = ak.index_stock_cons_csindex(symbol="000300")
                     if df.empty:
                         return
@@ -467,7 +467,7 @@ class DataEngine:
                     df["trade_date"] = pd.Timestamp.now()
                     df["out_date"] = pd.NaT
 
-                    # 写入数据库（使用DataFrame注册为临时表再INSERT，参数化查询防止SQL注入）
+                    # 鍐欏叆鏁版嵁搴擄紙浣跨敤DataFrame娉ㄥ唽涓轰复鏃惰〃鍐岻NSERT锛屽弬鏁板寲鏌ヨ闃叉SQL娉ㄥ叆锛?
                     conn.execute("DELETE FROM index_constituents WHERE index_code = ?", [index_code])
                     df["index_code"] = index_code
                     conn.register('tmp_constituents', df)
@@ -482,11 +482,11 @@ class DataEngine:
 
     def get_universe_at_date(self, index_code: str, trade_date: str) -> List[str]:
         """
-        获取指定日期的指数成分股列表（动态股票池）
+        鑾峰彇鎸囧畾鏃ユ湡鐨勬寚鏁版垚鍒嗚偂鍒楄〃锛堝姩鎬佽偂绁ㄦ睜锛?
         
         Returns
         -------
-        List[str]: 在该日期属于指数成分的股票代码列表
+        List[str]: 鍦ㄨ鏃ユ湡灞炰簬鎸囨暟鎴愬垎鐨勮偂绁ㄤ唬鐮佸垪琛?
         """
         if not HAS_DUCKDB:
             return []
@@ -499,25 +499,25 @@ class DataEngine:
         """, (index_code, trade_date, trade_date))
         return df["ts_code"].tolist() if not df.empty else []
 
-    # ──────────────────────────────────────────────────────────
-    # ST状态历史（时间序列特征）
-    # ──────────────────────────────────────────────────────────
+    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ST鐘舵€佸巻鍙诧紙鏃堕棿搴忓垪鐗瑰緛锛?
+    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     def sync_st_status_history(self) -> None:
         """
-        同步ST状态历史
+        鍚屾ST鐘舵€佸巻鍙?
         
-        记录每只股票何时被ST/解除ST，用于时间序列特征，
-        严禁在T日过滤"未来的ST"。
+        璁板綍姣忓彧鑲＄エ浣曟椂琚玈T/瑙ｉ櫎ST锛岀敤浜庢椂闂村簭鍒楃壒寰侊紝
+        涓ョ鍦═鏃ヨ繃婊?鏈潵鐨凷T"銆?
         
-        注意：daily_quotes 表没有 name 字段，需要从 stock_basic 表 JOIN 获取。
+        娉ㄦ剰锛歞aily_quotes 琛ㄦ病鏈?name 瀛楁锛岄渶瑕佷粠 stock_basic 琛?JOIN 鑾峰彇銆?
         """
         if not HAS_DUCKDB:
             return
 
         with self.get_connection() as conn:
-            # 从 stock_basic 获取含 ST 的股票列表
+            # 浠?stock_basic 鑾峰彇鍚?ST 鐨勮偂绁ㄥ垪琛?
             try:
-                # 先找到所有历史上曾是 ST 的股票
+                # 鍏堟壘鍒版墍鏈夊巻鍙蹭笂鏇炬槸 ST 鐨勮偂绁?
                 st_stocks = conn.execute("""
                     SELECT ts_code, name FROM stock_basic 
                     WHERE name LIKE '%ST%' OR name LIKE '%*ST%'
@@ -528,11 +528,11 @@ class DataEngine:
                 
                 st_codes = st_stocks['ts_code'].tolist()
                 
-                # 从日线数据推断 ST 状态变化（使用 register 避免大列表拼接 SQL 注入风险）
-                # 注意：daily_quotes 无 is_st 字段，只能用"ST股是否出现第一条记录"来标记新ST日。
-                # is_new_st = TRUE 当且仅当该股在 daily_quotes 中的当前记录之前没有紧邻的交易记录，
-                # 即 prev_trade_date IS NULL 或与当前日期间隔 > 1个交易日（被退市/停牌再上市）。
-                # 如需精确ST摘帽历史，应接入 AkShare stock_zh_a_st_em 接口。
+                # 浠庢棩绾挎暟鎹帹鏂?ST 鐘舵€佸彉鍖栵紙浣跨敤 register 閬垮厤澶у垪琛ㄦ嫾鎺?SQL 娉ㄥ叆椋庨櫓锛?
+                # 娉ㄦ剰锛歞aily_quotes 鏃?is_st 瀛楁锛屽彧鑳界敤"ST鑲℃槸鍚﹀嚭鐜扮涓€鏉¤褰?鏉ユ爣璁版柊ST鏃ャ€?
+                # is_new_st = TRUE 褰撲笖浠呭綋璇ヨ偂鍦?daily_quotes 涓殑褰撳墠璁板綍涔嬪墠娌℃湁绱ч偦鐨勪氦鏄撹褰曪紝
+                # 鍗?prev_trade_date IS NULL 鎴栦笌褰撳墠鏃ユ湡闂撮殧 > 1涓氦鏄撴棩锛堣閫€甯?鍋滅墝鍐嶄笂甯傦級銆?
+                # 濡傞渶绮剧‘ST鎽樺附鍘嗗彶锛屽簲鎺ュ叆 AkShare stock_zh_a_st_em 鎺ュ彛銆?
                 st_df = pd.DataFrame({"ts_code": st_codes})
                 conn.register('tmp_st_codes', st_df)
                 conn.execute("""
@@ -562,10 +562,10 @@ class DataEngine:
                 logger.warning(f"Failed to sync ST status: {e}")
 
     def is_st_at_date(self, ts_code: str, trade_date: str) -> bool:
-        """检查某股票在某日期是否为ST
+        """妫€鏌ユ煇鑲＄エ鍦ㄦ煇鏃ユ湡鏄惁涓篠T
         
-        注意：st_status_history 只记录 ST 期间的数据行。
-        如果该股在查询日没有记录，说明不是 ST（正常/已摘帽）。
+        娉ㄦ剰锛歴t_status_history 鍙褰?ST 鏈熼棿鐨勬暟鎹銆?
+        濡傛灉璇ヨ偂鍦ㄦ煡璇㈡棩娌℃湁璁板綍锛岃鏄庝笉鏄?ST锛堟甯?宸叉憳甯斤級銆?
         """
         df = self.query("""
             SELECT is_st FROM st_status_history
@@ -574,26 +574,26 @@ class DataEngine:
             ORDER BY trade_date DESC
             LIMIT 1
         """, (ts_code, trade_date))
-        # 如果没有记录，说明该股从未被 ST 或已摘帽，返回 False
+        # 濡傛灉娌℃湁璁板綍锛岃鏄庤鑲′粠鏈 ST 鎴栧凡鎽樺附锛岃繑鍥?False
         return not df.empty and bool(df.iloc[0, 0])
 
-    # ──────────────────────────────────────────────────────────
-    # 财务数据抓取（PIT 约束）
-    # ──────────────────────────────────────────────────────────
+    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # 璐㈠姟鏁版嵁鎶撳彇锛圥IT 绾︽潫锛?
+    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     def fetch_financial_data(self,
                              ts_code: str = None,
                              start_year: int = None,
                              end_year: int = None,
                              max_workers: int = 4) -> Dict:
         """
-        抓取财务数据（财报 + 估值），支持多线程。
+        鎶撳彇璐㈠姟鏁版嵁锛堣储鎶?+ 浼板€硷級锛屾敮鎸佸绾跨▼銆?
 
-        数据对齐规则：
-        - 使用 ann_date（公告日）作为 PIT 约束点
-        - 每期财报对应 end_date（报告期），但公告后才能使用
+        鏁版嵁瀵归綈瑙勫垯锛?
+        - 浣跨敤 ann_date锛堝叕鍛婃棩锛変綔涓?PIT 绾︽潫鐐?
+        - 姣忔湡璐㈡姤瀵瑰簲 end_date锛堟姤鍛婃湡锛夛紝浣嗗叕鍛婂悗鎵嶈兘浣跨敤
 
-        AkShare 字段：营业总收入、净利润、资产总计、负债总计、
-        基本每股收益、净资产收益率、每股现金流等
+        AkShare 瀛楁锛氳惀涓氭€绘敹鍏ャ€佸噣鍒╂鼎銆佽祫浜ф€昏銆佽礋鍊烘€昏銆?
+        鍩烘湰姣忚偂鏀剁泭銆佸噣璧勪骇鏀剁泭鐜囥€佹瘡鑲＄幇閲戞祦绛?
         """
         stats = {"success": 0, "failed": 0, "records": 0, "errors": []}
         if not HAS_AKSHARE:
@@ -603,7 +603,7 @@ class DataEngine:
         end_year = end_year or datetime.now().year
         start_year = start_year or (end_year - 5)
 
-        # 单只股票
+        # 鍗曞彧鑲＄エ
         if ts_code:
             sym = ts_code.split(".")[0] if "." in ts_code else str(ts_code).zfill(6)
             df = self._fetch_financial_single(sym, start_year, end_year)
@@ -615,7 +615,7 @@ class DataEngine:
                 stats["failed"] = 1
             return stats
 
-        # 全量
+        # 鍏ㄩ噺
         local = self._get_local_stocks()
         symbols = local["symbol"].tolist()
 
@@ -648,13 +648,13 @@ class DataEngine:
                                  symbol: str,
                                  start_year: int,
                                  end_year: int) -> pd.DataFrame:
-        """抓取单只股票的财务数据（年报 + 季报）"""
+        """鎶撳彇鍗曞彧鑲＄エ鐨勮储鍔℃暟鎹紙骞存姤 + 瀛ｆ姤锛?""
         records = []
         sym6 = str(symbol).zfill(6)
         bs_code = (f"sh.{sym6}" if sym6.startswith("6") or sym6.startswith("5")
                    else f"sz.{sym6}")
 
-        # 年报（4个财年）
+        # 骞存姤锛?涓储骞达級
         try:
             bs.login()
             try:
@@ -673,11 +673,11 @@ class DataEngine:
         except Exception as e:
             logger.debug(f"Baostock financial fetch failed for {symbol}: {e}")
 
-        # 估值快照（用 AkShare）
+        # 浼板€煎揩鐓э紙鐢?AkShare锛?
         try:
             df_val = ak.stock_a_indicator_lg(secu=symbol)
-            if not df_val.empty and "代码" in df_val.columns:
-                df_val = df_val.rename(columns={"代码": "symbol"})
+            if not df_val.empty and "浠ｇ爜" in df_val.columns:
+                df_val = df_val.rename(columns={"浠ｇ爜": "symbol"})
                 for _, row in df_val.iterrows():
                     records.append(self._ak_indicator_row(row, symbol))
         except Exception as e:
@@ -688,7 +688,7 @@ class DataEngine:
         return pd.DataFrame(records)
 
     def _bs_profit_row(self, row: Dict, symbol: str) -> Dict:
-        """Baostock 利润表行标准化"""
+        """Baostock 鍒╂鼎琛ㄨ鏍囧噯鍖?""
         sym6 = str(symbol).zfill(6)
         ann = row.get("profit_statements_pub_date", "")
         end = row.get("profit_statements_report_date", "")
@@ -696,7 +696,7 @@ class DataEngine:
             "ts_code": f"{sym6}.SH" if sym6.startswith(("6", "5", "9", "688")) else f"{sym6}.SZ",
             "ann_date": pd.to_datetime(ann, errors="coerce") if ann else pd.NaT,
             "end_date": pd.to_datetime(end, errors="coerce") if end else pd.NaT,
-            "report_type": "年报",
+            "report_type": "骞存姤",
             "revenue": float(row.get("total_operating_revenue", 0) or 0),
             "net_profit": float(row.get("parent_net_profit", 0) or 0),
             "total_assets": float(row.get("total_assets", 0) or 0),
@@ -704,37 +704,37 @@ class DataEngine:
             "roe": float(row.get("avg_roe", 0) or 0),
             "roa": float(row.get("roe", 0) or 0),
             "eps": float(row.get("basic_eps", 0) or 0),
-            "gross_margin": float(row.get("gross_profit_margin", 0) or 0),  # 与DDL字段名对齐
+            "gross_margin": float(row.get("gross_profit_margin", 0) or 0),  # 涓嶥DL瀛楁鍚嶅榻?
             "data_source": "baostock",
         }
 
     def _ak_indicator_row(self, row: pd.Series, symbol: str) -> Dict:
-        """AkShare 指标行标准化"""
+        """AkShare 鎸囨爣琛屾爣鍑嗗寲"""
         sym6 = str(symbol).zfill(6)
         return {
             "ts_code": f"{sym6}.SH" if sym6.startswith(("6", "5", "9", "688")) else f"{sym6}.SZ",
             "ann_date": pd.Timestamp.today(),
             "end_date": pd.NaT,
-            "report_type": "指标",
-            "revenue": float(row.get("营业总收入", 0) or 0),
-            "net_profit": float(row.get("净利润", 0) or 0),
+            "report_type": "鎸囨爣",
+            "revenue": float(row.get("钀ヤ笟鎬绘敹鍏?, 0) or 0),
+            "net_profit": float(row.get("鍑€鍒╂鼎", 0) or 0),
             "total_assets": 0,
             "total_equity": 0,
-            "roe": float(row.get("净资产收益率(%)", 0) or 0),
-            "roa": float(row.get("资产报酬率(%)", 0) or 0),
-            "eps": float(row.get("基本每股收益", 0) or 0),
-            "gross_margin": float(row.get("销售毛利率(%)", 0) or 0),  # 与DDL字段名对齐
-            "pe_ttm": float(row.get("市盈率(TTM)", 0) or 0),
-            "pb": float(row.get("市净率", 0) or 0),
+            "roe": float(row.get("鍑€璧勪骇鏀剁泭鐜?%)", 0) or 0),
+            "roa": float(row.get("璧勪骇鎶ラ叕鐜?%)", 0) or 0),
+            "eps": float(row.get("鍩烘湰姣忚偂鏀剁泭", 0) or 0),
+            "gross_margin": float(row.get("閿€鍞瘺鍒╃巼(%)", 0) or 0),  # 涓嶥DL瀛楁鍚嶅榻?
+            "pe_ttm": float(row.get("甯傜泩鐜?TTM)", 0) or 0),
+            "pb": float(row.get("甯傚噣鐜?, 0) or 0),
             "data_source": "akshare",
         }
 
     def _save_financial_data(self, df: pd.DataFrame):
-        """保存财务数据到数据库"""
+        """淇濆瓨璐㈠姟鏁版嵁鍒版暟鎹簱"""
         if df.empty or not HAS_DUCKDB:
             return
         with self.get_connection() as conn:
-            # 财务数据用 REPLACE（可重复更新）
+            # 璐㈠姟鏁版嵁鐢?REPLACE锛堝彲閲嶅鏇存柊锛?
             try:
                 conn.execute("""
                     INSERT OR REPLACE INTO financial_data
@@ -749,7 +749,7 @@ class DataEngine:
                 """)
             except Exception as e:
                 logger.warning(f"Financial data UPSERT failed, trying fallback: {e}")
-                # 字段不全时用原始列（列名来自 DataFrame 列列表，非用户输入，安全）
+                # 瀛楁涓嶅叏鏃剁敤鍘熷鍒楋紙鍒楀悕鏉ヨ嚜 DataFrame 鍒楀垪琛紝闈炵敤鎴疯緭鍏ワ紝瀹夊叏锛?
                 cols = [c for c in df.columns if c in
                         ["ts_code", "ann_date", "end_date", "report_type",
                          "revenue", "net_profit", "roe", "roa", "eps",
@@ -759,15 +759,15 @@ class DataEngine:
                     conn.execute(f"INSERT OR IGNORE INTO financial_data ({col_str}) SELECT {col_str} FROM df")
 
     def _get_local_stocks(self) -> pd.DataFrame:
-        """从本地数据库获取股票列表"""
+        """浠庢湰鍦版暟鎹簱鑾峰彇鑲＄エ鍒楄〃"""
         return self.query("SELECT * FROM stock_basic")
 
     def sync_stock_list(self, include_delisted: bool = True):
         """
-        同步股票列表到本地数据库（含 list_date/delist_date）
+        鍚屾鑲＄エ鍒楄〃鍒版湰鍦版暟鎹簱锛堝惈 list_date/delist_date锛?
         
-        使用 Baostock 补充上市/退市日期信息，解决幸存者偏差中的
-        日期缺失问题。
+        浣跨敤 Baostock 琛ュ厖涓婂競/閫€甯傛棩鏈熶俊鎭紝瑙ｅ喅骞稿瓨鑰呭亸宸腑鐨?
+        鏃ユ湡缂哄け闂銆?
         """
         df = self.get_all_stocks(include_delisted)
         if df.empty:
@@ -775,7 +775,7 @@ class DataEngine:
 
         conn = duckdb.connect(str(self.db_path))
 
-        # Baostock 补充 list_date / delist_date
+        # Baostock 琛ュ厖 list_date / delist_date
         if HAS_BAOSTOCK:
             logger.info("Enriching list/delist dates from Baostock...")
             try:
@@ -803,7 +803,7 @@ class DataEngine:
             except (ValueError, KeyError, RuntimeError) as e:
                 logger.warning(f"Baostock list_date enrichment failed: {e}")
 
-        # 写入基本信息
+        # 鍐欏叆鍩烘湰淇℃伅
         cols = ["ts_code", "symbol", "name", "industry", "market",
                 "list_date", "delist_date", "is_delisted"]
         write_cols = [c for c in cols if c in df.columns]
@@ -821,27 +821,26 @@ class DataEngine:
         logger.info(f"Synced {len(df)} stocks to database "
               f"(list_date filled: {df['list_date'].notna().sum()})")
 
-    # ──────────────────────────────────────────────────────────
-    # 日线数据下载
-    # ──────────────────────────────────────────────────────────
+    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # 鏃ョ嚎鏁版嵁涓嬭浇
+    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     def fetch_single(self,
                      symbol: str,
                      start_date: str,
                      end_date: str,
-                     adjust: Literal["qfq", "hfq", ""] = "qfq") -> pd.DataFrame:
+                     adjust: Literal["qfq", ""] = "qfq") -> pd.DataFrame:
         """
-        下载单只股票日线数据
         
         Parameters
         ----------
         symbol : str
-            6位股票代码
+            6浣嶈偂绁ㄤ唬鐮?
         start_date : str
-            开始日期，格式 YYYY-MM-DD
+            寮€濮嬫棩鏈燂紝鏍煎紡 YYYY-MM-DD
         end_date : str
-            结束日期，格式 YYYY-MM-DD
-        adjust : 'qfq' | 'hfq' | ''
-            复权方式
+            缁撴潫鏃ユ湡锛屾牸寮?YYYY-MM-DD
+        adjust : 'qfq' | ''
+            澶嶆潈鏂瑰紡
         """
         if not HAS_AKSHARE:
             return pd.DataFrame()
@@ -860,11 +859,11 @@ class DataEngine:
             if df.empty:
                 return pd.DataFrame()
 
-            # 列名标准化
+            # 鍒楀悕鏍囧噯鍖?
             col_map = {
-                "日期": "trade_date", "开盘": "open", "收盘": "close",
-                "最高": "high", "最低": "low", "成交量": "volume",
-                "成交额": "amount", "涨跌幅": "pct_chg", "换手率": "turnover"
+                "鏃ユ湡": "trade_date", "寮€鐩?: "open", "鏀剁洏": "close",
+                "鏈€楂?: "high", "鏈€浣?: "low", "鎴愪氦閲?: "volume",
+                "鎴愪氦棰?: "amount", "娑ㄨ穼骞?: "pct_chg", "鎹㈡墜鐜?: "turnover"
             }
             df = df.rename(columns=col_map)
             df["trade_date"] = pd.to_datetime(df["trade_date"])
@@ -876,11 +875,11 @@ class DataEngine:
             df["pre_close"] = df["close"].shift(1)
             df["is_suspend"] = df["volume"] == 0
             
-            # 涨跌停判定（使用统一方法）
+            # 娑ㄨ穼鍋滃垽瀹氾紙浣跨敤缁熶竴鏂规硶锛?
             df = self._apply_limit_flags(df, symbol)
             df["data_source"] = "akshare"
 
-            # 计算复权因子
+            # 璁＄畻澶嶆潈鍥犲瓙
             if adjust:
                 try:
                     df_raw = ak.stock_zh_a_hist(
@@ -888,7 +887,7 @@ class DataEngine:
                         start_date=start_str, end_date=end_str, adjust=""
                     )
                     if not df_raw.empty:
-                        df_raw = df_raw.rename(columns={"日期": "trade_date", "收盘": "close_raw"})
+                        df_raw = df_raw.rename(columns={"鏃ユ湡": "trade_date", "鏀剁洏": "close_raw"})
                         df_raw["trade_date"] = pd.to_datetime(df_raw["trade_date"])
                         df = df.merge(df_raw[["trade_date", "close_raw"]], on="trade_date", how="left")
                         df["adj_factor"] = df["close"] / df["close_raw"].replace(0, np.nan)
@@ -898,7 +897,7 @@ class DataEngine:
             else:
                 df["adj_factor"] = 1.0
 
-            # 验证
+            # 楠岃瘉
             val = self.validator.validate(df)
             if not val["ok"]:
                 logger.warning(f"Data validation issues for {symbol}: {val['issues']}")
@@ -914,10 +913,10 @@ class DataEngine:
 
     def save_quotes(self, df: pd.DataFrame, mode: str = "append"):
         """
-        保存行情数据到 DuckDB（UPSERT 逻辑，防止重复数据）
+        淇濆瓨琛屾儏鏁版嵁鍒?DuckDB锛圲PSERT 閫昏緫锛岄槻姝㈤噸澶嶆暟鎹級
         
-        使用 DuckDB 的 INSERT OR REPLACE 实现原子性 UPSERT，
-        避免 DELETE+INSERT 产生的并发覆盖问题。
+        浣跨敤 DuckDB 鐨?INSERT OR REPLACE 瀹炵幇鍘熷瓙鎬?UPSERT锛?
+        閬垮厤 DELETE+INSERT 浜х敓鐨勫苟鍙戣鐩栭棶棰樸€?
         """
         if df.empty or not HAS_DUCKDB:
             return
@@ -927,7 +926,7 @@ class DataEngine:
                 dates_min = df["trade_date"].min()
                 dates_max = df["trade_date"].max()
                 if codes and not (pd.isna(dates_min) or pd.isna(dates_max)):
-                    # 使用 register 避免大列表拼接 SQL 注入
+                    # 浣跨敤 register 閬垮厤澶у垪琛ㄦ嫾鎺?SQL 娉ㄥ叆
                     codes_df = pd.DataFrame({"ts_code": codes})
                     conn.register('tmp_codes', codes_df)
                     conn.execute("""
@@ -937,7 +936,7 @@ class DataEngine:
                     """, (dates_min, dates_max))
                     conn.execute("DROP VIEW tmp_codes")
             try:
-                # 原子性 UPSERT（覆盖已存在的 ts_code+trade_date 组合）
+                # 鍘熷瓙鎬?UPSERT锛堣鐩栧凡瀛樺湪鐨?ts_code+trade_date 缁勫悎锛?
                 conn.execute("""
                     INSERT OR REPLACE INTO daily_quotes
                     (ts_code, trade_date, open, high, low, close, pre_close,
@@ -960,15 +959,15 @@ class DataEngine:
                 logger.warning(f"UPSERT failed, trying INSERT OR IGNORE: {e}")
                 conn.execute("INSERT OR IGNORE INTO daily_quotes SELECT * FROM df")
 
-    # ──────────────────────────────────────────────────────────
-    # 增量更新（多线程 + 重试 + 断点续传）
-    # ──────────────────────────────────────────────────────────
+    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # 澧為噺鏇存柊锛堝绾跨▼ + 閲嶈瘯 + 鏂偣缁紶锛?
+    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     def get_latest_date(self, ts_code: str = None) -> Optional[str]:
-        """获取本地最新日期（含断点续传检测：验证最新日期数据是否完整）"""
+        """鑾峰彇鏈湴鏈€鏂版棩鏈燂紙鍚柇鐐圭画浼犳娴嬶細楠岃瘉鏈€鏂版棩鏈熸暟鎹槸鍚﹀畬鏁达級"""
         if not HAS_DUCKDB:
             return None
 
-        # 先尝试获取最新日期
+        # 鍏堝皾璇曡幏鍙栨渶鏂版棩鏈?
         if ts_code:
             result = self.query(
                 "SELECT MAX(trade_date) as md FROM daily_quotes WHERE ts_code = ?",
@@ -982,7 +981,7 @@ class DataEngine:
 
         latest = pd.Timestamp(val).strftime("%Y-%m-%d")
 
-        # 断点续传加固：检查最新日期数据是否完整（close>0 且 volume>=0）
+        # 鏂偣缁紶鍔犲浐锛氭鏌ユ渶鏂版棩鏈熸暟鎹槸鍚﹀畬鏁达紙close>0 涓?volume>=0锛?
         if ts_code:
             check = self.query("""
                 SELECT COUNT(*) as cnt FROM daily_quotes
@@ -990,7 +989,7 @@ class DataEngine:
                 AND close > 0 AND volume >= 0
             """, (ts_code, latest))
             if check.empty or check.iloc[0, 0] == 0:
-                # 数据损坏/不完整，回退到前一天
+                # 鏁版嵁鎹熷潖/涓嶅畬鏁达紝鍥為€€鍒板墠涓€澶?
                 prev = (pd.Timestamp(latest) - timedelta(days=1)).strftime("%Y-%m-%d")
                 prev_check = self.query("""
                     SELECT COUNT(*) as cnt FROM daily_quotes
@@ -998,7 +997,7 @@ class DataEngine:
                     AND close > 0 AND volume >= 0
                 """, (ts_code, prev))
                 if prev_check.empty or prev_check.iloc[0, 0] == 0:
-                    return None  # 数据彻底损坏
+                    return None  # 鏁版嵁褰诲簳鎹熷潖
                 return prev
         return latest
 
@@ -1006,14 +1005,14 @@ class DataEngine:
                                  symbol: str,
                                  start_date: str,
                                  end_date: str,
-                                 adjust: Literal["qfq", "hfq", ""] = "qfq",
+                                 adjust: Literal["qfq", ""] = "qfq",
                                  max_retries: int = DEFAULT_MAX_RETRIES) -> Tuple[pd.DataFrame, str]:
         """
-        带指数退避重试的抓取（AkShare → Baostock → 失败）
+        甯︽寚鏁伴€€閬块噸璇曠殑鎶撳彇锛圓kShare 鈫?Baostock 鈫?澶辫触锛?
         
         Returns
         -------
-        (df, source): df数据, source='akshare'|'baostock'|''
+        (df, source): df鏁版嵁, source='akshare'|'baostock'|''
         """
         for attempt in range(max_retries):
             # AkShare
@@ -1022,7 +1021,7 @@ class DataEngine:
                 if not df.empty:
                     return df, "akshare"
 
-            # Baostock 备援
+            # Baostock 澶囨彺
             if HAS_BAOSTOCK:
                 df = self._fetch_baostock(symbol, start_date, end_date, adjust)
                 if not df.empty:
@@ -1038,12 +1037,12 @@ class DataEngine:
                        symbol: str,
                        start_date: str,
                        end_date: str,
-                       adjust: Literal["qfq", "hfq", ""] = "qfq") -> pd.DataFrame:
-        """AkShare 抓取（内部用）"""
+                       adjust: Literal["qfq", ""] = "qfq") -> pd.DataFrame:
+        """AkShare 鎶撳彇锛堝唴閮ㄧ敤锛?""
         try:
             start_str = start_date.replace("-", "")
             end_str = end_date.replace("-", "")
-            adj_map = {"qfq": "qfq", "hfq": "hfq", "": ""}
+            adj_map = {"qfq": "qfq", "": ""}
             adj = adj_map.get(adjust, "qfq")
 
             df = ak.stock_zh_a_hist(
@@ -1057,9 +1056,9 @@ class DataEngine:
                 return pd.DataFrame()
 
             df = df.rename(columns={
-                "日期": "trade_date", "开盘": "open", "收盘": "close",
-                "最高": "high", "最低": "low", "成交量": "volume",
-                "成交额": "amount", "涨跌幅": "pct_chg", "换手率": "turnover"
+                "鏃ユ湡": "trade_date", "寮€鐩?: "open", "鏀剁洏": "close",
+                "鏈€楂?: "high", "鏈€浣?: "low", "鎴愪氦閲?: "volume",
+                "鎴愪氦棰?: "amount", "娑ㄨ穼骞?: "pct_chg", "鎹㈡墜鐜?: "turnover"
             })
             df["trade_date"] = pd.to_datetime(df["trade_date"])
             sym6 = str(symbol).zfill(6)
@@ -1067,11 +1066,11 @@ class DataEngine:
             df["pre_close"] = df["close"].shift(1)
             df["is_suspend"] = df["volume"] == 0
             
-            # 涨跌停判定
+            # 娑ㄨ穼鍋滃垽瀹?
             df = self._apply_limit_flags(df, symbol)
             df["data_source"] = "akshare"
 
-            # 复权因子
+            # 澶嶆潈鍥犲瓙
             if adjust:
                 try:
                     df_raw = ak.stock_zh_a_hist(
@@ -1079,7 +1078,7 @@ class DataEngine:
                         start_date=start_str, end_date=end_str, adjust=""
                     )
                     if not df_raw.empty:
-                        df_raw = df_raw.rename(columns={"日期": "td2", "收盘": "close_raw"})
+                        df_raw = df_raw.rename(columns={"鏃ユ湡": "td2", "鏀剁洏": "close_raw"})
                         df_raw["td2"] = pd.to_datetime(df_raw["td2"])
                         df = df.merge(df_raw[["td2", "close_raw"]], left_on="trade_date", right_on="td2", how="left")
                         df["adj_factor"] = df["close"] / df["close_raw"].replace(0, np.nan)
@@ -1104,15 +1103,15 @@ class DataEngine:
                         symbol: str,
                         start_date: str,
                         end_date: str,
-                        adjust: Literal["qfq", "hfq", ""] = "qfq") -> pd.DataFrame:
-        """Baostock 抓取（备援用，login/logout 在方法内部管理）"""
+                        adjust: Literal["qfq", ""] = "qfq") -> pd.DataFrame:
+        """Baostock 鎶撳彇锛堝鎻寸敤锛宭ogin/logout 鍦ㄦ柟娉曞唴閮ㄧ鐞嗭級"""
         if not HAS_BAOSTOCK:
             return pd.DataFrame()
         try:
-            adjflag_map = {"qfq": "2", "hfq": "1", "": "3"}
+            adjflag_map = {"qfq": "2", "": "3"}
             adjflag = adjflag_map.get(adjust, "2")
 
-            # 标准化 baostock 代码
+            # 鏍囧噯鍖?baostock 浠ｇ爜
             sym6 = str(symbol).zfill(6)
             if sym6.startswith("6") or sym6.startswith("5"):
                 bs_code = f"sh.{sym6}"
@@ -1151,7 +1150,7 @@ class DataEngine:
             df["amount"] = df["amount"].astype(float)
             df["is_suspend"] = df["volume"] == 0
             
-            # 涨跌停判定
+            # 娑ㄨ穼鍋滃垽瀹?
             df = self._apply_limit_flags(df, symbol)
             df["data_source"] = "baostock"
             df["adj_factor"] = 1.0
@@ -1166,11 +1165,11 @@ class DataEngine:
             return pd.DataFrame()
 
     def _batch_get_latest_dates(self, ts_codes: List[str]) -> Dict[str, str]:
-        """批量获取多只股票的最新日期（单条SQL替代N次查询，减少DB I/O）
+        """鎵归噺鑾峰彇澶氬彧鑲＄エ鐨勬渶鏂版棩鏈燂紙鍗曟潯SQL鏇夸唬N娆℃煡璇紝鍑忓皯DB I/O锛?
         
         Returns
         -------
-        Dict[str, str]: {ts_code: latest_date_str} 字典
+        Dict[str, str]: {ts_code: latest_date_str} 瀛楀吀
         """
         if not ts_codes or not HAS_DUCKDB:
             return {}
@@ -1195,22 +1194,22 @@ class DataEngine:
 
     def update_daily_data(self,
                           symbols: List[str] = None,
-                          adjust: Literal["qfq", "hfq", ""] = "qfq",
+                          adjust: Literal["qfq", ""] = "qfq",
                           max_workers: int = 12,
                           delay: float = 0.2,
                           check_dividend: bool = True,
                           cross_validate: bool = True) -> Dict:
         """
-        多线程增量更新日线数据 — 生产级增强版 v2
+        澶氱嚎绋嬪閲忔洿鏂版棩绾挎暟鎹?鈥?鐢熶骇绾у寮虹増 v2
         
-        改进点（Issue #1）：
-        1. max_workers 默认 12（充分利用多核）
-        2. 批量 latest_date 缓存（单条SQL替代N次查询）
-        3. 限速移入线程内部（主线程不再 sleep）
-        4. 批量入库累积写入（减少DB连接开销）
-        5. 复权因子监测（dividend_check）
-        6. 多源交叉验证（AkShare vs Baostock）
-        7. 断点续传加固 + DataValidator
+        鏀硅繘鐐癸紙Issue #1锛夛細
+        1. max_workers 榛樿 12锛堝厖鍒嗗埄鐢ㄥ鏍革級
+        2. 鎵归噺 latest_date 缂撳瓨锛堝崟鏉QL鏇夸唬N娆℃煡璇級
+        3. 闄愰€熺Щ鍏ョ嚎绋嬪唴閮紙涓荤嚎绋嬩笉鍐?sleep锛?
+        4. 鎵归噺鍏ュ簱绱Н鍐欏叆锛堝噺灏慏B杩炴帴寮€閿€锛?
+        5. 澶嶆潈鍥犲瓙鐩戞祴锛坉ividend_check锛?
+        6. 澶氭簮浜ゅ弶楠岃瘉锛圓kShare vs Baostock锛?
+        7. 鏂偣缁紶鍔犲浐 + DataValidator
         """
         start_time = time.time()
         stats = {
@@ -1238,7 +1237,7 @@ class DataEngine:
             logger.info("Data is up-to-date.")
             return stats
 
-        # ── Issue #2: 批量缓存 latest_date（单条SQL替代5000+次查询）──
+        # 鈹€鈹€ Issue #2: 鎵归噺缂撳瓨 latest_date锛堝崟鏉QL鏇夸唬5000+娆℃煡璇級鈹€鈹€
         ts_codes = []
         for sym in symbols:
             sym6 = str(sym).zfill(6)
@@ -1251,7 +1250,7 @@ class DataEngine:
         latest_cache = self._batch_get_latest_dates(ts_codes)
         logger.info(f"Cache hit: {len(latest_cache)}/{len(ts_codes)} stocks have local data")
 
-        # 预过滤：排除已是最新且无复权因子的股票
+        # 棰勮繃婊わ細鎺掗櫎宸叉槸鏈€鏂颁笖鏃犲鏉冨洜瀛愮殑鑲＄エ
         active_symbols = []
         for sym, tc in zip(symbols, ts_codes):
             cached = latest_cache.get(tc, "")
@@ -1268,19 +1267,19 @@ class DataEngine:
             stats["elapsed_sec"] = time.time() - start_time
             return stats
 
-        # ── 线程安全的批量累积缓冲区 ──
+        # 鈹€鈹€ 绾跨▼瀹夊叏鐨勬壒閲忕疮绉紦鍐插尯 鈹€鈹€
         import threading
         batch_buffer = []
         batch_lock = threading.Lock()
-        BATCH_FLUSH_SIZE = 50  # 每50只股票批量入库一次
+        BATCH_FLUSH_SIZE = 50  # 姣?0鍙偂绁ㄦ壒閲忓叆搴撲竴娆?
 
         def _download_one(sym: str) -> Tuple[str, pd.DataFrame, str, str]:
-            """单线程下载器（内部自带限速）"""
+            """鍗曠嚎绋嬩笅杞藉櫒锛堝唴閮ㄨ嚜甯﹂檺閫燂級"""
             try:
                 symbol_clean = str(sym).zfill(6)
                 ts_code = (f"{symbol_clean}.SH" if symbol_clean.startswith(("6", "5", "9", "688"))
                            else f"{symbol_clean}.SZ")
-                # 使用缓存而非实时查询
+                # 浣跨敤缂撳瓨鑰岄潪瀹炴椂鏌ヨ
                 sym_latest = latest_cache.get(ts_code, "")
                 if sym_latest and sym_latest >= start_date:
                     return sym, pd.DataFrame(), "", ""
@@ -1289,7 +1288,7 @@ class DataEngine:
                 if actual_start > end_date:
                     return sym, pd.DataFrame(), "", ""
 
-                # 线程内限速：避免并发请求过猛
+                # 绾跨▼鍐呴檺閫燂細閬垮厤骞跺彂璇锋眰杩囩寷
                 time.sleep(delay * random.uniform(0.5, 1.5))
 
                 df, source = self._fetch_single_with_retry(sym, actual_start, end_date, adjust)
@@ -1297,7 +1296,7 @@ class DataEngine:
             except Exception as e:
                 return sym, pd.DataFrame(), "", str(e)
 
-        # 多线程下载 + 批量入库
+        # 澶氱嚎绋嬩笅杞?+ 鎵归噺鍏ュ簱
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {pool.submit(_download_one, s): s for s in active_symbols}
             done = 0
@@ -1305,19 +1304,19 @@ class DataEngine:
                 sym, df, source, err = future.result()
                 done += 1
                 if not df.empty:
-                    # 复权因子监测
+                    # 澶嶆潈鍥犲瓙鐩戞祴
                     if check_dividend:
                         div_alerts = self._check_adj_factor_change(sym, df)
                         if div_alerts:
                             stats["dividend_detected"] += len(div_alerts)
 
-                    # DataValidator 验证
+                    # DataValidator 楠岃瘉
                     val = self.validator.validate(df)
                     if not val["ok"]:
                         for issue in val["issues"]:
                             stats["errors"].append(f"{sym}: {issue}")
 
-                    # 累积到批量缓冲区
+                    # 绱Н鍒版壒閲忕紦鍐插尯
                     with batch_lock:
                         batch_buffer.append(df)
                         if len(batch_buffer) >= BATCH_FLUSH_SIZE:
@@ -1340,12 +1339,12 @@ class DataEngine:
                           f"({done/len(active_symbols)*100:.1f}%) "
                           f"success={stats['success']} failed={stats['failed']}")
 
-        # 刷出缓冲区剩余数据
+        # 鍒峰嚭缂撳啿鍖哄墿浣欐暟鎹?
         if batch_buffer:
             self.save_quotes(pd.concat(batch_buffer, ignore_index=True), mode="append")
             batch_buffer.clear()
 
-        # 多源交叉验证（抽样）
+        # 澶氭簮浜ゅ弶楠岃瘉锛堟娊鏍凤級
         if cross_validate and HAS_BAOSTOCK and stats["success"] > 0:
             self._cross_validate_sources(active_symbols[:min(50, len(active_symbols))], end_date, stats)
 
@@ -1362,10 +1361,10 @@ class DataEngine:
                                   symbol: str,
                                   new_data: pd.DataFrame) -> List[Dict]:
         """
-        复权因子变化检测
+        澶嶆潈鍥犲瓙鍙樺寲妫€娴?
         
-        如果 adj_factor 发生非连续跳变（>5%），说明发生了分红/拆股，
-        需要记录日志，严重时可触发全量重拉。
+        濡傛灉 adj_factor 鍙戠敓闈炶繛缁烦鍙橈紙>5%锛夛紝璇存槑鍙戠敓浜嗗垎绾?鎷嗚偂锛?
+        闇€瑕佽褰曟棩蹇楋紝涓ラ噸鏃跺彲瑙﹀彂鍏ㄩ噺閲嶆媺銆?
         """
         if "adj_factor" not in new_data.columns or new_data.empty:
             return []
@@ -1373,7 +1372,7 @@ class DataEngine:
         alerts = []
         ts_code = new_data["ts_code"].iloc[0]
 
-        # 获取本地最近的复权因子
+        # 鑾峰彇鏈湴鏈€杩戠殑澶嶆潈鍥犲瓙
         local = self.query("""
             SELECT trade_date, adj_factor
             FROM daily_quotes
@@ -1390,7 +1389,7 @@ class DataEngine:
 
         if old_adj > 0 and new_adj > 0:
             change_ratio = abs(new_adj / old_adj - 1)
-            if change_ratio > DEFAULT_ADJ_CHANGE_THRESHOLD:  # 5% 以上变化
+            if change_ratio > DEFAULT_ADJ_CHANGE_THRESHOLD:  # 5% 浠ヤ笂鍙樺寲
                 alert = {
                     "ts_code": ts_code,
                     "trade_date": new_data["trade_date"].iloc[0],
@@ -1400,7 +1399,7 @@ class DataEngine:
                 }
                 alerts.append(alert)
 
-                # 记录到日志表（参数化查询防止SQL注入）
+                # 璁板綍鍒版棩蹇楄〃锛堝弬鏁板寲鏌ヨ闃叉SQL娉ㄥ叆锛?
                 with self.get_connection() as log_conn:
                     log_conn.execute("""
                         INSERT INTO adj_factor_log
@@ -1415,20 +1414,20 @@ class DataEngine:
                                 trade_date: str,
                                 stats: Dict) -> None:
         """
-        AkShare vs Baostock 交叉验证
+        AkShare vs Baostock 浜ゅ弶楠岃瘉
         
-        抽样检查当日涨跌幅，偏差 > 0.5% 报警
+        鎶芥牱妫€鏌ュ綋鏃ユ定璺屽箙锛屽亸宸?> 0.5% 鎶ヨ
         """
         if not HAS_BAOSTOCK:
             return
 
         try:
             bs.login()
-            for sym in symbols[:20]:  # 抽样20只
+            for sym in symbols[:20]:  # 鎶芥牱20鍙?
                 sym6 = str(sym).zfill(6)
                 bs_code = f"sh.{sym6}" if sym6.startswith("6") else f"sz.{sym6}"
 
-                # AkShare 数据（参数化查询防止SQL注入）
+                # AkShare 鏁版嵁锛堝弬鏁板寲鏌ヨ闃叉SQL娉ㄥ叆锛?
                 ak_data = self.query("""
                     SELECT pct_chg FROM daily_quotes
                     WHERE ts_code LIKE ?
@@ -1438,7 +1437,7 @@ class DataEngine:
                 if ak_data.empty:
                     continue
 
-                # Baostock 数据
+                # Baostock 鏁版嵁
                 try:
                     rs = bs.query_history_k_data_plus(
                         bs_code, "date,pctChg",
@@ -1462,7 +1461,7 @@ class DataEngine:
                     ak_pct = ak_data["pct_chg"].iloc[0]
                     diff = abs(ak_pct - bs_pct)
 
-                    if diff > 0.5:  # 偏差超过 0.5%
+                    if diff > 0.5:  # 鍋忓樊瓒呰繃 0.5%
                         stats["cross_validate_errors"] += 1
                         with self.get_connection() as conn:
                             conn.execute("""
@@ -1476,37 +1475,37 @@ class DataEngine:
         finally:
             bs.logout()
 
-    # ──────────────────────────────────────────────────────────
-    # Issue #3: 停牌日期填充 & 退市过滤
-    # ──────────────────────────────────────────────────────────
+    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # Issue #3: 鍋滅墝鏃ユ湡濉厖 & 閫€甯傝繃婊?
+    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     def _fill_suspend_dates(self,
                             df: pd.DataFrame,
                             start_date: str,
                             end_date: str) -> pd.DataFrame:
-        """填充停牌日缺失日期（Forward Fill），解决均线断裂问题
+        """濉厖鍋滅墝鏃ョ己澶辨棩鏈燂紙Forward Fill锛夛紝瑙ｅ喅鍧囩嚎鏂闂
         
-        对于数据库中缺失的停牌日期（volume=0 或无数据行），
-        使用前一日收盘价填充 OHLC，确保时间序列连续性。
+        瀵逛簬鏁版嵁搴撲腑缂哄け鐨勫仠鐗屾棩鏈燂紙volume=0 鎴栨棤鏁版嵁琛岋級锛?
+        浣跨敤鍓嶄竴鏃ユ敹鐩樹环濉厖 OHLC锛岀‘淇濇椂闂村簭鍒楄繛缁€с€?
         
         Parameters
         ----------
         df : pd.DataFrame
-            已有的日线数据
+            宸叉湁鐨勬棩绾挎暟鎹?
         start_date : str
-            期望的起始日期 YYYY-MM-DD
+            鏈熸湜鐨勮捣濮嬫棩鏈?YYYY-MM-DD
         end_date : str
-            期望的结束日期 YYYY-MM-DD
+            鏈熸湜鐨勭粨鏉熸棩鏈?YYYY-MM-DD
             
         Returns
         -------
-        pd.DataFrame: 填充后的完整时间序列
+        pd.DataFrame: 濉厖鍚庣殑瀹屾暣鏃堕棿搴忓垪
         """
         if df.empty:
             return df
 
         ts_code = df["ts_code"].iloc[0]
         
-        # 获取交易日历中的完整交易日序列
+        # 鑾峰彇浜ゆ槗鏃ュ巻涓殑瀹屾暣浜ゆ槗鏃ュ簭鍒?
         trade_dates = self.get_trade_dates(start_date, end_date)
         if not trade_dates:
             return df
@@ -1519,11 +1518,11 @@ class DataEngine:
         if not missing_dates:
             return df
         
-        # 构造缺失日期的填充行（使用前向填充）
+        # 鏋勯€犵己澶辨棩鏈熺殑濉厖琛岋紙浣跨敤鍓嶅悜濉厖锛?
         fill_rows = []
-        last_valid = df.iloc[-1]  # 默认使用最后一行
+        last_valid = df.iloc[-1]  # 榛樿浣跨敤鏈€鍚庝竴琛?
         for mdate in missing_dates:
-            # 找到该缺失日期之前的最近有效数据
+            # 鎵惧埌璇ョ己澶辨棩鏈熶箣鍓嶇殑鏈€杩戞湁鏁堟暟鎹?
             mdt = pd.Timestamp(mdate)
             valid_before = df[pd.to_datetime(df["trade_date"]) < mdt]
             if not valid_before.empty:
@@ -1556,16 +1555,16 @@ class DataEngine:
         return df
 
     def is_delisted(self, ts_code: str) -> bool:
-        """检查股票是否已退市
+        """妫€鏌ヨ偂绁ㄦ槸鍚﹀凡閫€甯?
         
         Parameters
         ----------
         ts_code : str
-            股票代码如 '000001.SZ'
+            鑲＄エ浠ｇ爜濡?'000001.SZ'
             
         Returns
         -------
-        bool: True 表示已退市
+        bool: True 琛ㄧず宸查€€甯?
         """
         result = self.query(
             "SELECT is_delisted FROM stock_basic WHERE ts_code = ?",
@@ -1576,11 +1575,11 @@ class DataEngine:
         return bool(result.iloc[0, 0])
 
     def get_delist_date(self, ts_code: str) -> Optional[str]:
-        """获取退市日期
+        """鑾峰彇閫€甯傛棩鏈?
         
         Returns
         -------
-        str or None: 退市日期 YYYY-MM-DD，未退市返回 None
+        str or None: 閫€甯傛棩鏈?YYYY-MM-DD锛屾湭閫€甯傝繑鍥?None
         """
         result = self.query(
             "SELECT delist_date FROM stock_basic WHERE ts_code = ? AND is_delisted = TRUE",
@@ -1591,18 +1590,18 @@ class DataEngine:
         return pd.Timestamp(result.iloc[0, 0]).strftime("%Y-%m-%d")
 
     def filter_delisted_stocks(self, symbols: List[str], as_of_date: str) -> List[str]:
-        """过滤在指定日期已退市的股票
+        """杩囨护鍦ㄦ寚瀹氭棩鏈熷凡閫€甯傜殑鑲＄エ
         
         Parameters
         ----------
         symbols : List[str]
-            股票代码列表（6位数字）
+            鑲＄エ浠ｇ爜鍒楄〃锛?浣嶆暟瀛楋級
         as_of_date : str
-            截止日期 YYYY-MM-DD
+            鎴鏃ユ湡 YYYY-MM-DD
             
         Returns
         -------
-        List[str]: 仍可交易的股票代码列表
+        List[str]: 浠嶅彲浜ゆ槗鐨勮偂绁ㄤ唬鐮佸垪琛?
         """
         if not symbols or not HAS_DUCKDB:
             return symbols
@@ -1634,7 +1633,7 @@ class DataEngine:
         if df.empty:
             return []
         
-        # 使用 ts_code 列映射回原始 symbol
+        # 浣跨敤 ts_code 鍒楁槧灏勫洖鍘熷 symbol
         result = []
         for _, row in df.iterrows():
             tc = row["ts_code"]
@@ -1645,34 +1644,34 @@ class DataEngine:
         
         return result
 
-    # ──────────────────────────────────────────────────────────
-    # 单股数据提取
-    # ──────────────────────────────────────────────────────────
+    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # 鍗曡偂鏁版嵁鎻愬彇
+    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     def get_security_data(self,
                           code: str,
                           start_date: str = None,
                           end_date: str = None,
-                          adjust: Literal["qfq", "hfq", ""] = "qfq",
+                          adjust: Literal["qfq", ""] = "qfq",
                           fill_suspend: bool = True) -> pd.DataFrame:
         """
-        获取单只股票数据
+        鑾峰彇鍗曞彧鑲＄エ鏁版嵁
         
-        先查本地，没有则从网络拉取。
+        鍏堟煡鏈湴锛屾病鏈夊垯浠庣綉缁滄媺鍙栥€?
         
         Parameters
         ----------
         code : str
-            股票代码（6位数字或带后缀）
+            鑲＄エ浠ｇ爜锛?浣嶆暟瀛楁垨甯﹀悗缂€锛?
         start_date : str, optional
-            开始日期
+            寮€濮嬫棩鏈?
         end_date : str, optional
-            结束日期
-        adjust : 'qfq' | 'hfq' | ''
-            复权方式
+            缁撴潫鏃ユ湡
+        adjust : 'qfq' | ''
+            澶嶆潈鏂瑰紡
         fill_suspend : bool
-            是否填充停牌日（默认True）
+            鏄惁濉厖鍋滅墝鏃ワ紙榛樿True锛?
         """
-        # 标准化代码
+        # 鏍囧噯鍖栦唬鐮?
         if "." in code:
             ts_code, symbol = code, code.split(".")[0]
         else:
@@ -1682,11 +1681,11 @@ class DataEngine:
         start_date = start_date or DEFAULT_START_DATE
         end_date = end_date or datetime.now().strftime("%Y-%m-%d")
 
-        # Issue #3: 检查是否已退市（退市后停止抓取）
+        # Issue #3: 妫€鏌ユ槸鍚﹀凡閫€甯傦紙閫€甯傚悗鍋滄鎶撳彇锛?
         delist_date = self.get_delist_date(ts_code)
         if delist_date and delist_date < start_date:
             logger.debug(f"{ts_code} delisted on {delist_date}, skip fetch")
-            # 仍然返回本地已有数据
+            # 浠嶇劧杩斿洖鏈湴宸叉湁鏁版嵁
             local = self.query("""
                 SELECT * FROM daily_quotes
                 WHERE ts_code = ? AND trade_date BETWEEN ? AND ?
@@ -1694,7 +1693,7 @@ class DataEngine:
             """, (ts_code, start_date, end_date))
             return local
 
-        # 查本地（参数化查询防止SQL注入）
+        # 鏌ユ湰鍦帮紙鍙傛暟鍖栨煡璇㈤槻姝QL娉ㄥ叆锛?
         local = self.query("""
             SELECT * FROM daily_quotes
             WHERE ts_code = ?
@@ -1706,7 +1705,7 @@ class DataEngine:
             today = datetime.now().strftime("%Y-%m-%d")
             if pd.Timestamp(local_latest).strftime("%Y-%m-%d") < today:
                 new_start = (pd.Timestamp(local_latest) + timedelta(days=1)).strftime("%Y-%m-%d")
-                # 退市后不抓取
+                # 閫€甯傚悗涓嶆姄鍙?
                 if delist_date and new_start > delist_date:
                     new_start = delist_date
                 if new_start <= end_date:
@@ -1716,7 +1715,7 @@ class DataEngine:
                         local = pd.concat([local, new_df], ignore_index=True)
             result = local.sort_values("trade_date").reset_index(drop=True)
         else:
-            # 本地没有，从网络拉（带重试）
+            # 鏈湴娌℃湁锛屼粠缃戠粶鎷夛紙甯﹂噸璇曪級
             if delist_date:
                 fetch_end = min(
                     pd.Timestamp(end_date),
@@ -1729,25 +1728,25 @@ class DataEngine:
                 self.save_quotes(df, mode="append")
             result = df
 
-        # Issue #3: 停牌日填充
+        # Issue #3: 鍋滅墝鏃ュ～鍏?
         if fill_suspend and not result.empty:
             result = self._fill_suspend_dates(result, start_date, end_date)
 
         return result
 
-    # ──────────────────────────────────────────────────────────
-    # 财务数据（PIT 约束）
-    # ──────────────────────────────────────────────────────────
+    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # 璐㈠姟鏁版嵁锛圥IT 绾︽潫锛?
+    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     def get_financial_data_pit(self,
                                ts_code: str,
                                trade_date: str,
                                lookback_days: int = 90) -> pd.DataFrame:
         """
-        Point-in-Time 财务数据获取
+        Point-in-Time 璐㈠姟鏁版嵁鑾峰彇
         
-        只返回 ann_date <= trade_date 的数据。
+        鍙繑鍥?ann_date <= trade_date 鐨勬暟鎹€?
         
-        这是防止未来函数的关键方法。
+        杩欐槸闃叉鏈潵鍑芥暟鐨勫叧閿柟娉曘€?
         """
         cutoff = (pd.Timestamp(trade_date) - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
         return self.query("""
@@ -1762,9 +1761,9 @@ class DataEngine:
                                   ts_code: str,
                                   trade_date: str) -> Optional[Dict]:
         """
-        获取 T 日最新的已公告财务数据
+        鑾峰彇 T 鏃ユ渶鏂扮殑宸插叕鍛婅储鍔℃暟鎹?
         
-        用于因子计算时的 PIT 约束。
+        鐢ㄤ簬鍥犲瓙璁＄畻鏃剁殑 PIT 绾︽潫銆?
         """
         df = self.get_financial_data_pit(ts_code, trade_date)
         if df.empty:
@@ -1772,22 +1771,22 @@ class DataEngine:
         latest = df.iloc[0]
         return latest.to_dict()
 
-    # ──────────────────────────────────────────────────────────
-    # 市值数据（PIT约束：只用T-1日收盘市值）
-    # ──────────────────────────────────────────────────────────
+    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # 甯傚€兼暟鎹紙PIT绾︽潫锛氬彧鐢═-1鏃ユ敹鐩樺競鍊硷級
+    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     def get_market_cap(self, trade_date: str, use_pit: bool = True) -> pd.Series:
         """
-        获取某日全市场市值
+        鑾峰彇鏌愭棩鍏ㄥ競鍦哄競鍊?
         
         Parameters
         ----------
         trade_date : str
-            目标日期
+            鐩爣鏃ユ湡
         use_pit : bool
-            True=使用T-1日市值（防止未来函数），False=使用当日市值
+            True=浣跨敤T-1鏃ュ競鍊硷紙闃叉鏈潵鍑芥暟锛夛紝False=浣跨敤褰撴棩甯傚€?
         """
         if use_pit:
-            # PIT约束：只用T-1日收盘市值
+            # PIT绾︽潫锛氬彧鐢═-1鏃ユ敹鐩樺競鍊?
             prev_date = self.get_previous_trade_date(trade_date)
             if prev_date:
                 trade_date = prev_date
@@ -1802,7 +1801,7 @@ class DataEngine:
         return df.set_index("ts_code")["circ_mv"]
 
     def get_previous_trade_date(self, trade_date: str) -> Optional[str]:
-        """获取指定日期的前一个交易日"""
+        """鑾峰彇鎸囧畾鏃ユ湡鐨勫墠涓€涓氦鏄撴棩"""
         df = self.query("""
             SELECT cal_date FROM trade_calendar
             WHERE is_open = TRUE
@@ -1814,28 +1813,28 @@ class DataEngine:
             return None
         return df.iloc[0, 0].strftime("%Y-%m-%d")
 
-    # ═══════════════════════════════════════════════════════════
-    # DuckDB Window Function 计算（下推至SQL层）
-    # ═══════════════════════════════════════════════════════════
+    # 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
+    # DuckDB Window Function 璁＄畻锛堜笅鎺ㄨ嚦SQL灞傦級
+    # 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
     def compute_rolling_returns(self,
                                   ts_codes: List[str],
                                   start_date: str,
                                   end_date: str,
                                   windows: List[int] = [5, 10, 20, 60]) -> pd.DataFrame:
         """
-        DuckDB Window Function 计算滚动收益率
+        DuckDB Window Function 璁＄畻婊氬姩鏀剁泭鐜?
         
-        直接在SQL层计算，避免将海量数据载入Pandas。
-        返回：ts_code, trade_date, window_5, window_10, window_20, window_60
+        鐩存帴鍦⊿QL灞傝绠楋紝閬垮厤灏嗘捣閲忔暟鎹浇鍏andas銆?
+        杩斿洖锛歵s_code, trade_date, window_5, window_10, window_20, window_60
         """
         if not ts_codes:
             return pd.DataFrame()
 
-        # 使用 register 避免大列表拼接 SQL 注入风险
+        # 浣跨敤 register 閬垮厤澶у垪琛ㄦ嫾鎺?SQL 娉ㄥ叆椋庨櫓
         codes_df = pd.DataFrame({"ts_code": ts_codes})
         max_window = max(windows)
 
-        # 构建窗口函数SQL（使用复利乘积计算滚动收益率）
+        # 鏋勫缓绐楀彛鍑芥暟SQL锛堜娇鐢ㄥ鍒╀箻绉绠楁粴鍔ㄦ敹鐩婄巼锛?
         window_parts = []
         for w in windows:
             window_parts.append(f"""
@@ -1875,14 +1874,14 @@ class DataEngine:
                             windows: List[int] = [5, 10, 20, 60],
                             price_col: str = "close") -> pd.DataFrame:
         """
-        DuckDB Window Function 计算移动平均线
+        DuckDB Window Function 璁＄畻绉诲姩骞冲潎绾?
         
-        直接在SQL层计算MA，避免内存爆炸。
+        鐩存帴鍦⊿QL灞傝绠桵A锛岄伩鍏嶅唴瀛樼垎鐐搞€?
         """
         if not ts_codes:
             return pd.DataFrame()
 
-        # 使用 register 避免大列表拼接 SQL 注入风险
+        # 浣跨敤 register 閬垮厤澶у垪琛ㄦ嫾鎺?SQL 娉ㄥ叆椋庨櫓
         codes_df = pd.DataFrame({"ts_code": ts_codes})
 
         window_parts = []
@@ -1915,12 +1914,12 @@ class DataEngine:
                                     end_date: str,
                                     windows: List[int] = [20, 60]) -> pd.DataFrame:
         """
-        DuckDB Window Function 计算滚动波动率
+        DuckDB Window Function 璁＄畻婊氬姩娉㈠姩鐜?
         """
         if not ts_codes:
             return pd.DataFrame()
 
-        # 使用 register 避免大列表拼接 SQL 注入风险
+        # 浣跨敤 register 閬垮厤澶у垪琛ㄦ嫾鎺?SQL 娉ㄥ叆椋庨櫓
         codes_df = pd.DataFrame({"ts_code": ts_codes})
 
         window_parts = []
@@ -1947,12 +1946,12 @@ class DataEngine:
             conn.execute("DROP VIEW tmp_codes_vol")
             return df
 
-    # ──────────────────────────────────────────────────────────
-    # 交易日历
-    # ──────────────────────────────────────────────────────────
+    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # 浜ゆ槗鏃ュ巻
+    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     def sync_calendar(self, start_year: int = 2018, end_year: int = None):
-        """同步交易日历（网络不可用时跳过，使用本地已有数据）"""
-        # 检查本地是否已有日历数据，有则跳过
+        """鍚屾浜ゆ槗鏃ュ巻锛堢綉缁滀笉鍙敤鏃惰烦杩囷紝浣跨敤鏈湴宸叉湁鏁版嵁锛?""
+        # 妫€鏌ユ湰鍦版槸鍚﹀凡鏈夋棩鍘嗘暟鎹紝鏈夊垯璺宠繃
         existing = self.query("SELECT COUNT(*) FROM trade_calendar WHERE is_open=TRUE")
         if existing.iloc[0, 0] > 100:
             logger.info(f"Calendar exists ({existing.iloc[0, 0]} days), skip sync")
@@ -1981,7 +1980,7 @@ class DataEngine:
     def get_trade_dates(self,
                         start_date: str = None,
                         end_date: str = None) -> List[str]:
-        """获取交易日列表"""
+        """鑾峰彇浜ゆ槗鏃ュ垪琛?""
         params = []
         sql = "SELECT cal_date FROM trade_calendar WHERE is_open = TRUE"
         if start_date:
@@ -1996,10 +1995,10 @@ class DataEngine:
             return []
         return df["cal_date"].dt.strftime("%Y-%m-%d").tolist()
 
-    # ──────────────────────────────────────────────────────────
-    # Parquet 导出
-    # ──────────────────────────────────────────────────────────
-    # 允许导出的表白名单（防止路径遍历和SQL注入）
+    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # Parquet 瀵煎嚭
+    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # 鍏佽瀵煎嚭鐨勮〃鐧藉悕鍗曪紙闃叉璺緞閬嶅巻鍜孲QL娉ㄥ叆锛?
     _EXPORT_TABLE_WHITELIST = frozenset({
         'daily_quotes', 'stock_basic', 'financial_data', 'index_constituents',
         'st_status_history', 'trade_calendar', 'daily_valuation',
@@ -2007,27 +2006,27 @@ class DataEngine:
     })
 
     def export_parquet(self, table: str = "daily_quotes") -> Path:
-        """导出表到 Parquet 格式（仅允许白名单表名）"""
+        """瀵煎嚭琛ㄥ埌 Parquet 鏍煎紡锛堜粎鍏佽鐧藉悕鍗曡〃鍚嶏級"""
         if table not in self._EXPORT_TABLE_WHITELIST:
-            raise ValueError(f"表 '{table}' 不在导出白名单中，允许的表: {sorted(self._EXPORT_TABLE_WHITELIST)}")
+            raise ValueError(f"琛?'{table}' 涓嶅湪瀵煎嚭鐧藉悕鍗曚腑锛屽厑璁哥殑琛? {sorted(self._EXPORT_TABLE_WHITELIST)}")
         output = self.parquet_dir / f"{table}.parquet"
-        # 路径安全检查：确保输出在 parquet_dir 内
+        # 璺緞瀹夊叏妫€鏌ワ細纭繚杈撳嚭鍦?parquet_dir 鍐?
         if not str(output.resolve()).startswith(str(self.parquet_dir.resolve())):
-            raise ValueError(f"导出路径 '{output}' 不在允许的目录 '{self.parquet_dir}' 内")
+            raise ValueError(f"瀵煎嚭璺緞 '{output}' 涓嶅湪鍏佽鐨勭洰褰?'{self.parquet_dir}' 鍐?)
         with self.get_connection() as conn:
             conn.execute(f"COPY (SELECT * FROM {table}) TO '{output}' (FORMAT PARQUET)")
         logger.info(f"Exported to {output}")
         return output
 
     def load_parquet(self, file_path: Path) -> pd.DataFrame:
-        """从 Parquet 加载"""
+        """浠?Parquet 鍔犺浇"""
         return pd.read_parquet(file_path)
 
-    # ──────────────────────────────────────────────────────────
-    # 数据质量报告
-    # ──────────────────────────────────────────────────────────
+    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # 鏁版嵁璐ㄩ噺鎶ュ憡
+    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     def quality_report(self, start_date: str, end_date: str) -> Dict:
-        """生成数据质量报告"""
+        """鐢熸垚鏁版嵁璐ㄩ噺鎶ュ憡"""
         total = self.query("""
             SELECT COUNT(*) as cnt FROM daily_quotes
             WHERE trade_date BETWEEN ? AND ?
@@ -2051,32 +2050,32 @@ class DataEngine:
         }
 
 
-    # ──────────────────────────────────────────────────────────
-    # 批量数据获取（优化 N+1 查询问题）
-    # ──────────────────────────────────────────────────────────
+    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # 鎵归噺鏁版嵁鑾峰彇锛堜紭鍖?N+1 鏌ヨ闂锛?
+    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     def get_batch_stock_data(self,
                               symbols: List[str],
                               trade_date: str) -> pd.DataFrame:
         """
-        批量获取多只股票在指定日期的日线数据
+        鎵归噺鑾峰彇澶氬彧鑲＄エ鍦ㄦ寚瀹氭棩鏈熺殑鏃ョ嚎鏁版嵁
         
-        用单条 SQL 替代 N 次循环查询，大幅减少数据库 I/O。
+        鐢ㄥ崟鏉?SQL 鏇夸唬 N 娆″惊鐜煡璇紝澶у箙鍑忓皯鏁版嵁搴?I/O銆?
         
         Parameters
         ----------
         symbols : List[str]
-            6位股票代码列表
+            6浣嶈偂绁ㄤ唬鐮佸垪琛?
         trade_date : str
-            交易日期 YYYY-MM-DD
+            浜ゆ槗鏃ユ湡 YYYY-MM-DD
             
         Returns
         -------
-        pd.DataFrame: 合并后的日线数据
+        pd.DataFrame: 鍚堝苟鍚庣殑鏃ョ嚎鏁版嵁
         """
         if not symbols or not HAS_DUCKDB:
             return pd.DataFrame()
         
-        # 构造 ts_code 列表
+        # 鏋勯€?ts_code 鍒楄〃
         ts_codes = []
         for sym in symbols:
             sym6 = str(sym).zfill(6)
@@ -2085,7 +2084,7 @@ class DataEngine:
             else:
                 ts_codes.append(f"{sym6}.SZ")
         
-        # 使用 register 避免 SQL 注入
+        # 浣跨敤 register 閬垮厤 SQL 娉ㄥ叆
         codes_df = pd.DataFrame({"ts_code": ts_codes})
         with self.get_connection() as conn:
             conn.register('tmp_batch_codes', codes_df)
@@ -2102,17 +2101,19 @@ class DataEngine:
         if df.empty:
             return pd.DataFrame()
         
-        # 提取6位代码作为 symbol 列
+        # 鎻愬彇6浣嶄唬鐮佷綔涓?symbol 鍒?
         df["symbol"] = df["ts_code"].str.split(".").str[0]
         return df
 
-    # ──────────────────────────────────────────────────────────
-    # 便捷函数
-    # ──────────────────────────────────────────────────────────
+    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # 渚挎嵎鍑芥暟
+    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 def load_stock(code: str,
                start: str = None,
                end: str = None,
                adjust: str = "qfq") -> pd.DataFrame:
-    """一行代码加载单只股票数据"""
+    """涓€琛屼唬鐮佸姞杞藉崟鍙偂绁ㄦ暟鎹?""
     engine = DataEngine()
     return engine.get_security_data(code, start, end, adjust)
+
+

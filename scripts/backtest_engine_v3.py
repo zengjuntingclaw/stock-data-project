@@ -353,7 +353,7 @@ class ProductionBacktestEngine:
         df['return'] = df['total_value'].pct_change()
         
         # 计算绩效指标
-        returns = df['return'].dropna()
+        returns = df['return'].dropna(how='all')
         metrics = self.performance.calculate(returns)
         
         report = {
