@@ -14,7 +14,7 @@ import pandas as pd
 import numpy as np
 from loguru import logger
 
-from scripts.data_classes import PerformanceMetrics
+from scripts.data_classes import PerformanceMetrics, Order
 from scripts.trading_rules import AShareTradingRules, TradingCalendar
 from scripts.execution_engine_v3 import ExecutionEngineV3, CashAccount, Position
 from scripts.survivorship_bias import SurvivorshipBiasHandler
@@ -55,7 +55,7 @@ class BacktestState:
     current_date: datetime
     cash: CashAccount
     positions: Dict[str, Position]
-    pending_orders: List[Any]  # 简化，实际应为List[Order]
+    pending_orders: List[Order] = field(default_factory=list)
     trade_history: List[Any]
     daily_values: List[Dict]
     
@@ -205,13 +205,34 @@ class ProductionBacktestEngine:
         date: datetime,
         strategy: Callable[[pd.DataFrame, datetime], Dict[str, float]],
     ):
-        """处理单日"""
+        """处理单日
+        
+        Bug修复(P0-3)：pending_orders必须每个交易日执行，不止调仓日。
+        根因：
+        - 旧逻辑只在_should_rebalance()=True时执行，导致非调仓日未成交的订单永久挂起
+        - 旧逻辑在调仓日生成新订单时未合并pending_orders，导致两部分订单孤立执行
+        修复：
+        - 步骤1：执行pending_orders（每个交易日必执行）
+        - 步骤2：如果是调仓日，生成新订单并与remaining合并，再执行
+        """
         self.state.current_date = date
         
         # 1. 获取当日市场数据
         market_data = self._get_market_data(date)
         if market_data is None or market_data.empty:
             return
+        
+        # === 步骤0(修复P0-3)：每个交易日先执行pending_orders ===
+        if self.state.pending_orders:
+            prices = market_data.set_index('symbol')['open'].to_dict()
+            # 更新pending订单的执行日期为当天
+            for order in self.state.pending_orders:
+                order.execution_date = date
+            trades, remaining = self.execution.execute(
+                self.state.pending_orders, market_data, date
+            )
+            self.state.pending_orders = remaining
+            self.state.trade_history.extend(trades)
         
         # 2. 检查是否需要调仓
         if self._should_rebalance(date):
@@ -224,14 +245,18 @@ class ProductionBacktestEngine:
             # 5. 权重约束
             target_weights = self._apply_weight_constraints(target_weights)
             
-            # 6. 生成订单
+            # 6. 生成新订单（包含信号重算后的全量目标）
             prices = market_data.set_index('symbol')['open'].to_dict()
-            orders = self.execution.generate_orders(
+            new_orders = self.execution.generate_orders(
                 target_weights, date, prices
             )
             
-            # 7. 执行订单
-            trades, remaining = self.execution.execute(orders, market_data, date)
+            # === 步骤7(修复P0-3)：新订单与remaining合并 ===
+            # 若步骤0执行后产生了remaining(含涨跌停/流动性阻塞)，将其加入新订单
+            all_orders = new_orders + self.state.pending_orders
+            
+            # 7. 执行合并后订单
+            trades, remaining = self.execution.execute(all_orders, market_data, date)
             
             self.state.pending_orders = remaining
             self.state.trade_history.extend(trades)
