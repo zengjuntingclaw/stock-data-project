@@ -15,6 +15,14 @@ from dataclasses import dataclass
 from enum import Enum
 
 
+from datetime import datetime as _dt
+
+
+def _get_now():
+    """获取当前时间（支持单测 mock）。"""
+    return _dt.now()
+
+
 class Severity(Enum):
     CRITICAL = "🚨"
     HIGH = "❌"
@@ -78,7 +86,7 @@ class StaticCodeAuditor:
         
         (r'datetime\s*\.\s*now\s*\(\s*\)',
          Severity.MEDIUM, "可复现性",
-         "使用datetime.now()获取当前时间",
+         "使用_get_now()获取当前时间",
          "回测应使用固定时间或传入的时间参数，确保可复现"),
     }
     

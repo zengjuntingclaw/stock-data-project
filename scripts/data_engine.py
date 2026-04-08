@@ -149,6 +149,9 @@ class DataEngine:
         数据验证器
     """
 
+    # 类级缓存：已初始化的数据库路径（避免重复建表）
+    _schema_initialized: set = set()
+
     def __init__(self,
                  db_path: str = None,
                  parquet_dir: str = None):
@@ -170,11 +173,21 @@ class DataEngine:
         # Baostock 全局会话锁（Baostock 不支持并发，全局单会话）
         self._bs_lock = threading.Lock()
 
+    @staticmethod
+    def _get_now() -> datetime:
+        """获取当前时间（支持单测 mock）。默认返回真实当前时间。"""
+        return datetime.now()
+
     # ──────────────────────────────────────────────────────────
     # 数据库初始化
     # ──────────────────────────────────────────────────────────
     def _init_schema(self):
-        """初始化表结构"""
+        """初始化表结构（幂等：同类路径只执行一次）"""
+        db_key = str(self.db_path.resolve())
+        if db_key in DataEngine._schema_initialized:
+            logger.debug(f"Schema already initialized for {db_key}")
+            return
+        
         conn = duckdb.connect(str(self.db_path))
         cur = conn.cursor()
 
@@ -339,6 +352,7 @@ class DataEngine:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_val_date ON daily_valuation(trade_date)")
 
         conn.close()
+        DataEngine._schema_initialized.add(str(self.db_path.resolve()))
         logger.info(f"DataEngine schema initialized: {self.db_path}")
 
     # ──────────────────────────────────────────────────────────
@@ -616,7 +630,7 @@ class DataEngine:
             logger.warning("AkShare not available, financial fetch skipped")
             return stats
 
-        end_year = end_year or datetime.now().year
+        end_year = end_year or self._get_now().year
         start_year = start_year or (end_year - 5)
 
         # 单只股票
@@ -799,7 +813,7 @@ class DataEngine:
                 with self._bs_lock:
                     bs.login()
                     try:
-                        bs_stocks = bs.query_all_stock(day=datetime.now().strftime("%Y-%m-%d"))
+                        bs_stocks = bs.query_all_stock(day=self._get_now().strftime("%Y-%m-%d"))
                     finally:
                         bs.logout()
                 if bs_stocks is not None and not bs_stocks.empty:
@@ -1271,7 +1285,7 @@ class DataEngine:
         else:
             start_date = DEFAULT_START_DATE
 
-        end_date = datetime.now().strftime("%Y-%m-%d")
+        end_date = self._get_now().strftime("%Y-%m-%d")
         if start_date > end_date:
             logger.info("Data is up-to-date.")
             return stats
@@ -1719,7 +1733,7 @@ class DataEngine:
             ts_code = build_ts_code(code)
 
         start_date = start_date or DEFAULT_START_DATE
-        end_date = end_date or datetime.now().strftime("%Y-%m-%d")
+        end_date = end_date or self._get_now().strftime("%Y-%m-%d")
 
         # Issue #3: 检查是否已退市（退市后停止抓取）
         delist_date = self.get_delist_date(ts_code)
@@ -1742,7 +1756,7 @@ class DataEngine:
         """, (ts_code, start_date, end_date))
         if not local.empty:
             local_latest = local["trade_date"].max()
-            today = datetime.now().strftime("%Y-%m-%d")
+            today = self._get_now().strftime("%Y-%m-%d")
             if pd.Timestamp(local_latest).strftime("%Y-%m-%d") < today:
                 new_start = (pd.Timestamp(local_latest) + timedelta(days=1)).strftime("%Y-%m-%d")
                 # 退市后不抓取
@@ -2002,7 +2016,7 @@ class DataEngine:
             return
 
         logger.info("Fetching calendar from AkShare...")
-        end_year = end_year or datetime.now().year
+        end_year = end_year or self._get_now().year
         with self.get_connection() as conn:
             cal = ak.tool_trade_date_hist_sina()
             cal.columns = ["cal_date", "is_open"]

@@ -17,6 +17,12 @@ import numpy as np
 from loguru import logger
 
 
+
+def _get_now():
+    """获取当前时间（支持单测 mock）。"""
+    return _get_now()
+
+
 class DataTier(Enum):
     """数据分层"""
     HOT = "hot"         # 热数据：最近2年，DuckDB
@@ -143,7 +149,7 @@ class PartitionedStorage:
     
     def _determine_tier(self, year: int) -> DataTier:
         """根据年份确定数据分层"""
-        current_year = datetime.now().year
+        current_year = _get_now().year
         age = current_year - year
         
         if age <= self.HOT_YEARS:
@@ -177,7 +183,7 @@ class PartitionedStorage:
         
         if year is None:
             # 归档所有超过HOT_YEARS的数据
-            current_year = datetime.now().year
+            current_year = _get_now().year
             for y in range(current_year - self.HOT_YEARS - 5, current_year - self.HOT_YEARS):
                 self.archive_to_parquet(table, y, compress)
             return None  # 显式返回 None，与类型注解 Optional[Path] 对齐
@@ -267,7 +273,7 @@ class PartitionedStorage:
         """
         start_year = int(start_date[:4])
         end_year = int(end_date[:4])
-        current_year = datetime.now().year
+        current_year = _get_now().year
         
         # 判断数据分布
         hot_years = [y for y in range(start_year, end_year + 1) 
@@ -514,7 +520,7 @@ class PartitionedStorage:
             'table': table,
             'year': year,
             'path': str(path),
-            'created_at': datetime.now().isoformat(),
+            'created_at': _get_now().isoformat(),
             'size_bytes': path.stat().st_size
         }
         

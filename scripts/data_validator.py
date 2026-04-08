@@ -6,7 +6,11 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from typing import Dict
-from datetime import datetime
+from datetime import datetime as _dt
+
+def _get_now() -> _dt:
+    """获取当前时间（支持单测 mock）。"""
+    return _dt.now()
 
 from scripts.data_engine import DEFAULT_ADJ_TOLERANCE, DEFAULT_SAMPLE_RATIO
 
@@ -135,7 +139,7 @@ class DataValidator:
 
     def _log_errors(self, df: pd.DataFrame):
         with open(self.error_log, "a", encoding="utf-8") as f:
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            ts = _get_now().strftime("%Y-%m-%d %H:%M:%S")
             for _, row in df.iterrows():
                 f.write(
                     f"[{ts}] CROSS_VALIDATE_ERROR | "

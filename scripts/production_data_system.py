@@ -44,6 +44,12 @@ from scripts.survivorship_bias import SurvivorshipBiasHandler
 from scripts.trading_rules import TradingFilter, AShareTradingRules
 
 
+
+def _get_now():
+    """获取当前时间（支持单测 mock）。"""
+    return _get_now()
+
+
 class ProductionDataSystem:
     """
     生产级数据系统统一入口
@@ -296,7 +302,7 @@ class ProductionDataSystem:
         logger.info("Running full system check...")
         
         results = {
-            'timestamp': datetime.now().isoformat(),
+            'timestamp': _get_now().isoformat(),
             'qa_check': None,
             'partition_stats': None,
             'version_audit': None,

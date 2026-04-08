@@ -16,6 +16,12 @@ import numpy as np
 from loguru import logger
 
 
+
+def _get_now():
+    """获取当前时间（支持单测 mock）。"""
+    return _get_now()
+
+
 class QASeverity(Enum):
     """QA问题严重程度"""
     INFO = "info"           # 信息提示
@@ -157,7 +163,7 @@ class DataQAPipeline:
         
         # 默认检查最近30天
         if end_date is None:
-            end_date = datetime.now().strftime('%Y-%m-%d')
+            end_date = _get_now().strftime('%Y-%m-%d')
         if start_date is None:
             start_date = (datetime.strptime(end_date, '%Y-%m-%d') - timedelta(days=30)).strftime('%Y-%m-%d')
         
@@ -618,7 +624,7 @@ class DataQAPipeline:
         
         return {
             'report_type': 'Data_QA_Full_Check',
-            'generated_at': datetime.now().isoformat(),
+            'generated_at': _get_now().isoformat(),
             'date_range': {'start': start_date, 'end': end_date},
             'summary': {
                 'total_records_checked': total_records,
@@ -639,7 +645,7 @@ class DataQAPipeline:
     
     def _save_report(self, report: Dict):
         """保存QA报告"""
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        timestamp = _get_now().strftime('%Y%m%d_%H%M%S')
         filename = f"qa_report_{timestamp}.json"
         filepath = self.report_dir / filename
         
@@ -660,14 +666,14 @@ class DataQAPipeline:
         """保存缺失数据报告"""
         report = {
             'report_type': 'Missing_Data_Report',
-            'generated_at': datetime.now().isoformat(),
+            'generated_at': _get_now().isoformat(),
             'date_range': {'start': start_date, 'end': end_date},
             'total_stocks_checked': len(missing_data),
             'stocks_with_missing_data': len([m for m in missing_data if m['missing_count'] > 0]),
             'details': missing_data[:100]  # 只保留前100条
         }
         
-        timestamp = datetime.now().strftime('%Y%m%d')
+        timestamp = _get_now().strftime('%Y%m%d')
         filepath = self.report_dir / f'missing_data_report_{timestamp}.json'
         
         with open(filepath, 'w', encoding='utf-8') as f:

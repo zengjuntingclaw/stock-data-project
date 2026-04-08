@@ -24,6 +24,12 @@ from loguru import logger
 duckdb = None
 
 
+
+def _get_now():
+    """获取当前时间（支持单测 mock）。"""
+    return _get_now()
+
+
 class DataVersionStatus(Enum):
     """数据版本状态"""
     ACTIVE = "active"           # 当前生效
@@ -134,7 +140,7 @@ class VersionedStorage:
         self._cache: Dict[str, Tuple[DataSnapshot, datetime]] = {}
         self._cache_max_size = 10000
         self._cache_ttl_seconds = 3600  # 1小时TTL
-        self._cache_last_cleanup = datetime.now()
+        self._cache_last_cleanup = _get_now()
         
         # 连接池（读写分离，减少开销）
         # 延迟导入duckdb，避免循环依赖
@@ -243,7 +249,7 @@ class VersionedStorage:
         snapshot = DataSnapshot(
             key=key,
             version=next_version,
-            recorded_at=datetime.now(),
+            recorded_at=_get_now(),
             effective_at=effective_at,
             data_hash="",  # 临时，后面计算
             data=data,
@@ -284,7 +290,7 @@ class VersionedStorage:
         # 更新缓存 - 使用store:前缀区分存储操作缓存
         self._evict_cache_if_needed()
         cache_key = f"store:{key}:v{snapshot.version}"
-        self._cache[cache_key] = (snapshot, datetime.now())
+        self._cache[cache_key] = (snapshot, _get_now())
         
         logger.debug(f"Stored snapshot: {key} v{snapshot.version}")
         return snapshot
@@ -352,7 +358,7 @@ class VersionedStorage:
             )
             
             # 缓存 - 带时间戳
-            self._cache[cache_key] = (snapshot, datetime.now())
+            self._cache[cache_key] = (snapshot, _get_now())
             
             return snapshot
     
@@ -419,7 +425,7 @@ class VersionedStorage:
         snapshot = self.store(
             key=key,
             data=corrected_data,
-            effective_at=datetime.now(),  # 勘误立即生效
+            effective_at=_get_now(),  # 勘误立即生效
             source=f"{corrected_by}:correction"
         )
         snapshot.correction_note = correction_note
@@ -595,7 +601,7 @@ class VersionedStorage:
     
     def _evict_cache_if_needed(self):
         """缓存淘汰 - 带TTL清理"""
-        now = datetime.now()
+        now = _get_now()
         
         # 每5分钟执行一次TTL清理
         if (now - self._cache_last_cleanup).seconds > 300:
