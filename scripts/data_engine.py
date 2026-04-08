@@ -110,31 +110,18 @@ def detect_limit(code: str) -> float:
 
 def build_ts_code(symbol: str) -> str:
     """构造 ts_code（支持沪深北三交易所）
-
-    交易所后缀规则（Tushare 标准）：
-      - .SH：上海证券交易所（主板 + 科创板，代码 6/5/9/688 开头）
-      - .SZ：深圳证券交易所（主板 + 创业板，代码 0/1/2/3 开头）
-      - .BJ：北京证券交易所（北交所，2021年开市，代码 4/8 开头）
-    """
-    sym6 = str(symbol).zfill(6)
-    # 取首位非 '0' 数字（识别原始前缀，避免 "600000".lstrip('0') → "" 丢失前缀）
-    first_char = next((c for c in sym6 if c != '0'), '0')
     
-    # 条件顺序：688特殊处理 > 9沪市 > 4/8北交所 > 6/5沪市 > 其余深市
-    if sym6.startswith("688"):
-        return f"{sym6}.SH"
-    elif first_char == '9':
-        # 9字头是沪市专属（注意：920xxx 不是北交所，北交所最大为 899xxx）
-        return f"{sym6}.SH"
-    elif first_char in ('4', '8'):
-        # 北交所股票（4开头老股退市整理期，8开头新股）
-        return f"{sym6}.BJ"
-    elif first_char in ('6', '5'):
-        # 6/5字头是沪市主板
-        return f"{sym6}.SH"
-    else:
-        # 0/1/2/3字头是深市（主板/创业板）
-        return f"{sym6}.SZ"
+    统一使用 exchange_mapping 模块的实现，确保所有入口一致。
+    交易所后缀规则（Tushare 标准）：
+      - .SH：上海证券交易所（主板 + 科创板，代码 6/5/688 开头）
+      - .SZ：深圳证券交易所（主板 + 创业板，代码 0/1/2/3 开头）
+      - .BJ：北京证券交易所（北交所，代码 4/8/920 开头）
+    
+    重要修复：920xxx 是北交所2024新代码段，不是沪市！
+    """
+    # 统一委托给 exchange_mapping 模块，确保所有入口一致
+    from scripts.exchange_mapping import build_ts_code as _build_ts_code
+    return _build_ts_code(symbol)
 
 
 # ──────────────────────────────────────────────────────────────

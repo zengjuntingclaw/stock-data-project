@@ -20,6 +20,11 @@ from scripts.execution_engine_v3 import ExecutionEngineV3, CashAccount, Position
 from scripts.survivorship_bias import SurvivorshipBiasHandler
 from scripts.pit_aligner import PITDataAligner
 from scripts.performance import EnhancedPerformanceAnalyzer
+from scripts.checkpoint_manager import (
+    CheckpointManager, BacktestState as CMBacktestState,
+    CashState, PositionState, OrderState, TradeState,
+    extract_state_from_engine, restore_engine_from_state
+)
 
 
 @dataclass
@@ -430,90 +435,72 @@ class ProductionBacktestEngine:
         return str(obj)  # fallback
 
     def _save_checkpoint(self, path: str):
-        """保存检查点（含完整状态，支持断点续传）"""
-        import json
-        state_data = self.state.to_dict()
-        # 使用递归序列化：Enum→name, datetime→isoformat, dataclass→嵌套dict
-        state_data['trade_history'] = self._dataclass_to_dict(self.state.trade_history)
-        state_data['pending_orders'] = self._dataclass_to_dict(self.state.pending_orders)
-        # 序列化 daily_records（已是 dict 或原生类型）
-        state_data['daily_records'] = self.daily_records
-        # 同步 execution engine 的内部状态（pending_settlements 等）
-        # pending_settlements 保存在 execution.cash 中，非 execution 直接属性
-        pending_settles = getattr(self.execution.cash, 'pending_settlements', [])
-        if pending_settles:
-            # pending_settlements 是 List[Tuple[datetime, float]]
-            state_data['execution'] = {
-                'pending_settlements': [
-                    {'settle_date': item[0].isoformat(), 'amount': item[1]}
-                    for item in pending_settles
-                ],
-                'pending_withdrawals': [
-                    {'withdrawable_date': item[0].isoformat(), 'amount': item[1]}
-                    for item in getattr(self.execution.cash, 'pending_withdrawals', [])
-                ],
-            }
-        else:
-            state_data['execution'] = {}
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(state_data, f, default=str, ensure_ascii=False)
+        """保存检查点（使用统一的CheckpointManager，确保save/load路径一致）"""
+        # 使用新的checkpoint_manager模块，确保状态保存/恢复一致性
+        manager = CheckpointManager(Path(path).parent)
+        
+        # 从execution engine提取完整状态
+        state = extract_state_from_engine(self.execution, self.state.current_date)
+        
+        # 补充BacktestState特有的字段
+        state.pending_orders = [
+            OrderState.from_order(o) for o in self.state.pending_orders
+        ]
+        state.trade_history = [
+            TradeState(
+                order_id=getattr(t, 'order_id', ''),
+                symbol=t.symbol,
+                side=t.side.name,
+                shares=t.shares,
+                price=t.price,
+                date=t.date.isoformat() if isinstance(t.date, datetime) else t.date,
+                commission=getattr(t, 'commission', 0.0),
+                stamp_tax=getattr(t, 'stamp_tax', 0.0),
+                slippage=getattr(t, 'slippage', 0.0),
+            )
+            for t in self.state.trade_history
+        ]
+        state.daily_records = self.daily_records
+        
+        # 保存（同时生成.json和.pkl）
+        manager.save(state, Path(path).stem)
+        logger.info(f"Checkpoint saved: {path}")
 
     def _load_checkpoint(self, path: str) -> bool:
-        """加载检查点（恢复完整状态，避免丢失历史记录）"""
+        """加载检查点（使用统一的CheckpointManager，确保save/load路径一致）"""
         try:
-            import json
-            from scripts.data_classes import Order, OrderStatus, OrderSide
-            with open(path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-
-            # 反序列化 pending_orders（dict → Order 对象）
-            # _dataclass_to_dict 将 OrderSide 序列化为 "BUY"/"SELL"，datetime 序列化为 ISO 字符串
-            restored_orders = []
-            for od in data.get('pending_orders', []):
-                try:
-                    side_name = od.get('side', 'BUY')
-                    # 支持 "BUY"/"SELL" 格式（新版）和 "OrderSide.BUY" 格式（旧版兼容）
-                    if isinstance(side_name, str) and side_name.startswith('OrderSide.'):
-                        side_name = side_name.split('.')[1]
-                    restored_orders.append(Order(
-                        symbol=od.get('symbol', ''),
-                        side=OrderSide[side_name],
-                        target_shares=int(od.get('target_shares', 0)),
-                        signal_date=datetime.fromisoformat(od['signal_date']) if od.get('signal_date') else None,
-                        execution_date=datetime.fromisoformat(od['execution_date']) if od.get('execution_date') else None,
-                    ))
-                except (KeyError, TypeError, ValueError) as e:
-                    logger.debug(f"Failed to restore order: {od}, error: {e}")
-                    pass  # 兼容旧格式，解析失败则跳过
-
-            # 恢复 BacktestState（注意字段名：daily_values → daily_records）
+            from scripts.data_classes import Order, OrderSide
+            
+            manager = CheckpointManager(Path(path).parent)
+            state = manager.load(path)
+            
+            if state is None:
+                logger.error(f"Failed to load checkpoint from {path}")
+                return False
+            
+            # 恢复 execution engine 状态
+            restore_engine_from_state(self.execution, state)
+            
+            # 恢复 BacktestState
             self.state = BacktestState(
-                current_date=datetime.fromisoformat(data['current_date']),
-                cash=CashAccount(**data['cash']),
-                positions={sym: Position(sym, **pos) for sym, pos in data['positions'].items()},
-                pending_orders=restored_orders,  # 修复：恢复挂单，不能硬编码 []
-                trade_history=data.get('trade_history', []),
-                daily_values=data.get('daily_records', []),  # BacktestState.daily_values（只读）
+                current_date=datetime.fromisoformat(state.current_date),
+                cash=self.execution.cash,  # 使用恢复后的cash
+                positions=self.execution.positions,  # 使用恢复后的positions
+                pending_orders=[
+                    o.to_order() for o in state.pending_orders
+                ],
+                trade_history=[],  # Trade历史从state.trade_history恢复（如果需要）
+                daily_values=state.daily_records,
             )
-            # 恢复 daily_records（外部列表，与 BacktestState 同步）
-            self.daily_records = data.get('daily_records', [])
-            # 恢复 execution engine 的 pending_settlements
-            exec_data = data.get('execution', {})
-            if exec_data and hasattr(self.execution.cash, 'pending_settlements'):
-                self.execution.cash.pending_settlements = [
-                    (datetime.fromisoformat(ps['settle_date']), ps['amount'])
-                    for ps in exec_data.get('pending_settlements', [])
-                ]
-                self.execution.cash.pending_withdrawals = [
-                    (datetime.fromisoformat(pw['withdrawable_date']), pw['amount'])
-                    for pw in exec_data.get('pending_withdrawals', [])
-                ]
-            logger.info(f"Checkpoint restored: date={data['current_date']}, "
-                       f"trades={len(self.state.trade_history)}, "
-                       f"pending_orders={len(restored_orders)}, "
-                       f"records={len(self.daily_records)}")
+            self.daily_records = state.daily_records
+            
+            logger.info(f"Checkpoint restored: date={state.current_date}, "
+                       f"trades={len(state.trade_history)}, "
+                       f"pending_orders={len(state.pending_orders)}, "
+                       f"records={len(state.daily_records)}")
             return True
         except Exception as e:
             logger.error(f"Failed to load checkpoint: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
             return False

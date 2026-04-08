@@ -16,7 +16,8 @@ import pandas as pd
 from loguru import logger
 
 # 复用统一交易所映射函数
-from scripts.data_engine import build_ts_code
+from scripts.exchange_mapping import build_ts_code, build_bs_code
+from scripts.field_specs import standardize_df, FieldNames
 
 
 @dataclass
@@ -106,7 +107,8 @@ class AkShareSource(DataSource):
         return build_ts_code(symbol)
     
     def _standardize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
-        """标准化列名"""
+        """标准化列名（使用统一的field_specs模块）"""
+        # 先进行中文列名映射
         column_map = {
             "日期": "date",
             "开盘": "open",
@@ -117,7 +119,9 @@ class AkShareSource(DataSource):
             "成交额": "amount",
         }
         df = df.rename(columns=column_map)
-        df["date"] = pd.to_datetime(df["date"])
+        
+        # 使用field_specs进行标准化（统一字段名、类型、默认值）
+        df = standardize_df(df)
         return df
 
 
@@ -187,29 +191,15 @@ class BaostockSource(DataSource):
             return FetchResult(False, error=str(e), source=self.name)
     
     def _to_bs_code(self, symbol: str) -> str:
-        """转换为Baostock代码格式（支持沪深北三交易所）"""
-        sym6 = str(symbol).zfill(6)
-        first_char = next((c for c in sym6 if c != '0'), '0')
-        
-        if sym6.startswith("688"):
-            return f"sh.{sym6}"
-        elif first_char == '9':
-            return f"sh.{sym6}"
-        elif first_char in ('4', '8'):
-            return f"bj.{sym6}"
-        elif first_char in ('6', '5'):
-            return f"sh.{sym6}"
-        else:
-            return f"sz.{sym6}"
+        """转换为Baostock代码格式（使用统一映射，支持沪深北三交易所）"""
+        # 统一使用exchange_mapping模块，确保所有入口一致
+        return build_bs_code(symbol)
     
     def _standardize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
-        """标准化列名"""
+        """标准化列名（使用统一的field_specs模块）"""
         df.columns = [c.lower() for c in df.columns]
-        df["date"] = pd.to_datetime(df["date"])
-        # 转换数值列
-        for col in ["open", "high", "low", "close", "volume", "amount"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
+        # 使用field_specs进行标准化（统一字段名、类型、默认值）
+        df = standardize_df(df)
         return df
 
 
