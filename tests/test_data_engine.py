@@ -126,8 +126,8 @@ class TestBuildTsCode(unittest.TestCase):
         self.assertEqual(build_ts_code("000001"), "000001.SZ")
         self.assertEqual(build_ts_code("002001"), "002001.SZ")
         self.assertEqual(build_ts_code("300001"), "300001.SZ")
-        self.assertEqual(build_ts_code("830001"), "830001.SZ")
-        self.assertEqual(build_ts_code("430001"), "430001.SZ")
+        self.assertEqual(build_ts_code("830001"), "830001.BJ")  # 新三板→北交所
+        self.assertEqual(build_ts_code("430001"), "430001.BJ")  # 新三板→北交所
 
     def test_padding(self):
         """不足6位自动补零"""
