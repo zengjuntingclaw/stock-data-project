@@ -291,7 +291,7 @@ class ProductionBacktestEngine:
             # 标准化列名
             # 注意：daily_quotes DDL 中字段名为 pre_close，而非 prev_close
             result = batch_df[["symbol", "open", "high", "low", "close", "volume", "pre_close"]].copy()
-            result["is_suspended"] = batch_df.get("is_suspend", False)
+            result["is_suspend"] = batch_df.get("is_suspend", False)
             return result
             
         except Exception as e:
@@ -412,7 +412,8 @@ class ProductionBacktestEngine:
         # 序列化 daily_values（daily_records 同步保存）
         state_data['daily_records'] = self.daily_records
         # 同步 execution engine 的内部状态（pending_settlements 等）
-        pending_settles = getattr(self.execution, 'pending_settlements', [])
+        # pending_settlements 保存在 execution.cash 中，非 execution 直接属性
+        pending_settles = getattr(self.execution.cash, 'pending_settlements', [])
         if pending_settles:
             # pending_settlements 是 List[Tuple[datetime, float]]
             state_data['execution'] = {

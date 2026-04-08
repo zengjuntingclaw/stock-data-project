@@ -900,11 +900,7 @@ class DataEngine:
             }
             df = df.rename(columns=col_map)
             df["trade_date"] = pd.to_datetime(df["trade_date"])
-            df["ts_code"] = (
-                f"{symbol.zfill(6)}.SZ"
-                if symbol.startswith(("0", "3", "2"))
-                else f"{symbol.zfill(6)}.SH"
-            )
+            df["ts_code"] = build_ts_code(symbol)
             df["pre_close"] = df["close"].shift(1)
             df["is_suspend"] = df["volume"] == 0
             

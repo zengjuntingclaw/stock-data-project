@@ -37,7 +37,7 @@ def make_market_row(
         "pre_close": pre_close,
         "volume": volume,
         "avg_volume_20": avg_volume_20,
-        "is_suspended": is_suspend,
+        "is_suspend": is_suspend,
     }
 
 

@@ -287,8 +287,8 @@ class ExecutionEngineV3:
         - 跌停：open = pre_close * (1 - limit) → 封板，成交量极小时无法卖出
         - 有量涨跌停：可以排队成交
         """
-        # 停牌
-        if r.get('is_suspended', False):
+        # 停牌（统一字段名 is_suspend）
+        if r.get('is_suspend', False):
             return True
         
         # 用前收盘价计算涨跌停板价格
