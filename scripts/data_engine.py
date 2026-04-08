@@ -209,6 +209,29 @@ class DataEngine:
             )
         """)
 
+        # 证券主表历史版本（时点版本，解决历史universe完整性问题）
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS stock_basic_history (
+                ts_code       VARCHAR,
+                snapshot_date DATE,         -- 快照日期
+                symbol        VARCHAR,
+                name          VARCHAR,
+                area          VARCHAR,
+                industry      VARCHAR,
+                market        VARCHAR,
+                list_date     DATE,
+                delist_date   DATE,
+                is_delisted   BOOLEAN DEFAULT FALSE,
+                total_mv      DOUBLE,       -- 总市值
+                circ_mv       DOUBLE,       -- 流通市值
+                PRIMARY KEY (ts_code, snapshot_date)
+            )
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_stock_hist_date 
+            ON stock_basic_history(snapshot_date)
+        """)
+
         # 指数成分股动态表（解决幸存者偏差）
         cur.execute("""
             CREATE TABLE IF NOT EXISTS index_constituents (
@@ -469,6 +492,131 @@ class DataEngine:
         df["ts_code"] = df["symbol"].apply(build_ts_code)
 
         df["market"] = df["symbol"].apply(detect_board)
+        return df
+
+    def save_stock_basic_snapshot(self, snapshot_date: Optional[str] = None) -> int:
+        """
+        保存证券主表每日快照到 stock_basic_history
+        
+        解决"证券主表时点版本"问题，支持历史时点查询。
+        
+        Parameters
+        ----------
+        snapshot_date : str, optional
+            快照日期 YYYY-MM-DD，默认今日
+            
+        Returns
+        -------
+        int: 保存的记录数
+        """
+        if snapshot_date is None:
+            snapshot_date = self._get_now().strftime("%Y-%m-%d")
+        
+        # 获取当前股票列表
+        df = self.get_all_stocks(include_delisted=True)
+        if df.empty:
+            logger.warning(f"No stocks to snapshot for {snapshot_date}")
+            return 0
+        
+        # 准备历史表字段
+        df["snapshot_date"] = pd.to_datetime(snapshot_date)
+        
+        # 确保所有必需字段存在
+        required_cols = ["ts_code", "symbol", "name", "industry", "market", 
+                        "list_date", "delist_date", "is_delisted", "total_mv", "circ_mv"]
+        for col in required_cols:
+            if col not in df.columns:
+                df[col] = None
+        
+        # 选择并重命名字段
+        hist_df = df[["ts_code", "snapshot_date", "symbol", "name", 
+                     "industry", "market", "list_date", "delist_date",
+                     "is_delisted", "total_mv", "circ_mv"]].copy()
+        
+        # UPSERT: 先删除该日期的旧数据，再插入新数据
+        with self.get_connection() as conn:
+            conn.execute(
+                "DELETE FROM stock_basic_history WHERE snapshot_date = ?",
+                (snapshot_date,)
+            )
+            conn.register("tmp_snapshot", hist_df)
+            conn.execute("""
+                INSERT INTO stock_basic_history 
+                SELECT * FROM tmp_snapshot
+            """)
+            conn.execute("DROP VIEW tmp_snapshot")
+        
+        logger.info(f"Saved stock basic snapshot for {snapshot_date}: {len(hist_df)} records")
+        return len(hist_df)
+
+    def get_stocks_as_of(self, as_of_date: str) -> pd.DataFrame:
+        """
+        获取指定日期的证券主表（时点版本）
+        
+        解决结构性风险：回测时使用历史真实的股票池，
+        而非"当前快照+退市补丁"的近似方案。
+        
+        Parameters
+        ----------
+        as_of_date : str
+            查询日期 YYYY-MM-DD
+            
+        Returns
+        -------
+        pd.DataFrame: 该日期的证券主表快照
+            - 包含当日所有可交易股票
+            - 包含已退市但当日仍有效的股票
+            - 不包含当日尚未上市的股票
+        """
+        # 先尝试从历史表查询
+        with self.get_connection() as conn:
+            hist_df = conn.execute("""
+                SELECT * FROM stock_basic_history 
+                WHERE snapshot_date = ?
+            """, (as_of_date,)).fetchdf()
+        
+        if not hist_df.empty:
+            logger.info(f"Using historical snapshot for {as_of_date}: {len(hist_df)} stocks")
+            return hist_df
+        
+        # 无历史数据，回退到当前表+日期过滤
+        logger.warning(f"No historical snapshot for {as_of_date}, using current data with date filter")
+        
+        with self.get_connection() as conn:
+            df = conn.execute("""
+                SELECT * FROM stock_basic
+                WHERE (list_date IS NULL OR list_date <= ?)
+                  AND (delist_date IS NULL OR delist_date >= ?)
+            """, (as_of_date, as_of_date)).fetchdf()
+        
+        return df
+
+    def get_all_stocks_historical(self, 
+                                   start_date: str, 
+                                   end_date: str) -> pd.DataFrame:
+        """
+        获取日期范围内的证券主表历史序列
+        
+        用于分析股票池变化、IPO/退市时间线等。
+        
+        Parameters
+        ----------
+        start_date : str
+            开始日期 YYYY-MM-DD
+        end_date : str
+            结束日期 YYYY-MM-DD
+            
+        Returns
+        -------
+        pd.DataFrame: 包含所有日期快照的合并数据
+        """
+        with self.get_connection() as conn:
+            df = conn.execute("""
+                SELECT * FROM stock_basic_history 
+                WHERE snapshot_date BETWEEN ? AND ?
+                ORDER BY snapshot_date, ts_code
+            """, (start_date, end_date)).fetchdf()
+        
         return df
 
     # ──────────────────────────────────────────────────────────
