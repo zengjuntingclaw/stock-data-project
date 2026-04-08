@@ -20,6 +20,9 @@ import numpy as np
 import threading
 from loguru import logger
 
+# 复用 data_engine.py 中的统一交易所映射函数（避免代码重复）
+from scripts.data_engine import build_ts_code
+
 # Baostock 全局会话锁（Baostock 不支持并发，全局单会话）
 _BS_LOCK = threading.Lock()
 
@@ -226,9 +229,10 @@ class SurvivorshipBiasHandler:
                         
                         while rs.next() and rs.error_code == '0':
                             row = rs.get_row_data()
-                            bs_code = row[0]  # sh.600000
-                            symbol = bs_code.split('.')[1]  # 600000
-                            ts_code = f"{symbol}.SH" if bs_code.startswith('sh') else f"{symbol}.SZ"
+                            bs_code = row[0]  # sh.600000 / sz.000001 / bj.430001
+                            symbol = bs_code.split('.')[1]  # 600000 / 000001 / 430001
+                            # 统一使用 build_ts_code：自动识别沪深北三交易所
+                            ts_code = build_ts_code(symbol)
                             
                             if symbol not in self._stocks:
                                 # 查询股票基本信息

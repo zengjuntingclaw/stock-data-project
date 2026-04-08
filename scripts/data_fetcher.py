@@ -15,6 +15,9 @@ from typing import Optional, List, Dict, Callable, Type
 import pandas as pd
 from loguru import logger
 
+# 复用统一交易所映射函数
+from scripts.data_engine import build_ts_code
+
 
 @dataclass
 class FetchResult:
@@ -99,11 +102,8 @@ class AkShareSource(DataSource):
             return FetchResult(False, error=str(e), source=self.name)
     
     def _to_ts_code(self, symbol: str) -> str:
-        """转换为ts_code格式"""
-        if symbol.startswith(("6", "5", "9")):
-            return f"{symbol}.SH"
-        else:
-            return f"{symbol}.SZ"
+        """转换为ts_code格式（复用统一映射，支持沪深北三交易所）"""
+        return build_ts_code(symbol)
     
     def _standardize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
         """标准化列名"""
@@ -187,11 +187,20 @@ class BaostockSource(DataSource):
             return FetchResult(False, error=str(e), source=self.name)
     
     def _to_bs_code(self, symbol: str) -> str:
-        """转换为Baostock代码格式"""
-        if symbol.startswith(("6", "5", "9")):
-            return f"sh.{symbol}"
+        """转换为Baostock代码格式（支持沪深北三交易所）"""
+        sym6 = str(symbol).zfill(6)
+        first_char = next((c for c in sym6 if c != '0'), '0')
+        
+        if sym6.startswith("688"):
+            return f"sh.{sym6}"
+        elif first_char == '9':
+            return f"sh.{sym6}"
+        elif first_char in ('4', '8'):
+            return f"bj.{sym6}"
+        elif first_char in ('6', '5'):
+            return f"sh.{sym6}"
         else:
-            return f"sz.{symbol}"
+            return f"sz.{sym6}"
     
     def _standardize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
         """标准化列名"""

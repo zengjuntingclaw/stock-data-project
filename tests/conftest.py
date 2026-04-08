@@ -1,18 +1,19 @@
-"""测试配置和 fixtures
+"""
+conftest.py - pytest/unittest 路径配置
 
-为所有测试模块提供共享配置和工具函数
+确保项目 scripts/ 目录优先级高于全局 scripts/ 目录
+（防止 C:\Users\zengj\.qclaw\workspace\scripts 干扰导入）
 """
 import sys
-from pathlib import Path
 import os
 
-# 添加项目路径
-project_root = Path(__file__).parent.parent
-sys.path.insert(0, str(project_root))
+_project_root = os.path.join(os.path.dirname(__file__), '..')
+_scripts_path = os.path.join(_project_root, 'scripts')
 
-# 测试数据目录
-TEST_DATA_DIR = Path(__file__).parent / "test_data"
-TEST_DATA_DIR.mkdir(exist_ok=True)
+# 将项目 scripts 目录插入 sys.path 最前
+if _scripts_path not in sys.path:
+    sys.path.insert(0, _scripts_path)
 
-# 禁用日志输出（测试时太吵）
-os.environ["LOGURU_LEVEL"] = "WARNING"
+# 同时确保项目根目录在路径中
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)

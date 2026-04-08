@@ -403,13 +403,40 @@ class ProductionBacktestEngine:
         
         return report
     
+    def _dataclass_to_dict(self, obj):
+        """递归序列化 dataclass（含 Enum/datetime 正确处理）"""
+        from dataclasses import is_dataclass
+        from enum import Enum
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        elif isinstance(obj, Enum):
+            return obj.name  # "BUY"/"SELL"/"PENDING" 等
+        elif isinstance(obj, float):
+            return obj
+        elif isinstance(obj, int):
+            return obj
+        elif isinstance(obj, str):
+            return obj
+        elif isinstance(obj, (list, tuple)):
+            return [self._dataclass_to_dict(x) for x in obj]
+        elif isinstance(obj, dict):
+            return {k: self._dataclass_to_dict(v) for k, v in obj.items()}
+        elif is_dataclass(obj):
+            result = {}
+            for field_name in obj.__dataclass_fields__:
+                val = getattr(obj, field_name)
+                result[field_name] = self._dataclass_to_dict(val)
+            return result
+        return str(obj)  # fallback
+
     def _save_checkpoint(self, path: str):
         """保存检查点（含完整状态，支持断点续传）"""
         import json
         state_data = self.state.to_dict()
-        # 序列化 trade_history（每条交易记录为 dict）
-        state_data['trade_history'] = self.state.trade_history
-        # 序列化 daily_values（daily_records 同步保存）
+        # 使用递归序列化：Enum→name, datetime→isoformat, dataclass→嵌套dict
+        state_data['trade_history'] = self._dataclass_to_dict(self.state.trade_history)
+        state_data['pending_orders'] = self._dataclass_to_dict(self.state.pending_orders)
+        # 序列化 daily_records（已是 dict 或原生类型）
         state_data['daily_records'] = self.daily_records
         # 同步 execution engine 的内部状态（pending_settlements 等）
         # pending_settlements 保存在 execution.cash 中，非 execution 直接属性
@@ -436,18 +463,40 @@ class ProductionBacktestEngine:
         """加载检查点（恢复完整状态，避免丢失历史记录）"""
         try:
             import json
+            from scripts.data_classes import Order, OrderStatus, OrderSide
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            # 恢复状态
+
+            # 反序列化 pending_orders（dict → Order 对象）
+            # _dataclass_to_dict 将 OrderSide 序列化为 "BUY"/"SELL"，datetime 序列化为 ISO 字符串
+            restored_orders = []
+            for od in data.get('pending_orders', []):
+                try:
+                    side_name = od.get('side', 'BUY')
+                    # 支持 "BUY"/"SELL" 格式（新版）和 "OrderSide.BUY" 格式（旧版兼容）
+                    if isinstance(side_name, str) and side_name.startswith('OrderSide.'):
+                        side_name = side_name.split('.')[1]
+                    restored_orders.append(Order(
+                        symbol=od.get('symbol', ''),
+                        side=OrderSide[side_name],
+                        target_shares=int(od.get('target_shares', 0)),
+                        signal_date=datetime.fromisoformat(od['signal_date']) if od.get('signal_date') else None,
+                        execution_date=datetime.fromisoformat(od['execution_date']) if od.get('execution_date') else None,
+                    ))
+                except (KeyError, TypeError, ValueError) as e:
+                    logger.debug(f"Failed to restore order: {od}, error: {e}")
+                    pass  # 兼容旧格式，解析失败则跳过
+
+            # 恢复 BacktestState（注意字段名：daily_values → daily_records）
             self.state = BacktestState(
                 current_date=datetime.fromisoformat(data['current_date']),
                 cash=CashAccount(**data['cash']),
                 positions={sym: Position(sym, **pos) for sym, pos in data['positions'].items()},
-                pending_orders=[],
+                pending_orders=restored_orders,  # 修复：恢复挂单，不能硬编码 []
                 trade_history=data.get('trade_history', []),
-                daily_values=data.get('daily_records', []),
+                daily_values=data.get('daily_records', []),  # BacktestState.daily_values（只读）
             )
-            # 恢复 daily_records（外部列表与 BacktestState 同步）
+            # 恢复 daily_records（外部列表，与 BacktestState 同步）
             self.daily_records = data.get('daily_records', [])
             # 恢复 execution engine 的 pending_settlements
             exec_data = data.get('execution', {})
@@ -462,6 +511,7 @@ class ProductionBacktestEngine:
                 ]
             logger.info(f"Checkpoint restored: date={data['current_date']}, "
                        f"trades={len(self.state.trade_history)}, "
+                       f"pending_orders={len(restored_orders)}, "
                        f"records={len(self.daily_records)}")
             return True
         except Exception as e:

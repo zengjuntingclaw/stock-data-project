@@ -3,6 +3,12 @@
 使用 unittest 标准库，无需额外依赖
 """
 import unittest
+import sys
+import os
+
+# 添加项目路径（支持独立运行）
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
 from datetime import datetime
 import pandas as pd
 import numpy as np

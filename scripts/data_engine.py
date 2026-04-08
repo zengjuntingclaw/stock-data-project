@@ -117,12 +117,23 @@ def build_ts_code(symbol: str) -> str:
       - .BJ：北京证券交易所（北交所，2021年开市，代码 4/8 开头）
     """
     sym6 = str(symbol).zfill(6)
-    if sym6.startswith(("6", "5", "9", "688")):
+    # 取首位非 '0' 数字（识别原始前缀，避免 "600000".lstrip('0') → "" 丢失前缀）
+    first_char = next((c for c in sym6 if c != '0'), '0')
+    
+    # 条件顺序：688特殊处理 > 9沪市 > 4/8北交所 > 6/5沪市 > 其余深市
+    if sym6.startswith("688"):
         return f"{sym6}.SH"
-    elif sym6.startswith(("4", "8")):
+    elif first_char == '9':
+        # 9字头是沪市专属（注意：920xxx 不是北交所，北交所最大为 899xxx）
+        return f"{sym6}.SH"
+    elif first_char in ('4', '8'):
         # 北交所股票（4开头老股退市整理期，8开头新股）
         return f"{sym6}.BJ"
+    elif first_char in ('6', '5'):
+        # 6/5字头是沪市主板
+        return f"{sym6}.SH"
     else:
+        # 0/1/2/3字头是深市（主板/创业板）
         return f"{sym6}.SZ"
 
 
@@ -568,12 +579,17 @@ class DataEngine:
             - 包含已退市但当日仍有效的股票
             - 不包含当日尚未上市的股票
         """
-        # 先尝试从历史表查询
+        as_of = pd.to_datetime(as_of_date)
+        
+        # 先尝试从历史表查询（历史快照已预过滤，只保留当日有效的股票）
         with self.get_connection() as conn:
             hist_df = conn.execute("""
                 SELECT * FROM stock_basic_history 
                 WHERE snapshot_date = ?
-            """, (as_of_date,)).fetchdf()
+                -- 边界过滤：当日必须已上市且尚未退市
+                AND (list_date IS NULL OR list_date <= ?)
+                AND (delist_date IS NULL OR delist_date >= ?)
+            """, (as_of_date, as_of_date, as_of_date)).fetchdf()
         
         if not hist_df.empty:
             logger.info(f"Using historical snapshot for {as_of_date}: {len(hist_df)} stocks")
@@ -1308,8 +1324,11 @@ class DataEngine:
 
             # 标准化 baostock 代码
             sym6 = str(symbol).zfill(6)
-            if sym6.startswith("6") or sym6.startswith("5"):
+            # 使用统一的 Baostock 前缀映射（支持沪深北三交易所）
+            if sym6.startswith(("6", "5", "9", "688")):
                 bs_code = f"sh.{sym6}"
+            elif sym6.startswith(("4", "8")):
+                bs_code = f"bj.{sym6}"
             else:
                 bs_code = f"sz.{sym6}"
 
