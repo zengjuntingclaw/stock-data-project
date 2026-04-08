@@ -27,6 +27,11 @@ from scripts.performance import EnhancedPerformanceAnalyzer, BrinsonAttribution
 # 数据引擎（v1兼容）
 from scripts.data_engine import DataEngine, detect_board, detect_limit, build_ts_code
 
+# 数据引擎（v2重构版）
+from scripts.data_store import DataStore, ConnectionPool
+from scripts.data_fetcher import DataFetcher, DataSource, AkShareSource, BaostockSource
+from scripts.data_engine_v2 import DataEngineV2
+
 # 数据验证器
 from scripts.data_validator import DataValidator
 
@@ -47,8 +52,12 @@ __all__ = [
     "ProductionBacktestEngine", "BacktestConfig",
     # 绩效分析
     "EnhancedPerformanceAnalyzer", "BrinsonAttribution",
-    # 数据引擎
+    # 数据引擎（v1兼容）
     "DataEngine", "detect_board", "detect_limit", "build_ts_code",
+    # 数据引擎（v2重构版）
+    "DataStore", "ConnectionPool",
+    "DataFetcher", "DataSource", "AkShareSource", "BaostockSource",
+    "DataEngineV2",
     # 数据验证器
     "DataValidator",
 ]
