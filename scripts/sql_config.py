@@ -10,8 +10,8 @@ from typing import Dict
 # ─────────────────────────────────────────────────────────────
 
 SCHEMA_SQL: Dict[str, str] = {
-    "stock_list": """
-        CREATE TABLE IF NOT EXISTS stock_list (
+    "stock_basic": """
+        CREATE TABLE IF NOT EXISTS stock_basic (
             symbol TEXT PRIMARY KEY,
             ts_code TEXT NOT NULL,
             name TEXT,
@@ -112,23 +112,23 @@ SCHEMA_SQL: Dict[str, str] = {
 QUERY_SQL: Dict[str, str] = {
     # 股票基础信息
     "get_stock_basic": """
-        SELECT * FROM stock_list 
+        SELECT * FROM stock_basic 
         WHERE symbol = ?
     """,
     
     "get_stock_by_ts_code": """
-        SELECT * FROM stock_list 
+        SELECT * FROM stock_basic 
         WHERE ts_code = ?
     """,
     
     "get_all_stocks": """
-        SELECT * FROM stock_list 
+        SELECT * FROM stock_basic 
         WHERE is_delisted = FALSE
         ORDER BY symbol
     """,
     
     "get_delisted_stocks": """
-        SELECT * FROM stock_list 
+        SELECT * FROM stock_basic 
         WHERE is_delisted = TRUE
     """,
     
@@ -198,11 +198,11 @@ QUERY_SQL: Dict[str, str] = {
     """,
     
     "count_stocks": """
-        SELECT COUNT(*) as cnt FROM stock_list
+        SELECT COUNT(*) as cnt FROM stock_basic
     """,
     
     "count_delisted": """
-        SELECT COUNT(*) as cnt FROM stock_list 
+        SELECT COUNT(*) as cnt FROM stock_basic 
         WHERE is_delisted = TRUE
     """,
 }
@@ -214,13 +214,13 @@ QUERY_SQL: Dict[str, str] = {
 DML_SQL: Dict[str, str] = {
     # 股票列表
     "upsert_stock": """
-        INSERT OR REPLACE INTO stock_list 
+        INSERT OR REPLACE INTO stock_basic 
         (symbol, ts_code, name, industry, list_date, delist_date, is_delisted, board_type)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """,
     
     "delete_stock": """
-        DELETE FROM stock_list WHERE symbol = ?
+        DELETE FROM stock_basic WHERE symbol = ?
     """,
     
     # 日线数据

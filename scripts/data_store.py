@@ -74,7 +74,7 @@ class DataStore:
         """初始化数据库Schema（使用SQL配置中心）"""
         with self.pool.get_connection() as conn:
             # 使用SQL配置中心创建核心表
-            for table_name in ["stock_list", "daily_quotes", "financial_data", "trade_calendar"]:
+            for table_name in ["stock_basic", "daily_quotes", "financial_data", "trade_calendar"]:
                 sql = get_sql("schema", table_name)
                 conn.execute(sql)
             
