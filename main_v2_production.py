@@ -1,4 +1,4 @@
-"""A股多因子回测框架 v2.0 主程序"""
+"""A股多因子回测框架 v3.0 主程序"""
 import sys
 from pathlib import Path
 from datetime import datetime
@@ -13,7 +13,7 @@ from loguru import logger
 
 logger.remove()
 logger.add(sys.stdout, format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | {message}", level="INFO")
-logger.add(project_root / "logs" / "v2_{time}.log", rotation="10 MB", retention="7 days", level="DEBUG")
+logger.add(project_root / "logs" / "v3_{time}.log", rotation="10 MB", retention="7 days", level="DEBUG")
 
 from scripts.data_classes import TradingCostConfig
 from scripts.execution_engine_v3 import ExecutionEngineV3, CashAccount, Position
@@ -27,7 +27,7 @@ def setup():
     (project_root / "logs").mkdir(exist_ok=True)
     (project_root / "data" / "v2").mkdir(parents=True, exist_ok=True)
     (project_root / "_output").mkdir(parents=True, exist_ok=True)
-    logger.info("="*50 + "\nv2.0 启动\n" + "="*50)
+    logger.info("="*50 + "\nv3.0 启动\n" + "="*50)
 
 
 def run_backtest(start="2022-01-01", end="2024-12-31", capital=1e7):

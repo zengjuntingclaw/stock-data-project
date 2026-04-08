@@ -11,12 +11,14 @@ DataEngine - 生产级数据治理与存储引擎
 """
 
 import os
+import bisect
 import pandas as pd
 import numpy as np
 from pathlib import Path
 from typing import Optional, List, Dict, Union, Literal, Tuple
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 import time
 import warnings
 import random
@@ -104,10 +106,19 @@ def detect_limit(code: str) -> float:
 
 
 def build_ts_code(symbol: str) -> str:
-    """构造 ts_code（上海/深圳）（统一实现）"""
+    """构造 ts_code（支持沪深北三交易所）
+
+    交易所后缀规则（Tushare 标准）：
+      - .SH：上海证券交易所（主板 + 科创板，代码 6/5/9/688 开头）
+      - .SZ：深圳证券交易所（主板 + 创业板，代码 0/1/2/3 开头）
+      - .BJ：北京证券交易所（北交所，2021年开市，代码 4/8 开头）
+    """
     sym6 = str(symbol).zfill(6)
     if sym6.startswith(("6", "5", "9", "688")):
         return f"{sym6}.SH"
+    elif sym6.startswith(("4", "8")):
+        # 北交所股票（4开头老股退市整理期，8开头新股）
+        return f"{sym6}.BJ"
     else:
         return f"{sym6}.SZ"
 
@@ -152,6 +163,9 @@ class DataEngine:
             self._init_schema()
         else:
             logger.error("DuckDB required but not installed.")
+
+        # Baostock 全局会话锁（Baostock 不支持并发，全局单会话）
+        self._bs_lock = threading.Lock()
 
     # ──────────────────────────────────────────────────────────
     # 数据库初始化
@@ -653,22 +667,23 @@ class DataEngine:
         bs_code = (f"sh.{sym6}" if sym6.startswith("6") or sym6.startswith("5")
                    else f"sz.{sym6}")
 
-        # 年报（4个财年）
+        # 年报（4个财年）- Baostock 线程安全
         try:
-            bs.login()
-            try:
-                for year in range(start_year, end_year + 1):
-                    rs = bs.query_profit_statements_per_year(
-                        bs_code=bs_code, year=str(year)
-                    )
-                    if rs and rs.error_code == "0":
-                        while rs.next():
-                            row = dict(zip(rs.fields, rs.get_row_data()))
-                            if row.get("profit_statements_pub_date"):
-                                records.append(self._bs_profit_row(row, symbol))
-                    time.sleep(0.1)
-            finally:
-                bs.logout()
+            with self._bs_lock:
+                bs.login()
+                try:
+                    for year in range(start_year, end_year + 1):
+                        rs = bs.query_profit_statements_per_year(
+                            bs_code=bs_code, year=str(year)
+                        )
+                        if rs and rs.error_code == "0":
+                            while rs.next():
+                                row = dict(zip(rs.fields, rs.get_row_data()))
+                                if row.get("profit_statements_pub_date"):
+                                    records.append(self._bs_profit_row(row, symbol))
+                        time.sleep(0.1)
+                finally:
+                    bs.logout()
         except Exception as e:
             logger.debug(f"Baostock financial fetch failed for {symbol}: {e}")
 
@@ -692,7 +707,7 @@ class DataEngine:
         ann = row.get("profit_statements_pub_date", "")
         end = row.get("profit_statements_report_date", "")
         return {
-            "ts_code": f"{sym6}.SH" if sym6.startswith(("6", "5", "9", "688")) else f"{sym6}.SZ",
+            "ts_code": build_ts_code(sym6),
             "ann_date": pd.to_datetime(ann, errors="coerce") if ann else pd.NaT,
             "end_date": pd.to_datetime(end, errors="coerce") if end else pd.NaT,
             "report_type": "年报",
@@ -711,7 +726,7 @@ class DataEngine:
         """AkShare 指标行标准化"""
         sym6 = str(symbol).zfill(6)
         return {
-            "ts_code": f"{sym6}.SH" if sym6.startswith(("6", "5", "9", "688")) else f"{sym6}.SZ",
+            "ts_code": build_ts_code(sym6),
             "ann_date": pd.Timestamp.today(),
             "end_date": pd.NaT,
             "report_type": "指标",
@@ -748,7 +763,7 @@ class DataEngine:
                 """)
             except Exception as e:
                 logger.warning(f"Financial data UPSERT failed, trying fallback: {e}")
-                # 字段不全时用原始列（列名来自 DataFrame 列列表，非用户输入，安全）
+                # 字段不全时用原始列（列名来自白名单，非用户输入，DuckDB DF 绑定无需参数化）
                 cols = [c for c in df.columns if c in
                         ["ts_code", "ann_date", "end_date", "report_type",
                          "revenue", "net_profit", "roe", "roa", "eps",
@@ -774,15 +789,16 @@ class DataEngine:
 
         conn = duckdb.connect(str(self.db_path))
 
-        # Baostock 补充 list_date / delist_date
+        # Baostock 补充 list_date / delist_date（线程安全）
         if HAS_BAOSTOCK:
             logger.info("Enriching list/delist dates from Baostock...")
             try:
-                bs.login()
-                try:
-                    bs_stocks = bs.query_all_stock(day=datetime.now().strftime("%Y-%m-%d"))
-                finally:
-                    bs.logout()
+                with self._bs_lock:
+                    bs.login()
+                    try:
+                        bs_stocks = bs.query_all_stock(day=datetime.now().strftime("%Y-%m-%d"))
+                    finally:
+                        bs.logout()
                 if bs_stocks is not None and not bs_stocks.empty:
                     date_map = dict(zip(
                         bs_stocks["code"].str.replace("sh.", "6", regex=False).str.replace("sz.", "", regex=False),
@@ -1010,27 +1026,45 @@ class DataEngine:
         """
         带指数退避重试的抓取（AkShare → Baostock → 失败）
         
+        改进：HTTP 429 限流时使用更长等待时间；先尝试一个数据源，
+        失败后再尝试备援，避免同时触发多个数据源的限流。
+
         Returns
         -------
         (df, source): df数据, source='akshare'|'baostock'|''
         """
+        last_error: str = ""
         for attempt in range(max_retries):
-            # AkShare
+            # 优先尝试 AkShare（主数据源）
             if HAS_AKSHARE:
-                df = self._fetch_akshare(symbol, start_date, end_date, adjust)
-                if not df.empty:
-                    return df, "akshare"
+                try:
+                    df = self._fetch_akshare(symbol, start_date, end_date, adjust)
+                    if not df.empty:
+                        return df, "akshare"
+                except Exception as e:
+                    last_error = str(e)
+                    # HTTP 429 限流：使用更长等待时间
+                    if "429" in last_error or "Too Many Requests" in last_error:
+                        wait = (5 ** attempt) + random.uniform(1, 3)  # 限流时更保守
+                        logger.warning(f"AkShare rate limit hit for {symbol}, waiting {wait:.1f}s")
+                        time.sleep(wait)
+                        continue
 
-            # Baostock 备援
+            # AkShare 失败后尝试 Baostock 备援
             if HAS_BAOSTOCK:
-                df = self._fetch_baostock(symbol, start_date, end_date, adjust)
-                if not df.empty:
-                    return df, "baostock"
+                try:
+                    df = self._fetch_baostock(symbol, start_date, end_date, adjust)
+                    if not df.empty:
+                        return df, "baostock"
+                except Exception as e:
+                    last_error = str(e)
 
+            # 非限流错误或所有数据源都失败
             if attempt < max_retries - 1:
                 wait = (2 ** attempt) + random.uniform(0, 1)
                 time.sleep(wait)
 
+        logger.debug(f"All sources failed for {symbol} after {max_retries} retries: {last_error}")
         return pd.DataFrame(), ""
 
     def _fetch_akshare(self,
@@ -1062,7 +1096,7 @@ class DataEngine:
             })
             df["trade_date"] = pd.to_datetime(df["trade_date"])
             sym6 = str(symbol).zfill(6)
-            df["ts_code"] = f"{sym6}.SH" if sym6.startswith(("6", "5", "9", "688")) else f"{sym6}.SZ"
+            df["ts_code"] = build_ts_code(sym6)
             df["pre_close"] = df["close"].shift(1)
             df["is_suspend"] = df["volume"] == 0
             
@@ -1104,7 +1138,7 @@ class DataEngine:
                         start_date: str,
                         end_date: str,
                         adjust: Literal["qfq", ""] = "qfq") -> pd.DataFrame:
-        """Baostock 抓取（备援用，login/logout 在方法内部管理）"""
+        """Baostock 抓取（备援用，线程安全：使用锁保护全局会话）"""
         if not HAS_BAOSTOCK:
             return pd.DataFrame()
         try:
@@ -1118,18 +1152,20 @@ class DataEngine:
             else:
                 bs_code = f"sz.{sym6}"
 
-            try:
+            # Baostock 全局会话锁（多线程安全）
+            with self._bs_lock:
                 bs.login()
-                rs = bs.query_history_k_data_plus(
-                    bs_code,
-                    "date,open,high,low,close,volume,amount,adjustflag",
-                    start_date=start_date.replace("-", ""),
-                    end_date=end_date.replace("-", ""),
-                    frequency="d",
-                    adjustflag=adjflag
-                )
-            finally:
-                bs.logout()
+                try:
+                    rs = bs.query_history_k_data_plus(
+                        bs_code,
+                        "date,open,high,low,close,volume,amount,adjustflag",
+                        start_date=start_date.replace("-", ""),
+                        end_date=end_date.replace("-", ""),
+                        frequency="d",
+                        adjustflag=adjflag
+                    )
+                finally:
+                    bs.logout()
             if rs is None or rs.error_code != "0":
                 return pd.DataFrame()
 
@@ -1144,7 +1180,7 @@ class DataEngine:
             for col in ["open", "high", "low", "close", "volume", "amount"]:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
             df["trade_date"] = pd.to_datetime(df["trade_date"])
-            df["ts_code"] = f"{sym6}.SH" if sym6.startswith(("6", "5", "9", "688")) else f"{sym6}.SZ"
+            df["ts_code"] = build_ts_code(sym6)
             df["pre_close"] = df["close"].shift(1)
             df["pct_chg"] = df["close"].pct_change().fillna(0) * 100
             df["amount"] = df["amount"].astype(float)
@@ -1238,13 +1274,7 @@ class DataEngine:
             return stats
 
         # ── Issue #2: 批量缓存 latest_date（单条SQL替代5000+次查询）──
-        ts_codes = []
-        for sym in symbols:
-            sym6 = str(sym).zfill(6)
-            if sym6.startswith(("6", "5", "9", "688")):
-                ts_codes.append(f"{sym6}.SH")
-            else:
-                ts_codes.append(f"{sym6}.SZ")
+        ts_codes = [build_ts_code(sym) for sym in symbols]
 
         logger.info(f"Pre-caching latest dates for {len(ts_codes)} stocks...")
         latest_cache = self._batch_get_latest_dates(ts_codes)
@@ -1276,9 +1306,7 @@ class DataEngine:
         def _download_one(sym: str) -> Tuple[str, pd.DataFrame, str, str]:
             """单线程下载器（内部自带限速）"""
             try:
-                symbol_clean = str(sym).zfill(6)
-                ts_code = (f"{symbol_clean}.SH" if symbol_clean.startswith(("6", "5", "9", "688"))
-                           else f"{symbol_clean}.SZ")
+                ts_code = build_ts_code(sym)
                 # 使用缓存而非实时查询
                 sym_latest = latest_cache.get(ts_code, "")
                 if sym_latest and sym_latest >= start_date:
@@ -1421,59 +1449,61 @@ class DataEngine:
         if not HAS_BAOSTOCK:
             return
 
-        try:
+        # Baostock 线程安全
+        with self._bs_lock:
             bs.login()
-            for sym in symbols[:20]:  # 抽样20只
-                sym6 = str(sym).zfill(6)
-                bs_code = f"sh.{sym6}" if sym6.startswith("6") else f"sz.{sym6}"
+            try:
+                for sym in symbols[:20]:  # 抽样20只
+                    sym6 = str(sym).zfill(6)
+                    bs_code = f"sh.{sym6}" if sym6.startswith("6") else f"sz.{sym6}"
 
-                # AkShare 数据（参数化查询防止SQL注入）
-                ak_data = self.query("""
-                    SELECT pct_chg FROM daily_quotes
-                    WHERE ts_code LIKE ?
-                    AND trade_date = ?
-                    LIMIT 1
-                """, (f"{sym6}%", trade_date))
-                if ak_data.empty:
-                    continue
-
-                # Baostock 数据
-                try:
-                    rs = bs.query_history_k_data_plus(
-                        bs_code, "date,pctChg",
-                        start_date=trade_date.replace("-", ""),
-                        end_date=trade_date.replace("-", ""),
-                        frequency="d"
-                    )
-                    if rs is None or rs.error_code != "0":
+                    # AkShare 数据（参数化查询防止SQL注入）
+                    ak_data = self.query("""
+                        SELECT pct_chg FROM daily_quotes
+                        WHERE ts_code LIKE ?
+                        AND trade_date = ?
+                        LIMIT 1
+                    """, (f"{sym6}%", trade_date))
+                    if ak_data.empty:
                         continue
 
-                    bs_pct = None
-                    while rs.next():
-                        row = rs.get_row_data()
-                        if row[1]:
-                            bs_pct = float(row[1])
-                            break
+                    # Baostock 数据
+                    try:
+                        rs = bs.query_history_k_data_plus(
+                            bs_code, "date,pctChg",
+                            start_date=trade_date.replace("-", ""),
+                            end_date=trade_date.replace("-", ""),
+                            frequency="d"
+                        )
+                        if rs is None or rs.error_code != "0":
+                            continue
 
-                    if bs_pct is None:
-                        continue
+                        bs_pct = None
+                        while rs.next():
+                            row = rs.get_row_data()
+                            if row[1]:
+                                bs_pct = float(row[1])
+                                break
 
-                    ak_pct = ak_data["pct_chg"].iloc[0]
-                    diff = abs(ak_pct - bs_pct)
+                        if bs_pct is None:
+                            continue
 
-                    if diff > 0.5:  # 偏差超过 0.5%
-                        stats["cross_validate_errors"] += 1
-                        with self.get_connection() as conn:
-                            conn.execute("""
-                                INSERT INTO data_quality_alert
-                                (alert_type, ts_code, trade_date, detail)
-                                VALUES (?, ?, ?, ?)
-                            """, ('cross_validate', sym6, trade_date,
-                                  f'AkShare={ak_pct:.2f}% vs Baostock={bs_pct:.2f}%, diff={diff:.2f}%'))
-                except Exception as e:
-                    logger.debug(f"Cross-validate error for {sym6}: {e}")
-        finally:
-            bs.logout()
+                        ak_pct = ak_data["pct_chg"].iloc[0]
+                        diff = abs(ak_pct - bs_pct)
+
+                        if diff > 0.5:  # 偏差超过 0.5%
+                            stats["cross_validate_errors"] += 1
+                            with self.get_connection() as conn:
+                                conn.execute("""
+                                    INSERT INTO data_quality_alert
+                                    (alert_type, ts_code, trade_date, detail)
+                                    VALUES (?, ?, ?, ?)
+                                """, ('cross_validate', sym6, trade_date,
+                                      f'AkShare={ak_pct:.2f}% vs Baostock={bs_pct:.2f}%, diff={diff:.2f}%'))
+                    except Exception as e:
+                        logger.debug(f"Cross-validate error for {sym6}: {e}")
+            finally:
+                bs.logout()
 
     # ──────────────────────────────────────────────────────────
     # Issue #3: 停牌日期填充 & 退市过滤
@@ -1482,20 +1512,23 @@ class DataEngine:
                             df: pd.DataFrame,
                             start_date: str,
                             end_date: str) -> pd.DataFrame:
-        """填充停牌日缺失日期（Forward Fill），解决均线断裂问题
-        
+        """
+        填充停牌日缺失日期（Forward Fill），解决均线断裂问题
+
+        性能优化：使用双指针 O(n+m) 而非 O(n*m) 过滤操作
+
         对于数据库中缺失的停牌日期（volume=0 或无数据行），
         使用前一日收盘价填充 OHLC，确保时间序列连续性。
-        
+
         Parameters
         ----------
         df : pd.DataFrame
-            已有的日线数据
+            已有的日线数据（需按 trade_date 排序）
         start_date : str
             期望的起始日期 YYYY-MM-DD
         end_date : str
             期望的结束日期 YYYY-MM-DD
-            
+
         Returns
         -------
         pd.DataFrame: 填充后的完整时间序列
@@ -1504,29 +1537,39 @@ class DataEngine:
             return df
 
         ts_code = df["ts_code"].iloc[0]
-        
+
         # 获取交易日历中的完整交易日序列
         trade_dates = self.get_trade_dates(start_date, end_date)
         if not trade_dates:
             return df
 
-        existing_dates = set(
-            pd.to_datetime(df["trade_date"]).dt.strftime("%Y-%m-%d").tolist()
-        )
-        missing_dates = [d for d in trade_dates if d not in existing_dates]
-        
+        # 转换为 datetime 列表并排序
+        trade_dates = sorted([pd.Timestamp(d) for d in trade_dates])
+        df_dates = pd.to_datetime(df["trade_date"]).tolist()
+        existing_set = set(df_dates)
+
+        # 双指针查找缺失日期（O(n+m)）
+        missing_dates = []
+        j = 0
+        for td in trade_dates:
+            if td not in existing_set:
+                missing_dates.append(td)
+
         if not missing_dates:
             return df
-        
-        # 构造缺失日期的填充行（使用前向填充）
+
+        # 预处理：提取 df 中的有效数据用于前向填充
+        # 将 df 转换为字典列表，避免重复访问 DataFrame
+        df_list = df.to_dict('records')
+        last_valid = df_list[-1] if df_list else {}
+
+        # 使用 bisect 二分查找快速定位前一个有效日期
         fill_rows = []
-        last_valid = df.iloc[-1]  # 默认使用最后一行
-        for mdate in missing_dates:
-            # 找到该缺失日期之前的最近有效数据
-            mdt = pd.Timestamp(mdate)
-            valid_before = df[pd.to_datetime(df["trade_date"]) < mdt]
-            if not valid_before.empty:
-                last_valid = valid_before.iloc[-1]
+        for mdt in missing_dates:
+            # 二分查找：找到 < mdt 的最大索引
+            idx = bisect.bisect_right(df_dates, mdt) - 1
+            if idx >= 0:
+                last_valid = df_list[idx]
             fill_rows.append({
                 "ts_code": ts_code,
                 "trade_date": mdt,
@@ -1545,13 +1588,13 @@ class DataEngine:
                 "limit_down": False,
                 "data_source": "filled",
             })
-        
+
         if fill_rows:
             fill_df = pd.DataFrame(fill_rows)
             df = pd.concat([df, fill_df], ignore_index=True)
             df = df.sort_values("trade_date").reset_index(drop=True)
             logger.debug(f"Filled {len(fill_rows)} suspend dates for {ts_code}")
-        
+
         return df
 
     def is_delisted(self, ts_code: str) -> bool:
@@ -1607,13 +1650,8 @@ class DataEngine:
             return symbols
         
         ts_codes = []
-        for sym in symbols:
-            sym6 = str(sym).zfill(6)
-            if sym6.startswith(("6", "5", "9", "688")):
-                ts_codes.append(f"{sym6}.SH")
-            else:
-                ts_codes.append(f"{sym6}.SZ")
-        
+        ts_codes = [build_ts_code(sym) for sym in symbols]
+
         codes_df = pd.DataFrame({"ts_code": ts_codes})
         sym_map = dict(zip(ts_codes, symbols))
         
@@ -1675,8 +1713,7 @@ class DataEngine:
         if "." in code:
             ts_code, symbol = code, code.split(".")[0]
         else:
-            symbol = str(code).zfill(6)
-            ts_code = f"{symbol}.SH" if symbol.startswith(("6", "5", "9")) else f"{symbol}.SZ"
+            ts_code = build_ts_code(code)
 
         start_date = start_date or DEFAULT_START_DATE
         end_date = end_date or datetime.now().strftime("%Y-%m-%d")
@@ -2077,13 +2114,8 @@ class DataEngine:
         
         # 构造 ts_code 列表
         ts_codes = []
-        for sym in symbols:
-            sym6 = str(sym).zfill(6)
-            if sym6.startswith(("6", "5", "9", "688")):
-                ts_codes.append(f"{sym6}.SH")
-            else:
-                ts_codes.append(f"{sym6}.SZ")
-        
+        ts_codes = [build_ts_code(sym) for sym in symbols]
+
         # 使用 register 避免 SQL 注入
         codes_df = pd.DataFrame({"ts_code": ts_codes})
         with self.get_connection() as conn:

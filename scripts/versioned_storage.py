@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any, Set
 from dataclasses import dataclass, asdict
 from enum import Enum
+from collections import deque
+import contextlib
 import json
 import hashlib
 import threading
@@ -135,15 +137,16 @@ class VersionedStorage:
         self._cache_last_cleanup = datetime.now()
         
         # 连接池（读写分离，减少开销）
-        # 延迟导入duckdb，避免循环依赖；使用类级别锁保证线程安全
+        # 延迟导入duckdb，避免循环依赖
+        # 改进：使用 deque 替代 list（线程安全 pop/popleft），使用 RLock 替代 Lock（同线程可重入）
         global duckdb
         if duckdb is None:
             import duckdb as _duckdb
             duckdb = _duckdb
-        self._write_pool: List = []    # 写连接池（可复用）
-        self._read_pool: List = []      # 读连接池（可复用）
+        self._write_pool: deque = deque()    # 写连接池（可复用）
+        self._read_pool: deque = deque()     # 读连接池（可复用）
         self._pool_max = 5
-        self._pool_lock = threading.Lock()
+        self._pool_lock = threading.RLock()  # RLock：同线程可重入，更安全
         
         self._init_schema()
         logger.info(f"VersionedStorage initialized: {self.db_path}")
@@ -615,58 +618,56 @@ class VersionedStorage:
                 del self._cache[k]
             logger.debug(f"Cache LRU cleanup: {len(keys_to_remove)} evicted")
     
+    @contextlib.contextmanager
     def _get_connection(self, read_only: bool = False):
-        """从连接池获取连接（上下文管理器）
-        
+        """
+        从连接池获取连接（上下文管理器）
+
         读写分离：写连接和读连接各自独立池，完全隔离，避免 read_only=True 的连接
         被错误地用于写入操作导致崩溃。
+
+        线程安全改进：
+        - 使用 RLock（同线程可重入）
+        - 使用 deque 替代 list（线程安全 popleft）
+        - 所有池操作在锁内完成
         """
-        import contextlib
-        
-        @contextlib.contextmanager
-        def _conn():
+        conn = None
+        from_pool = False
+        pool_key = 'read' if read_only else 'write'
+
+        with self._pool_lock:
             pool = self._read_pool if read_only else self._write_pool
-            
-            # 尝试从连接池获取
-            conn = None
-            from_pool = False
+            if pool:
+                conn = pool.popleft()  # deque popleft 是线程安全的 O(1) 操作
+                from_pool = True
+
+        # 池为空，创建新连接（在锁外创建，减少锁持有时间）
+        if conn is None:
+            conn = duckdb.connect(str(self.db_path), read_only=read_only)
+
+        try:
+            yield conn
+        finally:
             with self._pool_lock:
-                if pool:
-                    conn = pool.pop()
-                    from_pool = True
-            
-            # 池为空，创建新连接
-            if conn is None:
-                conn = duckdb.connect(str(self.db_path), read_only=read_only)
-            
-            try:
-                yield conn
-            finally:
-                with self._pool_lock:
-                    if from_pool and len(pool) < self._pool_max:
-                        # 归还到对应池
-                        pool.append(conn)
-                    else:
-                        # 关闭连接
-                        conn.close()
-        
-        return _conn()
+                pool = self._read_pool if read_only else self._write_pool
+                if from_pool and len(pool) < self._pool_max:
+                    pool.append(conn)  # deque append 是线程安全的
+                else:
+                    conn.close()
     
     def close(self):
         """关闭所有连接池连接"""
         with self._pool_lock:
-            for conn in self._write_pool:
+            while self._write_pool:
                 try:
-                    conn.close()
+                    self._write_pool.popleft().close()
                 except Exception:
                     pass
-            self._write_pool.clear()
-            for conn in self._read_pool:
+            while self._read_pool:
                 try:
-                    conn.close()
+                    self._read_pool.popleft().close()
                 except Exception:
                     pass
-            self._read_pool.clear()
         logger.info("Connection pools closed")
 
 

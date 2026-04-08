@@ -13,10 +13,15 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple, Any
 from dataclasses import dataclass, field
 from enum import Enum
+import bisect
 import json
 import pandas as pd
 import numpy as np
+import threading
 from loguru import logger
+
+# Baostock 全局会话锁（Baostock 不支持并发，全局单会话）
+_BS_LOCK = threading.Lock()
 
 
 class DelistReason(Enum):
@@ -199,71 +204,73 @@ class SurvivorshipBiasHandler:
             logger.error(f"Failed to load from AkShare: {e}")
     
     def load_from_baostock(self, start_year: int = 2000, end_year: int = 2024):
-        """从Baostock加载历史全量股票（含退市）- V2增强版"""
+        """从Baostock加载历史全量股票（含退市）- V2增强版（线程安全）"""
         try:
             import baostock as bs
             
-            lg = bs.login()
-            if lg.error_code != '0':
-                logger.error(f"Baostock login failed: {lg.error_msg}")
-                return
-            
-            try:
-                newly_delisted = []
+            # Baostock 全局会话锁（线程安全）
+            with _BS_LOCK:
+                lg = bs.login()
+                if lg.error_code != '0':
+                    logger.error(f"Baostock login failed: {lg.error_msg}")
+                    return
                 
-                for year in range(start_year, end_year + 1):
-                    # 查询每年最后一个交易日的所有股票
-                    rs = bs.query_all_stock(day=f"{year}-12-31")
-                    if rs.error_code != '0':
-                        continue
+                try:
+                    newly_delisted = []
                     
-                    while rs.next() and rs.error_code == '0':
-                        row = rs.get_row_data()
-                        bs_code = row[0]  # sh.600000
-                        symbol = bs_code.split('.')[1]  # 600000
-                        ts_code = f"{symbol}.SH" if bs_code.startswith('sh') else f"{symbol}.SZ"
+                    for year in range(start_year, end_year + 1):
+                        # 查询每年最后一个交易日的所有股票
+                        rs = bs.query_all_stock(day=f"{year}-12-31")
+                        if rs.error_code != '0':
+                            continue
                         
-                        if symbol not in self._stocks:
-                            # 查询股票基本信息
-                            rs_detail = bs.query_stock_basic(code=bs_code)
-                            if rs_detail.error_code == '0' and rs_detail.next():
-                                detail = rs_detail.get_row_data()
-                                list_date = pd.to_datetime(detail[6]) if detail[6] else pd.Timestamp(f"{year}-01-01")
-                                delist_date = pd.to_datetime(detail[7]) if detail[7] else None
-                                
-                                # 检测退市原因
-                                delist_reason = self._detect_delist_reason(detail)
-                                
-                                lifetime = StockLifetime(
-                                    symbol=symbol,
-                                    name=detail[1],
-                                    ts_code=ts_code,
-                                    list_date=list_date,
-                                    delist_date=delist_date,
-                                    delist_reason=delist_reason,
-                                    board=self._detect_board(symbol),
-                                )
-                                
-                                self._stocks[symbol] = lifetime
-                                
-                                if delist_date:
-                                    self._delisted.add(symbol)
-                                    newly_delisted.append(symbol)
+                        while rs.next() and rs.error_code == '0':
+                            row = rs.get_row_data()
+                            bs_code = row[0]  # sh.600000
+                            symbol = bs_code.split('.')[1]  # 600000
+                            ts_code = f"{symbol}.SH" if bs_code.startswith('sh') else f"{symbol}.SZ"
+                            
+                            if symbol not in self._stocks:
+                                # 查询股票基本信息
+                                rs_detail = bs.query_stock_basic(code=bs_code)
+                                if rs_detail.error_code == '0' and rs_detail.next():
+                                    detail = rs_detail.get_row_data()
+                                    list_date = pd.to_datetime(detail[6]) if detail[6] else pd.Timestamp(f"{year}-01-01")
+                                    delist_date = pd.to_datetime(detail[7]) if detail[7] else None
                                     
-                                    # 固化最后交易状态
-                                    self._finalize_delisted_stock(symbol, delist_date)
-                
-                # 检测代码变更（通过名称变化或特殊标记）
-                self._detect_code_changes()
-                
-                # 保存更新
-                if newly_delisted:
-                    self._save_persisted_data()
-                
-                logger.info(f"Loaded {len(self._stocks)} stocks from Baostock ({len(self._delisted)} delisted)")
-                
-            finally:
-                bs.logout()
+                                    # 检测退市原因
+                                    delist_reason = self._detect_delist_reason(detail)
+                                    
+                                    lifetime = StockLifetime(
+                                        symbol=symbol,
+                                        name=detail[1],
+                                        ts_code=ts_code,
+                                        list_date=list_date,
+                                        delist_date=delist_date,
+                                        delist_reason=delist_reason,
+                                        board=self._detect_board(symbol),
+                                    )
+                                    
+                                    self._stocks[symbol] = lifetime
+                                    
+                                    if delist_date:
+                                        self._delisted.add(symbol)
+                                        newly_delisted.append(symbol)
+                                        
+                                        # 固化最后交易状态
+                                        self._finalize_delisted_stock(symbol, delist_date)
+                    
+                    # 检测代码变更（通过名称变化或特殊标记）
+                    self._detect_code_changes()
+                    
+                    # 保存更新
+                    if newly_delisted:
+                        self._save_persisted_data()
+                    
+                    logger.info(f"Loaded {len(self._stocks)} stocks from Baostock ({len(self._delisted)} delisted)")
+                    
+                finally:
+                    bs.logout()
             
         except Exception as e:
             logger.error(f"Failed to load from Baostock: {e}")
@@ -327,24 +334,58 @@ class SurvivorshipBiasHandler:
             logger.debug(f"Failed to finalize {symbol}: {e}")
     
     def _detect_code_changes(self):
-        """检测代码变更（如股改、合并导致的代码变化）"""
-        # 通过名称相似性和时间连续性检测
-        for symbol, lifetime in self._stocks.items():
-            if lifetime.delist_reason == DelistReason.CODE_CHANGE:
-                # 查找可能的新代码（名称相似且上市日期接近退市日期）
-                for new_symbol, new_lifetime in self._stocks.items():
-                    if new_symbol == symbol:
-                        continue
-                    if new_lifetime.list_date and lifetime.delist_date:
-                        days_diff = (new_lifetime.list_date - lifetime.delist_date).days
-                        if 0 <= days_diff <= 30:  # 30天内重新上市
-                            # 名称相似度检查
-                            if self._name_similarity(lifetime.name, new_lifetime.name) > 0.5:
-                                self._code_change_map[symbol] = new_symbol
-                                lifetime.successor_symbol = new_symbol
-                                new_lifetime.predecessor_symbols.append(symbol)
-                                logger.info(f"Detected code change: {symbol} -> {new_symbol}")
-                                break
+        """检测代码变更（如股改、合并导致的代码变化）- O(n log n) 优化版"""
+        # 筛选 CODE_CHANGE 类型的历史股票
+        old_stocks = {
+            s: l for s, l in self._stocks.items()
+            if l.delist_reason == DelistReason.CODE_CHANGE and l.delist_date
+        }
+        if not old_stocks:
+            return
+
+        # 构建时间窗口索引：新股票按上市日期排序，便于范围查询
+        # 只考虑退市后 60 天内重新上市的（放宽窗口）
+        new_stocks = [
+            (s, l)
+            for s, l in self._stocks.items()
+            if s not in old_stocks and l.list_date
+        ]
+        # 按上市日期排序，支持二分查找
+        new_stocks.sort(key=lambda x: x[1].list_date)
+
+        # 用字典做符号表：快速查找名称
+        # 用列表维持有序（用于二分边界）
+        name_map: Dict[str, List[str]] = {}  # 标准化名称 -> [symbol, ...]
+        for s, l in new_stocks:
+            key = self._normalize_name(l.name)
+            name_map.setdefault(key, []).append(s)
+
+        for old_sym, old_lifetime in old_stocks.items():
+            if old_sym in self._code_change_map:
+                continue  # 已有映射
+
+            delist_date = old_lifetime.delist_date
+            # 二分查找：退市日期之后 60 天内的新股票
+            target_date = delist_date + timedelta(days=60)
+            idx = bisect.bisect_right(new_stocks, ('', None), key=lambda x: x[1].list_date)
+            # 找 [delist_date, target_date] 区间的股票
+            candidates = [
+                (s, l) for s, l in new_stocks[idx:]
+                if old_lifetime.list_date <= l.list_date <= target_date
+                if l.list_date >= delist_date
+            ]
+
+            # 名称相似度快速过滤
+            old_key = self._normalize_name(old_lifetime.name)
+            for new_sym, new_lifetime in candidates:
+                new_key = self._normalize_name(new_lifetime.name)
+                # 完全匹配或高相似度
+                if old_key == new_key or self._name_similarity(old_lifetime.name, new_lifetime.name) > 0.5:
+                    self._code_change_map[old_sym] = new_sym
+                    old_lifetime.successor_symbol = new_sym
+                    new_lifetime.predecessor_symbols.append(old_sym)
+                    logger.info(f"Detected code change: {old_sym} -> {new_sym}")
+                    break
     
     def _name_similarity(self, name1: str, name2: str) -> float:
         """计算名称相似度（简单实现）"""
