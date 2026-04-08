@@ -2,7 +2,7 @@
 
 # A股多因子回测框架
 
-**准实盘级量化回测系统 v3.0**
+**准实盘级量化回测系统 v3.1**
 
 [![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://www.python.org/)
 [![DuckDB](https://img.shields.io/badge/DuckDB-0.9+-orange.svg)](https://duckdb.org/)
@@ -589,7 +589,7 @@ python run_tests.py test_production
 
 ## 版本历史
 
-### v3.0 (2026-04-06)
+### v3.1 (2026-04-08)
 - 修复 5 个 P0 运行时 Bug（位运算死循环、NameError、TypeError、持仓丢失）
 - 拆分 DataValidator 到独立模块
 - 消除板块识别重复逻辑

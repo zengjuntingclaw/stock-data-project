@@ -15,6 +15,8 @@ from typing import Optional, List, Dict, Any, Generator
 
 from loguru import logger
 
+from scripts.sql_config import SCHEMA_SQL, QUERY_SQL, DML_SQL, get_sql
+
 
 class ConnectionPool:
     """线程安全的DuckDB连接池（读写分离）"""
@@ -69,58 +71,12 @@ class DataStore:
         self._init_schema()
         
     def _init_schema(self) -> None:
-        """初始化数据库Schema（精简版，仅核心表）"""
+        """初始化数据库Schema（使用SQL配置中心）"""
         with self.pool.get_connection() as conn:
-            # 股票列表
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS stock_list (
-                    symbol VARCHAR PRIMARY KEY,
-                    name VARCHAR,
-                    ts_code VARCHAR,
-                    list_date DATE,
-                    delist_date DATE,
-                    industry VARCHAR,
-                    market VARCHAR
-                )
-            """)
-            
-            # 日线行情
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS daily_quotes (
-                    symbol VARCHAR,
-                    date DATE,
-                    open DOUBLE,
-                    high DOUBLE,
-                    low DOUBLE,
-                    close DOUBLE,
-                    volume BIGINT,
-                    amount DOUBLE,
-                    adj_factor DOUBLE,
-                    is_suspended BOOLEAN,
-                    PRIMARY KEY (symbol, date)
-                )
-            """)
-            
-            # 财务数据
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS financial_data (
-                    symbol VARCHAR,
-                    end_date DATE,
-                    ann_date DATE,
-                    revenue DOUBLE,
-                    net_profit DOUBLE,
-                    roe DOUBLE,
-                    PRIMARY KEY (symbol, end_date, ann_date)
-                )
-            """)
-            
-            # 交易日历
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS trade_calendar (
-                    date DATE PRIMARY KEY,
-                    is_open BOOLEAN
-                )
-            """)
+            # 使用SQL配置中心创建核心表
+            for table_name in ["stock_list", "daily_quotes", "financial_data", "trade_calendar"]:
+                sql = get_sql("schema", table_name)
+                conn.execute(sql)
             
             conn.commit()
             logger.info(f"Schema initialized: {self.db_path}")

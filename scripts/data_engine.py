@@ -90,7 +90,10 @@ def detect_board(symbol: str) -> str:
 
 
 def detect_limit(code: str) -> float:
-    """根据股票代码返回涨跌停幅度（统一实现）
+    """根据股票代码返回涨跌停幅度（基础版，仅用于数据验证）
+    
+    注意：这是简化版，不含时间维度。
+    完整涨跌停逻辑请使用 AShareTradingRules.get_price_limit()
     
     科创板(688): 20%, 创业板(30): 20%, 北交所(4/8): 30%, 主板: 10%
     """
@@ -382,14 +385,14 @@ class DataEngine:
     # 工具方法
     # ──────────────────────────────────────────────────────────
     @staticmethod
-    def _detect_limit(code: str) -> float:
-        """根据股票代码返回涨跌停幅度（委托到公共函数）"""
-        return detect_limit(code)
-    
-    @staticmethod
     def _apply_limit_flags(df: pd.DataFrame, code: str, pct_col: str = "pct_chg") -> pd.DataFrame:
-        """统一应用涨跌停标记（容差0.01%避免浮点误差）"""
-        limit_pct = detect_limit(code)
+        """统一应用涨跌停标记（容差0.01%避免浮点误差）
+        
+        注意：这是简化版涨跌停判断，不含时间维度。
+        完整涨跌停逻辑（含新股规则、历史变迁）请使用 AShareTradingRules.get_price_limit()
+        """
+        limit_pct = detect_limit(code)  # 返回小数，如0.1表示10%
+        # pct_chg是百分比数值（如9.8表示9.8%），需要乘100转换
         df["limit_up"] = df[pct_col] >= (limit_pct * 100 - 0.01)
         df["limit_down"] = df[pct_col] <= -(limit_pct * 100 - 0.01)
         return df

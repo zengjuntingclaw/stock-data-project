@@ -1,4 +1,4 @@
-"""A股多因子回测框架 v3.0 主程序"""
+"""A股多因子回测框架 v3.1 主程序"""
 import sys
 from pathlib import Path
 from datetime import datetime
@@ -27,7 +27,7 @@ def setup():
     (project_root / "logs").mkdir(exist_ok=True)
     (project_root / "data" / "v2").mkdir(parents=True, exist_ok=True)
     (project_root / "_output").mkdir(parents=True, exist_ok=True)
-    logger.info("="*50 + "\nv3.0 启动\n" + "="*50)
+    logger.info("="*50 + "\nv3.1 启动\n" + "="*50)
 
 
 def run_backtest(start="2022-01-01", end="2024-12-31", capital=1e7):

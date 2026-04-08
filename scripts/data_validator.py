@@ -8,7 +8,24 @@ from pathlib import Path
 from typing import Dict
 from datetime import datetime
 
-from scripts.data_engine import detect_limit, DEFAULT_ADJ_TOLERANCE, DEFAULT_SAMPLE_RATIO
+from scripts.data_engine import DEFAULT_ADJ_TOLERANCE, DEFAULT_SAMPLE_RATIO
+
+
+def _detect_limit(code: str) -> float:
+    """根据股票代码返回涨跌停幅度（基础版，仅用于数据验证）
+    
+    注意：这是简化版，不含时间维度。
+    完整涨跌停逻辑请使用 AShareTradingRules.get_price_limit()
+    """
+    c = str(code).zfill(6)
+    if c.startswith("688"):
+        return 0.20
+    elif c.startswith("30"):
+        return 0.20
+    elif c.startswith("4") or c.startswith("8"):
+        return 0.30
+    else:
+        return 0.10
 
 
 class DataValidator:
@@ -52,7 +69,7 @@ class DataValidator:
         if "pct_chg" in df.columns and "ts_code" in df.columns:
             # 向量化计算每只股票的涨跌停阈值
             codes_6 = df["ts_code"].astype(str).str[:6]
-            max_pct = codes_6.apply(detect_limit) * 100
+            max_pct = codes_6.apply(_detect_limit) * 100
             abnormal = df[df["pct_chg"].abs() > max_pct]
             if len(abnormal) > 0:
                 issues.append({

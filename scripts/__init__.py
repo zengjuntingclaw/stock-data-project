@@ -1,4 +1,4 @@
-"""stock_data_project - A股多因子回测框架 v3.0 生产级"""
+"""stock_data_project - A股多因子回测框架 v3.1 生产级"""
 
 # 数据类
 from scripts.data_classes import (
@@ -53,7 +53,7 @@ __all__ = [
     # 绩效分析
     "EnhancedPerformanceAnalyzer", "BrinsonAttribution",
     # 数据引擎（v1兼容）
-    "DataEngine", "detect_board", "detect_limit", "build_ts_code",
+    "DataEngine", "detect_board", "build_ts_code",
     # 数据引擎（v2重构版）
     "DataStore", "ConnectionPool",
     "DataFetcher", "DataSource", "AkShareSource", "BaostockSource",
