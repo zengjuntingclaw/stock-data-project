@@ -5,6 +5,8 @@
 2. T+1 冻结释放：买入当日不可卖，次日释放；资金 T+1 可用、T+2 可取
 3. 资金结算：买卖对 available/total/pending_settlements 的精确影响
 """
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import unittest
 from datetime import datetime, timedelta
 import pandas as pd

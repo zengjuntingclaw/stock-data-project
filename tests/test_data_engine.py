@@ -6,6 +6,8 @@
   3. DataEngine 核心方法 (init / query / execute / save_quotes / 技术指标计算)
   4. 边界条件与异常处理
 """
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import unittest
 import tempfile
 import shutil
@@ -132,7 +134,7 @@ class TestBuildTsCode(unittest.TestCase):
     def test_padding(self):
         """不足6位自动补零"""
         self.assertEqual(build_ts_code("1"), "000001.SZ")
-        self.assertEqual(build_ts_code("6005"), "006005.SZ")  # zfill → 006005 → SZ
+        self.assertEqual(build_ts_code("6005"), "006005.SH")  # zfill → 006005 → 首位6 → 沪市
 
     def test_numeric_input(self):
         """数字类型输入"""

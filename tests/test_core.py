@@ -2,6 +2,8 @@
 
 测试 data_classes 和基础执行引擎
 """
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import unittest
 from datetime import datetime
 

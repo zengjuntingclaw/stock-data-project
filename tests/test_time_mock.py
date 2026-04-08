@@ -1,4 +1,6 @@
 """测试 _get_now() 时间注入能力 - 验证单元测试可 mock 时间"""
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import unittest
 import os
 from datetime import datetime
