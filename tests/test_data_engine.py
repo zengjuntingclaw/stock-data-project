@@ -134,7 +134,7 @@ class TestBuildTsCode(unittest.TestCase):
     def test_padding(self):
         """不足6位自动补零"""
         self.assertEqual(build_ts_code("1"), "000001.SZ")
-        self.assertEqual(build_ts_code("6005"), "006005.SH")  # zfill → 006005 → 首位6 → 沪市
+        self.assertEqual(build_ts_code("6005"), "006005.SZ")  # 006005匹配SZ_MAIN→.SZ
 
     def test_numeric_input(self):
         """数字类型输入"""

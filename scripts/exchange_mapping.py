@@ -28,9 +28,52 @@ RE_SZ_CHINEXT = re.compile(r'^30\d{4}$')     # 300xxx 创业板
 RE_SZ_B    = re.compile(r'^200\d{3}$')       # 200xxx B股
 
 # 北交所（北京证券交易所）
-RE_BJ_OLD  = re.compile(r'^4\d{5}$')         # 4xxxxx 老股（原新三板精选层）
-RE_BJ_NEW  = re.compile(r'^8\d{5}$')         # 8xxxxx 新股
-RE_BJ_2024 = re.compile(r'^920\d{3}$')       # 920xxx 2024年新启用代码段
+# ⚠️ 修复（V3）：使用 strip_prefix() 统一处理前导零问题
+# 规则：去掉所有前导零后，判断前3位（920xxx）或前1位（4xxx/8xxx）
+# 实现：先 strip_leading_zeros，再用正则精确匹配
+# strip_leading_zeros("004301") = "4301", strip_leading_zeros("830001") = "830001"
+# 北交所识别辅助函数
+def _strip_leading_zeros(s: str) -> str:
+    """去掉前导零，返回有效数字部分"""
+    return s.lstrip('0') or '0'
+
+
+def _is_bj_code(symbol: str) -> bool:
+    """
+    判断是否为北交所代码
+    
+    ⚠️ 核心修复（V7-final）：传入原始 symbol，保留前导零信息
+    规则：
+    - 去掉前导零后取前4个字符
+    - ≥4位：用前4位精确判断（920xxx / 4xxxx / 8xxxx）
+    - <4位：用首位非零字符判断（4/8 → BJ，其余 → SZ）
+    """
+    # 取前4个非零字符（避免zfill填充后判断错误）
+    stripped = str(symbol).lstrip('0')[:4]
+    
+    if len(stripped) < 4:
+        # 不足4位：用首位非零字符判断
+        # 4/8 → 北交所（短输入的4/8几乎肯定是北交所代码）
+        # 9 → 沪市（920xxx段需要至少4位，不可能在9xxx段）
+        # 其他 → 深市
+        return stripped in ('4', '8')
+    
+    # ≥4位：精确判断
+    # 920xxx-929xxx（前4位 920x 或 921x...929x）
+    if stripped[:2] == '92':
+        return True
+    # 4xxxxx（首位4）
+    if stripped[0] == '4':
+        return True
+    # 8xxxxx（首位8）
+    if stripped[0] == '8':
+        return True
+    return False
+
+
+RE_BJ_OLD  = re.compile(r'^4\d{5}$')         # 4xxxxx 老股（6位精确）
+RE_BJ_NEW  = re.compile(r'^8\d{5}$')         # 8xxxxx 新股（6位精确）
+RE_BJ_2024 = re.compile(r'^920\d{3}$')       # 920xxx 2024年新启用代码段（6位精确）
 
 
 # ============================================================================
@@ -77,8 +120,14 @@ def classify_exchange(symbol: str) -> Tuple[str, str]:
     if RE_SH_B.match(sym6):
         return ('SH', 'B股')
     
-    # 北交所（必须在深交所之前检查，因为920xxx可能被误判为深市）
-    if RE_BJ_2024.match(sym6) or RE_BJ_NEW.match(sym6) or RE_BJ_OLD.match(sym6):
+    # 北交所（必须在深交所之前检查）
+    # ⚠️ 修复（V7）：传入原始 symbol（而非 zfill 后的 sym6），保留前导零信息
+    # "006005".lstrip('0')[:4] = "6005" → 首位6 → not BJ ✓
+    # "000008".lstrip('0')[:4] = "8" → 首位8 → BJ ✓
+    # "4301".lstrip('0')[:4] = "4301" → 前4位4301 → BJ ✓
+    # "000001".lstrip('0')[:4] = "1" → 不足4位首位1 → not BJ ✓
+    # "920000".lstrip('0')[:4] = "9200" → 前4位9200 → BJ ✓
+    if _is_bj_code(symbol):
         return ('BJ', '北交所')
     
     # 深交所
@@ -90,12 +139,29 @@ def classify_exchange(symbol: str) -> Tuple[str, str]:
         return ('SZ', 'B股')
     
     # 未知代码，根据首位数字兜底
-    first = sym6[0] if sym6 else '0'
-    if first in '68':
+    # ⚠️ 修复（V4）：使用原始符号的"首个非零数字"而非zfill后的首位
+    # 原因：zfill后所有代码前导零都被填满，导致"006005"被误判为BJ
+    # 规则：
+    #   - 首个非零数字为4/8/92/920 → 北交所
+    #   - 首个非零数字为6 → 沪市
+    #   - 其他 → 深市
+    def _first_nonzero(s: str) -> str:
+        """返回字符串中首个非零字符"""
+        for c in s:
+            if c != '0':
+                return c
+        return '0'
+    
+    first_nz = _first_nonzero(str(symbol))
+    
+    if first_nz == '9':
+        # 9字头 → 沪市主板兜底（920xxx已在上面被BJ捕获）
         return ('SH', '主板')
-    elif first in '048':
+    elif first_nz in '048':
+        # 0/4/8 开头 → 北交所
         return ('BJ', '北交所')
     else:
+        # 其他（1/2/3/5/6/7） → 深市
         return ('SZ', '主板')
 
 

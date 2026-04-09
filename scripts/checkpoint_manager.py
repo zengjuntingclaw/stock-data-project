@@ -376,19 +376,21 @@ def extract_state_from_engine(engine, current_date: datetime) -> BacktestState:
     -------
     BacktestState : 完整状态
     """
-    # 提取资金状态
+    # 提取资金状态（⚠️ 必须完整包含 pending_withdrawals，否则 T+2 可取资金丢失）
     cash = CashState(
         total=engine.cash.total,
         available=engine.cash.available,
         withdrawable=engine.cash.withdrawable,
         frozen=engine.cash.frozen,
         pending_settlements=[
-            (d.isoformat(), float(a)) 
-            for d, a in getattr(engine.cash, 'pending_settlements', [])
+            (d.isoformat(), float(a))
+            for d, a in engine.cash.pending_settlements
         ],
+        # ⚠️ 修复：必须同时保存 pending_withdrawals（T+2可取队列）
+        # 否则断点恢复后，部分资金会永久卡在"可用"状态无法提现
         pending_withdrawals=[
             (d.isoformat(), float(a))
-            for d, a in getattr(engine.cash, 'pending_withdrawals', [])
+            for d, a in engine.cash.pending_withdrawals
         ],
     )
     

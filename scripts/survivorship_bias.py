@@ -138,7 +138,9 @@ class SurvivorshipBiasHandler:
                     lifetime = StockLifetime(
                         symbol=item['symbol'],
                         name=item['name'],
-                        ts_code=item.get('ts_code', f"{item['symbol']}.SH" if item['symbol'].startswith('6') else f"{item['symbol']}.SZ"),
+                        # ⚠️ 修复：统一使用 build_ts_code()，禁止硬编码 .SH/.SZ 逻辑
+                        # 否则 4xxxxx/8xxxxx/920xxx 等北交所代码会被误判为 .SZ
+                        ts_code=item.get('ts_code', build_ts_code(item['symbol'])),
                         list_date=pd.to_datetime(item['list_date']),
                         delist_date=pd.to_datetime(item['delist_date']) if item.get('delist_date') else None,
                         delist_reason=DelistReason(item.get('delist_reason', 'unknown')),

@@ -52,7 +52,7 @@ class TestExchangeMapping(unittest.TestCase):
             ("900001", "900001.SH"),   # 9开头 → 沪市
             (600000, "600000.SH"),     # int输入
             ("000001", "000001.SZ"),   # 深市不误判为沪市
-            ("068001", "068001.SH"),   # 068xxx，首位6 → 沪市
+            ("068001", "068001.SZ"),   # 068xxx：首位0 → SZ_MAIN匹配 → .SZ
         ]
         for sym, expected in cases:
             self.assertEqual(build_ts_code(str(sym)), expected)
@@ -87,7 +87,7 @@ class TestExchangeMapping(unittest.TestCase):
             ("871000", "871000.BJ"),
             ("872000", "872000.BJ"),
             ("873000", "873000.BJ"),
-            ("920000", "920000.SH"),  # 注意：920xxx是沪市（9开头），不是北交所
+            ("920000", "920000.BJ"),  # 920xxx：首位9，RE_BJ_2024 捕获 → BJ
         ]
         for sym, expected in cases:
             self.assertEqual(build_ts_code(str(sym)), expected, f"{sym} should be {expected}")
@@ -95,7 +95,7 @@ class TestExchangeMapping(unittest.TestCase):
     def test_build_ts_code_both_bj_prefixes(self):
         """4/8 开头的北交所代码（4位/5位/6位都要正确）"""
         # 4开头（老股退市整理期）
-        self.assertEqual(build_ts_code("4301"), "004301.BJ")
+        self.assertEqual(build_ts_code("4301"), "004301.BJ")  # 4301→BJ（新_is_bj_code规则）
         self.assertEqual(build_ts_code("430001"), "430001.BJ")
         self.assertEqual(build_ts_code("499999"), "499999.BJ")
         # 8开头（北交所新股）
@@ -110,7 +110,7 @@ class TestExchangeMapping(unittest.TestCase):
         self.assertEqual(build_ts_code("202001"), "202001.SZ")  # 深市
         self.assertEqual(build_ts_code("302001"), "302001.SZ")  # 创业板
         # 688 vs 068（068是深市，688是科创板）
-        self.assertEqual(build_ts_code("068001"), "068001.SH")  # 首位6 → 沪市
+        self.assertEqual(build_ts_code("068001"), "068001.SZ")  # 068xxx：首位0→SZ_MAIN
         self.assertEqual(build_ts_code("688001"), "688001.SH")
 
 
@@ -575,6 +575,205 @@ class TestCheckpointResumeConsistency(unittest.TestCase):
         self.assertEqual(len(backtest2.execution.cash.pending_settlements), 1)
         _, amount = backtest2.execution.cash.pending_settlements[0]
         self.assertEqual(amount, 50000)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 任务4: extract_state 完整性测试（pending_withdrawals 修复验证）
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestExtractStateCompleteness(unittest.TestCase):
+    """验证 extract_state_from_engine 包含所有资金状态字段"""
+
+    def test_pending_withdrawals_included(self):
+        """⚠️ 关键测试：extract_state 必须包含 pending_withdrawals
+        
+        否则 T+2 可取资金在断点恢复后永久丢失。
+        """
+        from scripts.checkpoint_manager import extract_state_from_engine
+        
+        engine = ExecutionEngineV3(initial_cash=1_000_000)
+        engine.cash.total = 1_000_000
+        engine.cash.available = 950_000
+        engine.cash.withdrawable = 900_000
+        engine.cash.pending_settlements = [
+            (datetime(2024, 1, 10), 30000),   # T+1 待结算
+        ]
+        engine.cash.pending_withdrawals = [
+            (datetime(2024, 1, 11), 29700),    # T+2 可取（关键！）
+        ]
+        
+        state = extract_state_from_engine(engine, datetime(2024, 1, 5))
+        
+        # pending_settlements 必须存在
+        self.assertEqual(len(state.cash.pending_settlements), 1)
+        self.assertEqual(state.cash.pending_settlements[0][1], 30000)
+        
+        # ⚠️ pending_withdrawals 也必须存在（T+2可取）
+        self.assertEqual(len(state.cash.pending_withdrawals), 1)
+        self.assertEqual(state.cash.pending_withdrawals[0][1], 29700)
+    
+    def test_pending_withdrawals_roundtrip(self):
+        """验证 pending_withdrawals 经过 save→load 循环后不丢失"""
+        from scripts.checkpoint_manager import (
+            extract_state_from_engine, BacktestState,
+            CheckpointManager
+        )
+        import tempfile, shutil, os
+        
+        temp_dir = tempfile.mkdtemp()
+        try:
+            engine = ExecutionEngineV3(initial_cash=1_000_000)
+            engine.cash.pending_withdrawals = [
+                (datetime(2024, 1, 11), 29700),
+                (datetime(2024, 1, 12), 15000),
+            ]
+            
+            state = extract_state_from_engine(engine, datetime(2024, 1, 5))
+            state.pending_orders = []
+            state.trade_history = []
+            state.daily_records = []
+            
+            # 保存
+            manager = CheckpointManager(temp_dir)
+            manager.save(state, "test_withdrawals")
+            
+            # 加载
+            loaded_state = manager.load(os.path.join(temp_dir, "test_withdrawals.json"))
+            
+            # ⚠️ 关键断言：pending_withdrawals 不丢失
+            self.assertEqual(len(loaded_state.cash.pending_withdrawals), 2)
+            amounts = [a for _, a in loaded_state.cash.pending_withdrawals]
+            self.assertIn(29700, amounts)
+            self.assertIn(15000, amounts)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 任务5: 字段标准化全链路测试
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestFieldStandardization(unittest.TestCase):
+    """验证旧字段名统一映射到 is_suspend"""
+
+    def test_is_suspended_to_is_suspend(self):
+        """is_suspended → is_suspend"""
+        from scripts.field_specs import normalize_column_names
+        
+        df = pd.DataFrame({
+            'date': ['2024-01-01'],
+            'is_suspended': [True],
+            'symbol': ['000001'],
+            'close': [10.0],
+        })
+        df = normalize_column_names(df)
+        self.assertIn('is_suspend', df.columns)
+        self.assertNotIn('is_suspended', df.columns)
+        self.assertEqual(df['is_suspend'].iloc[0], True)
+
+    def test_is_trading_logic_reversal(self):
+        """is_trading=True → is_suspend=False（逻辑取反）"""
+        from scripts.field_specs import normalize_column_names
+        
+        df = pd.DataFrame({
+            'date': ['2024-01-01'],
+            'is_trading': [True],   # 可交易=True
+            'symbol': ['000001'],
+        })
+        df = normalize_column_names(df)
+        self.assertIn('is_suspend', df.columns)
+        # is_trading=True → is_suspend=False（逻辑取反）
+        self.assertEqual(df['is_suspend'].iloc[0], False)
+
+    def test_standardize_df_complete(self):
+        """完整标准化流程"""
+        from scripts.field_specs import standardize_df
+        
+        df = pd.DataFrame({
+            'code': ['000001'],          # 旧: code → symbol
+            'date': ['2024-01-01'],       # 旧: date → trade_date
+            'is_suspended': [False],       # 旧: is_suspended → is_suspend
+            'open': [10.0],
+            'high': [10.5],
+            'low': [9.8],
+            'close': [10.2],
+            'vol': [100000],              # 旧: vol → volume
+        })
+        df_std = standardize_df(df)
+        
+        # 验证标准化后的字段
+        self.assertIn('symbol', df_std.columns)
+        self.assertIn('trade_date', df_std.columns)
+        self.assertIn('is_suspend', df_std.columns)
+        self.assertIn('volume', df_std.columns)
+        self.assertNotIn('code', df_std.columns)
+        self.assertNotIn('is_suspended', df_std.columns)
+        self.assertNotIn('vol', df_std.columns)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 任务6: exchange_mapping 920xxx 北交所边界测试
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestBeijingExchange920(unittest.TestCase):
+    """验证 920xxx 北交所2024新代码段不被误判为沪市"""
+
+    def test_920xxx_is_bj_not_sh(self):
+        """920xxx 必须识别为 BJ，不是 SH（即使首位是9）"""
+        from scripts.exchange_mapping import classify_exchange, build_ts_code
+        
+        cases = [
+            ("920000", ("BJ", "北交所")),
+            ("920001", ("BJ", "北交所")),
+            ("920100", ("BJ", "北交所")),
+            ("920999", ("BJ", "北交所")),
+            ("930000", ("SH", "主板")),    # 93xxx：strip→"930000"，不在BJ段，fallback→SH
+        ]
+        for sym, (expected_ex, expected_board) in cases:
+            ex, board = classify_exchange(sym)
+            self.assertEqual(
+                (ex, board), (expected_ex, expected_board),
+                msg=f"{sym} should be {expected_ex}/{expected_board}, got {ex}/{board}"
+            )
+            ts_code = build_ts_code(sym)
+            # 930000 是 SH，不是 BJ（不在北交所代码段内）
+            if expected_ex == 'BJ':
+                self.assertTrue(
+                    ts_code.endswith(".BJ"),
+                    msg=f"{sym} ts_code should end with .BJ, got {ts_code}"
+                )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 任务7: survivorship_bias fallback ts_code 生成
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestSurvivorshipBiasTSCode(unittest.TestCase):
+    """验证 survivorship_bias 使用正确的 ts_code 生成逻辑"""
+
+    def test_load_persisted_uses_build_ts_code(self):
+        """_load_persisted_data 中的 ts_code 生成已修复
+        
+        验证点：不再使用 `if startswith('6') → .SH else .SZ` 的错误逻辑
+        修复方式：统一使用 build_ts_code()
+        """
+        # 直接验证 survivorship_bias.py 中的逻辑已修复
+        # 读取源码检查 L138 不再包含错误的三元表达式
+        import re
+        content = open('scripts/survivorship_bias.py', encoding='utf-8').read()
+        
+        # 确认没有错误的 .SH/.SZ fallback 逻辑
+        bad_pattern = r"\.SH.*if.*startswith\(['\"]6['\"]\).*\.SZ"
+        matches = re.findall(bad_pattern, content)
+        
+        # 应该有0个匹配（已修复）
+        self.assertEqual(
+            len(matches), 0,
+            msg=f"Found bad .SH/.SZ fallback pattern: {matches}"
+        )
+        
+        # 确认使用了 build_ts_code
+        self.assertIn("build_ts_code(item['symbol'])", content)
 
 
 if __name__ == '__main__':
