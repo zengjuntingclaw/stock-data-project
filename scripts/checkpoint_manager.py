@@ -196,8 +196,17 @@ class BacktestState:
     daily_records: List[Dict]
     
     # 元数据
-    version: str = "2.0"               # 状态格式版本
-    created_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    version: str = "3.0"               # 状态格式版本
+    created_at: Optional[str] = None    # ISO格式日期，None时自动填充
+    
+    def __post_init__(self):
+        if self.created_at is None:
+            self.created_at = self._get_now()
+    
+    @classmethod
+    def _get_now(cls) -> str:
+        """获取当前时间（ISO格式），单测时可mock"""
+        return datetime.now().isoformat()
     
     def to_dict(self) -> Dict:
         """完整序列化为字典"""
@@ -238,7 +247,7 @@ class CheckpointManager:
     提供可靠的保存/加载功能，确保状态完全一致。
     """
     
-    CURRENT_VERSION = "2.0"
+    CURRENT_VERSION = "3.0"
     
     def __init__(self, checkpoint_dir: str = "./checkpoints"):
         self.checkpoint_dir = Path(checkpoint_dir)
@@ -260,11 +269,11 @@ class CheckpointManager:
         str : 保存的文件路径
         """
         if name is None:
-            name = f"checkpoint_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            name = f"checkpoint_{BacktestState._get_now()[:10]}"
         
         # 更新版本和创建时间
         state.version = self.CURRENT_VERSION
-        state.created_at = datetime.now().isoformat()
+        state.created_at = BacktestState._get_now()
         
         # 保存为JSON（人类可读）
         json_path = self.checkpoint_dir / f"{name}.json"

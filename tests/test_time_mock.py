@@ -40,6 +40,39 @@ class TestTimeMock(unittest.TestCase):
         finally:
             dm._get_now = original
 
+    def test_checkpoint_backteststate_get_now_mockable(self):
+        """BacktestState._get_now() 是类方法，通过子类覆盖实现 mock"""
+        from scripts.checkpoint_manager import BacktestState, CashState
+
+        # 子类覆盖 _get_now 类方法
+        class MockState(BacktestState):
+            @classmethod
+            def _get_now(cls):
+                return datetime(2026, 4, 10, 0, 0, 0).isoformat()
+
+        # 验证自动填充 created_at
+        state = MockState(
+            current_date='2026-04-01',
+            cash=CashState(),
+            positions={},
+            pending_orders=[],
+            trade_history=[],
+            daily_records=[],
+        )
+        self.assertEqual(state.created_at, '2026-04-10T00:00:00')
+
+    def test_data_consistency_checker_get_now_mockable(self):
+        """data_consistency_checker._get_now() 是模块级函数，支持直接 patch"""
+        import scripts.data_consistency_checker as dcc
+        original = dcc._get_now
+        try:
+            dcc._get_now = lambda: datetime(2026, 1, 1, 9, 0, 0)
+            result = dcc._get_now()
+            self.assertEqual(result.year, 2026)
+            self.assertEqual(result.month, 1)
+        finally:
+            dcc._get_now = original
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

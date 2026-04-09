@@ -27,6 +27,11 @@ from scripts.exchange_mapping import classify_exchange, build_ts_code
 from scripts.field_specs import FieldNames, get_required_market_data_fields
 
 
+def _get_now() -> str:
+    """获取当前时间（ISO格式），单测时可mock"""
+    return datetime.now().isoformat()
+
+
 @dataclass
 class DataQualityReport:
     """数据质量报告"""
@@ -53,7 +58,7 @@ class DataQualityReport:
             'symbol': symbol,
             'message': message,
             'details': details or {},
-            'timestamp': datetime.now().isoformat()
+            'timestamp': _get_now()
         })
         self.error_count += 1
     
@@ -65,7 +70,7 @@ class DataQualityReport:
             'symbol': symbol,
             'message': message,
             'details': details or {},
-            'timestamp': datetime.now().isoformat()
+            'timestamp': _get_now()
         })
         self.warning_count += 1
     
