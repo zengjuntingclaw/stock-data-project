@@ -18,8 +18,8 @@ from loguru import logger
 
 
 def _get_now():
-    """获取当前时间（支持单测 mock）。"""
-    return _get_now()
+    """获取当前时间。真实实现用 datetime.now()，单测可用 patch 替换。"""
+    return datetime.now()
 
 
 class QASeverity(Enum):
@@ -644,7 +644,7 @@ class DataQAPipeline:
         }
     
     def _save_report(self, report: Dict):
-        """保存QA报告"""
+        """保存QA报告 + 写入 data_quality_alert 表"""
         timestamp = _get_now().strftime('%Y%m%d_%H%M%S')
         filename = f"qa_report_{timestamp}.json"
         filepath = self.report_dir / filename
@@ -658,6 +658,41 @@ class DataQAPipeline:
         latest_path = self.report_dir / 'latest_qa_report.json'
         with open(latest_path, 'w', encoding='utf-8') as f:
             json.dump(report, f, indent=2, ensure_ascii=False, default=str)
+        
+        # 写入 data_quality_alert 表（关键修复）
+        self._write_alerts_to_db(report)
+    
+    def _write_alerts_to_db(self, report: Dict):
+        """将 QA 告警写入 data_quality_alert 表（幂等：ON CONFLICT IGNORE）"""
+        import duckdb
+        from pathlib import Path
+        try:
+            db_path = self.data_engine.db_path
+            conn = duckdb.connect(str(db_path))
+            for detail in report.get('details', []):
+                check_name = detail['check_name']
+                for issue in detail.get('issues', []):
+                    alert_detail = (
+                        f"[{check_name}] {issue['message']} "
+                        f"(severity={issue['severity']}, "
+                        f"expected={issue.get('expected','N/A')}, "
+                        f"actual={issue.get('actual','N/A')})"
+                    )
+                    conn.execute("""
+                        INSERT INTO data_quality_alert
+                            (alert_type, ts_code, trade_date, detail)
+                        VALUES (?, ?, ?, ?)
+                    """, (
+                        f"qa_{check_name}",
+                        issue.get('ts_code'),
+                        issue.get('trade_date'),
+                        alert_detail,
+                    ))
+            conn.commit()
+            conn.close()
+            logger.debug(f"QA alerts written to data_quality_alert")
+        except Exception as e:
+            logger.warning(f"Failed to write QA alerts to DB: {e}")
     
     def _save_missing_data_report(self, 
                                    missing_data: List[Dict],

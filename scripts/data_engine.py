@@ -195,24 +195,26 @@ class DataEngine:
         # 证券主表历史版本（时点版本，解决历史universe完整性问题）
         cur.execute("""
             CREATE TABLE IF NOT EXISTS stock_basic_history (
-                ts_code       VARCHAR,
-                snapshot_date DATE,         -- 快照日期
+                ts_code       VARCHAR PRIMARY KEY,
                 symbol        VARCHAR,
                 name          VARCHAR,
+                exchange      VARCHAR,
                 area          VARCHAR,
                 industry      VARCHAR,
                 market        VARCHAR,
                 list_date     DATE,
                 delist_date   DATE,
                 is_delisted   BOOLEAN DEFAULT FALSE,
-                total_mv      DOUBLE,       -- 总市值
-                circ_mv       DOUBLE,       -- 流通市值
-                PRIMARY KEY (ts_code, snapshot_date)
+                delist_reason VARCHAR,
+                board         VARCHAR,
+                eff_date      DATE,         -- 上市日期（版本快照标识）
+                end_date      DATE,         -- 退市日期（NULL表示仍在交易）
+                created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
         cur.execute("""
             CREATE INDEX IF NOT EXISTS idx_stock_hist_date 
-            ON stock_basic_history(snapshot_date)
+            ON stock_basic_history(eff_date)
         """)
 
         # 指数成分股动态表（解决幸存者偏差）
@@ -601,8 +603,8 @@ class DataEngine:
         with self.get_connection() as conn:
             df = conn.execute("""
                 SELECT * FROM stock_basic_history 
-                WHERE snapshot_date BETWEEN ? AND ?
-                ORDER BY snapshot_date, ts_code
+                WHERE eff_date BETWEEN ? AND ?
+                ORDER BY eff_date, ts_code
             """, (start_date, end_date)).fetchdf()
         
         return df
@@ -616,33 +618,61 @@ class DataEngine:
         
         记录每个股票何时被加入/退出指数，确保回测时只使用
         该时点真实属于指数成分的股票。
+        
+        关键原则：只追加，不覆盖。使用 INSERT OR IGNORE，
+        已存在的 (index_code, ts_code, in_date) 组合会被跳过。
+        历史上退出但本次快照未出现的股票，需要人工补充 out_date。
         """
         if not HAS_AKSHARE:
             return
 
         with self.get_connection() as conn:
-            # 获取历史成分股（AkShare提供）
             try:
-                if index_code == "000300.SH":
-                    # 沪深300成分股
+                # 解析指数代码（支持 "000300" 或 "000300.SH"）
+                index_symbol = index_code.replace(".SH", "").replace(".SZ", "")
+                
+                # 获取当前成分股快照
+                if index_symbol == "000300":
                     df = ak.index_stock_cons_csindex(symbol="000300")
-                    if df.empty:
-                        return
-                    df.columns = ["ts_code", "name", "in_date"]
-                    df["index_code"] = index_code
-                    df["trade_date"] = pd.Timestamp.now()
-                    df["out_date"] = pd.NaT
+                elif index_symbol == "000905":
+                    df = ak.index_stock_cons_csindex(symbol="000905")
+                elif index_symbol == "000852":
+                    df = ak.index_stock_cons_csindex(symbol="000852")
+                else:
+                    logger.warning(f"Unsupported index: {index_code}")
+                    return
 
-                    # 写入数据库（使用DataFrame注册为临时表再INSERT，参数化查询防止SQL注入）
-                    conn.execute("DELETE FROM index_constituents WHERE index_code = ?", [index_code])
-                    df["index_code"] = index_code
-                    conn.register('tmp_constituents', df)
-                    conn.execute("""
-                        INSERT INTO index_constituents (index_code, ts_code, trade_date, in_date, out_date)
-                        SELECT index_code, ts_code, trade_date, in_date, out_date
-                        FROM tmp_constituents
-                    """)
-                    logger.info(f"Synced {len(df)} constituents for {index_code}")
+                if df.empty:
+                    return
+
+                # 解析中证指数接口字段
+                df = df.rename(columns={
+                    '日期': 'snapshot_date',
+                    '指数代码': 'index_code',
+                    '成分券代码': 'ts_code_raw',
+                    '成分券名称': 'name',
+                    '交易所': 'exchange_cn',
+                })
+                df['index_code'] = df['index_code'] + '.SH'
+                df['ts_code'] = df['ts_code_raw'].apply(build_ts_code)
+                df['snapshot_date'] = pd.to_datetime(df['snapshot_date']).dt.strftime('%Y-%m-%d')
+                df['in_date'] = df['snapshot_date']  # 快照日期 = 该股票进入指数的日期
+                df['out_date'] = None               # 未退出
+                df['source'] = 'csindex'
+
+                # 写入（INSERT OR IGNORE：已存在则跳过，绝对禁止 DELETE）
+                conn.register('tmp_constituents', df[['index_code', 'ts_code', 'in_date', 'out_date', 'source']])
+                conn.execute("""
+                    INSERT OR IGNORE INTO index_constituents_history
+                        (index_code, ts_code, in_date, out_date, source)
+                    SELECT index_code, ts_code,
+                           CAST(in_date AS DATE),
+                           NULL,
+                           source
+                    FROM tmp_constituents
+                """)
+                conn.execute("DROP VIEW IF EXISTS tmp_constituents")
+                logger.info(f"Synced {len(df)} constituents for {index_code} (append only, no overwrite)")
             except Exception as e:
                 logger.warning(f"Failed to sync index constituents: {e}")
 
@@ -658,7 +688,7 @@ class DataEngine:
             return []
 
         df = self.query("""
-            SELECT ts_code FROM index_constituents
+            SELECT ts_code FROM index_constituents_history
             WHERE index_code = ?
             AND in_date <= ?
             AND (out_date IS NULL OR out_date > ?)
