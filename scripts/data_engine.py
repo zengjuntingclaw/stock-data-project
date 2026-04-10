@@ -1127,6 +1127,9 @@ class DataEngine:
         - daily_quotes：复权价格（含 adj_factor，查询时用）
         
         写入策略：使用 DuckDB register() + INSERT ... SELECT（批量，700x快于逐行）
+        
+        注意：daily_bar_raw 没有 adj_factor/is_suspend/limit_up/limit_down/pre_close 列，
+        写入时需排除这些列。
         """
         if df.empty or not HAS_DUCKDB:
             return
