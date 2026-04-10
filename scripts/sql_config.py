@@ -103,6 +103,103 @@ SCHEMA_SQL: Dict[str, str] = {
             checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """,
+
+    # ── 2026-04-10 新增表 ────────────────────────────────────
+    "daily_bar_raw": """
+        CREATE TABLE IF NOT EXISTS daily_bar_raw (
+            ts_code       VARCHAR  NOT NULL,
+            trade_date    DATE     NOT NULL,
+            symbol        VARCHAR  NOT NULL,
+            open          DOUBLE,
+            high          DOUBLE,
+            low           DOUBLE,
+            close         DOUBLE   NOT NULL,
+            volume        BIGINT,
+            amount        DOUBLE,
+            pct_chg       DOUBLE,
+            turnover      DOUBLE,
+            data_source   VARCHAR,
+            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (ts_code, trade_date)
+        )
+    """,
+
+    "corporate_actions": """
+        CREATE TABLE IF NOT EXISTS corporate_actions (
+            ts_code       VARCHAR  NOT NULL,
+            trade_date    DATE     NOT NULL,
+            ann_date      DATE,
+            adj_factor    DOUBLE   NOT NULL,
+            adj_type      VARCHAR,
+            prev_factor   DOUBLE,
+            change_ratio  DOUBLE,
+            reason        VARCHAR,
+            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (ts_code, trade_date)
+        )
+    """,
+
+    "stock_basic_history": """
+        CREATE TABLE IF NOT EXISTS stock_basic_history (
+            ts_code       VARCHAR  NOT NULL,
+            symbol        VARCHAR  NOT NULL,
+            name          VARCHAR,
+            exchange      VARCHAR,
+            area          VARCHAR,
+            industry      VARCHAR,
+            market        VARCHAR,
+            list_date     DATE,
+            delist_date   DATE,
+            is_delisted   BOOLEAN  DEFAULT FALSE,
+            delist_reason VARCHAR,
+            board         VARCHAR,
+            eff_date      DATE     NOT NULL,
+            end_date      DATE,
+            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (ts_code, eff_date)
+        )
+    """,
+
+    "daily_valuation": """
+        CREATE TABLE IF NOT EXISTS daily_valuation (
+            ts_code       VARCHAR  NOT NULL,
+            trade_date    DATE     NOT NULL,
+            total_mv      DOUBLE,
+            circ_mv       DOUBLE,
+            pe_ttm        DOUBLE,
+            pb            DOUBLE,
+            ps_ttm        DOUBLE,
+            pcf_cf_ttm    DOUBLE,
+            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (ts_code, trade_date)
+        )
+    """,
+
+    "st_status_history": """
+        CREATE TABLE IF NOT EXISTS st_status_history (
+            ts_code       VARCHAR  NOT NULL,
+            trade_date    DATE     NOT NULL,
+            is_st         BOOLEAN  NOT NULL,
+            is_new_st     BOOLEAN  DEFAULT FALSE,
+            is_removed_st BOOLEAN  DEFAULT FALSE,
+            st_type       VARCHAR,
+            reason        VARCHAR,
+            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (ts_code, trade_date)
+        )
+    """,
+
+    "index_constituents_history": """
+        CREATE TABLE IF NOT EXISTS index_constituents_history (
+            index_code    VARCHAR  NOT NULL,
+            ts_code       VARCHAR  NOT NULL,
+            in_date       DATE     NOT NULL,
+            out_date      DATE,
+            source        VARCHAR,
+            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (index_code, ts_code, in_date)
+        )
+    """,
 }
 
 # ─────────────────────────────────────────────────────────────
