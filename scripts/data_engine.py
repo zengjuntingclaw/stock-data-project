@@ -207,11 +207,15 @@ class DataEngine:
                 is_delisted   BOOLEAN DEFAULT FALSE,
                 delist_reason VARCHAR,
                 board         VARCHAR,
-                eff_date      DATE,         -- 上市日期（版本快照标识）
-                end_date      DATE,         -- 退市日期（NULL表示仍在交易）
+                eff_date      DATE,         -- 上市日期（版本快照标识，=list_date，用于PIT回放）
+                end_date      DATE,         -- 冗余字段，同 delist_date（保留便于兼容查询）
                 created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # 注意：stock_basic_history 每只股票只有一条记录（list_date时刻的快照），
+        # 不是真正的多版本历史表。这是Baostock一次性拉取的当前股票列表。
+        # PIT查询逻辑: WHERE list_date <= 查询日 AND (delist_date > 查询日 OR delist_date IS NULL)
+        # 此逻辑对任意历史时点的可交易股票池判断正确，无需多版本。
         cur.execute("""
             CREATE INDEX IF NOT EXISTS idx_stock_hist_date 
             ON stock_basic_history(eff_date)
