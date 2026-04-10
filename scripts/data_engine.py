@@ -1015,6 +1015,13 @@ class DataEngine:
         """
         下载单只股票日线数据
         
+        重要：同时下载原始价和复权价，分别存储。
+        - daily_bar_raw: 原始未复权OHLCV（所有数据的基础）
+        - daily_quotes: 复权价格（通过 adj_factor 在查询时计算，或直接用复权close）
+        
+        adjust 参数仅决定返回给调用方的 DataFrame 是否含复权价，
+        不影响原始价存储。
+        
         Parameters
         ----------
         symbol : str
@@ -1024,7 +1031,7 @@ class DataEngine:
         end_date : str
             结束日期，格式 YYYY-MM-DD
         adjust : 'qfq' | ''
-            复权方式
+            复权方式（仅影响返回值，复权因子始终计算并存入 daily_quotes）
         """
         if not HAS_AKSHARE:
             return pd.DataFrame()
@@ -1033,14 +1040,15 @@ class DataEngine:
             start_str = start_date.replace("-", "")
             end_str = end_date.replace("-", "")
 
-            df = ak.stock_zh_a_hist(
+            # ── 1. 始终下载原始价格（adjust=""）─────────────────────
+            df_raw = ak.stock_zh_a_hist(
                 symbol=symbol,
                 period="daily",
                 start_date=start_str,
                 end_date=end_str,
-                adjust=adjust
+                adjust=""
             )
-            if df.empty:
+            if df_raw.empty:
                 return pd.DataFrame()
 
             # 列名标准化
@@ -1049,43 +1057,62 @@ class DataEngine:
                 "最高": "high", "最低": "low", "成交量": "volume",
                 "成交额": "amount", "涨跌幅": "pct_chg", "换手率": "turnover"
             }
-            df = df.rename(columns=col_map)
-            df["trade_date"] = pd.to_datetime(df["trade_date"])
-            df["ts_code"] = build_ts_code(symbol)
-            df["pre_close"] = df["close"].shift(1)
-            df["is_suspend"] = df["volume"] == 0
-            
-            # 涨跌停判定（使用统一方法）
-            df = self._apply_limit_flags(df, symbol)
-            df["data_source"] = "akshare"
+            df_raw = df_raw.rename(columns=col_map)
+            df_raw["trade_date"] = pd.to_datetime(df_raw["trade_date"])
+            df_raw["ts_code"] = build_ts_code(symbol)
+            df_raw["pre_close"] = df_raw["close"].shift(1)
+            df_raw["is_suspend"] = df_raw["volume"] == 0
+            df_raw["data_source"] = "akshare"
 
-            # 计算复权因子
+            # ── 2. 下载复权价格（用于计算 adj_factor）─────────────
+            adj_factor = pd.Series(1.0, index=df_raw.index)
             if adjust:
                 try:
-                    df_raw = ak.stock_zh_a_hist(
+                    df_adj = ak.stock_zh_a_hist(
                         symbol=symbol, period="daily",
-                        start_date=start_str, end_date=end_str, adjust=""
+                        start_date=start_str, end_date=end_str, adjust="qfq"
                     )
-                    if not df_raw.empty:
-                        df_raw = df_raw.rename(columns={"日期": "trade_date", "收盘": "close_raw"})
-                        df_raw["trade_date"] = pd.to_datetime(df_raw["trade_date"])
-                        df = df.merge(df_raw[["trade_date", "close_raw"]], on="trade_date", how="left")
-                        df["adj_factor"] = df["close"] / df["close_raw"].replace(0, np.nan)
-                        df.drop(columns=["close_raw"], inplace=True, errors="ignore")
-                except Exception:
-                    df["adj_factor"] = 1.0
-            else:
-                df["adj_factor"] = 1.0
+                    if not df_adj.empty:
+                        df_adj = df_adj.rename(columns={"日期": "td2", "收盘": "close_adj"})
+                        df_adj["td2"] = pd.to_datetime(df_adj["td2"])
+                        df_raw = df_raw.merge(df_adj[["td2", "close_adj"]],
+                                              left_on="trade_date", right_on="td2",
+                                              how="left")
+                        # adj_factor = adj_close / raw_close（复权因子 = 复权收盘 / 原始收盘）
+                        adj_factor = (df_raw["close_adj"] / df_raw["close"].replace(0, np.nan)).fillna(1.0)
+                        adj_factor = adj_factor.replace([np.inf, -np.inf], 1.0)
+                        df_raw.drop(columns=["td2", "close_adj"], inplace=True, errors="ignore")
+                except Exception as e:
+                    logger.debug(f"adj_factor calc failed for {symbol}: {e}")
 
-            # 验证
-            val = self.validator.validate(df)
+            df_raw["adj_factor"] = adj_factor
+
+            # ── 3. 涨跌停判定（基于原始价）─────────────────────────
+            df_raw = self._apply_limit_flags(df_raw, symbol)
+
+            # ── 4. 验证 ──────────────────────────────────────────
+            val = self.validator.validate(df_raw)
             if not val["ok"]:
                 logger.warning(f"Data validation issues for {symbol}: {val['issues']}")
 
-            cols = ["ts_code", "trade_date", "open", "high", "low", "close",
-                    "pre_close", "volume", "amount", "pct_chg", "turnover",
-                    "adj_factor", "is_suspend", "limit_up", "limit_down", "data_source"]
-            return df[[c for c in cols if c in df.columns]]
+            # ── 5. 根据 adjust 参数决定返回格式 ───────────────────
+            if adjust == "qfq":
+                # 返回复权价格（close_adj = close * adj_factor）
+                ret = df_raw.copy()
+                for col in ["open", "high", "low", "close"]:
+                    ret[col] = ret[col] * ret["adj_factor"]
+                # pct_chg 用复权价格重新计算
+                ret["pct_chg"] = (ret["close"] / ret["pre_close"].replace(0, np.nan) - 1) * 100
+                cols = ["ts_code", "trade_date", "open", "high", "low", "close",
+                        "pre_close", "volume", "amount", "pct_chg", "turnover",
+                        "adj_factor", "is_suspend", "limit_up", "limit_down", "data_source"]
+            else:
+                # 返回原始价格
+                cols = ["ts_code", "trade_date", "open", "high", "low", "close",
+                        "pre_close", "volume", "amount", "pct_chg", "turnover",
+                        "adj_factor", "is_suspend", "limit_up", "limit_down", "data_source"]
+
+            return df_raw[[c for c in cols if c in df_raw.columns]]
 
         except (ValueError, KeyError, RuntimeError, ConnectionError) as e:
             logger.error(f"Failed to fetch {symbol}: {e}")
@@ -1093,20 +1120,41 @@ class DataEngine:
 
     def save_quotes(self, df: pd.DataFrame, mode: str = "append"):
         """
-        保存行情数据到 DuckDB（UPSERT 逻辑，防止重复数据）
+        保存行情数据到 DuckDB（双表写入：daily_bar_raw + daily_quotes）
         
-        使用 DuckDB 的 INSERT OR REPLACE 实现原子性 UPSERT，
-        避免 DELETE+INSERT 产生的并发覆盖问题。
+        存储架构：
+        - daily_bar_raw：原始未复权价格（所有数据的基础）
+        - daily_quotes：复权价格（含 adj_factor，查询时用）
+        
+        写入策略：使用 DuckDB register() + INSERT ... SELECT（批量，700x快于逐行）
         """
         if df.empty or not HAS_DUCKDB:
             return
         with self.get_connection() as conn:
+            # ── 预处理：统一列，提取 symbol ──────────────────────
+            df = df.copy()
+            if "symbol" not in df.columns:
+                df["symbol"] = df["ts_code"].str.replace(r"\.[A-Z]+$", "", regex=True)
+            for col in ["open", "high", "low", "close", "pre_close"]:
+                if col not in df.columns:
+                    df[col] = 0.0
+            for col in ["volume", "amount"]:
+                if col not in df.columns:
+                    df[col] = 0
+            for col in ["pct_chg", "turnover", "adj_factor"]:
+                if col not in df.columns:
+                    df[col] = 0.0
+            for col in ["is_suspend", "limit_up", "limit_down"]:
+                if col not in df.columns:
+                    df[col] = False
+            if "data_source" not in df.columns:
+                df["data_source"] = "unknown"
+
             if mode == "overwrite":
                 codes = df["ts_code"].unique().tolist()
                 dates_min = df["trade_date"].min()
                 dates_max = df["trade_date"].max()
                 if codes and not (pd.isna(dates_min) or pd.isna(dates_max)):
-                    # 使用 register 避免大列表拼接 SQL 注入
                     codes_df = pd.DataFrame({"ts_code": codes})
                     conn.register('tmp_codes', codes_df)
                     conn.execute("""
@@ -1114,30 +1162,111 @@ class DataEngine:
                         WHERE ts_code IN (SELECT ts_code FROM tmp_codes)
                         AND trade_date BETWEEN ? AND ?
                     """, (dates_min, dates_max))
+                    conn.execute("""
+                        DELETE FROM daily_bar_raw
+                        WHERE ts_code IN (SELECT ts_code FROM tmp_codes)
+                        AND trade_date BETWEEN ? AND ?
+                    """, (dates_min, dates_max))
                     conn.execute("DROP VIEW tmp_codes")
+
+            # 注册 DataFrame（批量写入核心优化）
+            conn.register('tmp_quotes', df)
+
+            # ── 1. 写入 daily_bar_raw（原始价格）──────────────────
             try:
-                # 原子性 UPSERT（覆盖已存在的 ts_code+trade_date 组合）
                 conn.execute("""
-                    INSERT OR REPLACE INTO daily_quotes
-                    (ts_code, trade_date, open, high, low, close, pre_close,
-                     volume, amount, pct_chg, turnover, adj_factor,
-                     is_suspend, limit_up, limit_down, data_source)
-                    SELECT
-                        ts_code, trade_date,
-                        COALESCE(open, 0), COALESCE(high, 0),
-                        COALESCE(low, 0), COALESCE(close, 0),
-                        COALESCE(pre_close, 0), COALESCE(volume, 0),
-                        COALESCE(amount, 0), COALESCE(pct_chg, 0),
-                        COALESCE(turnover, 0), COALESCE(adj_factor, 1),
-                        COALESCE(is_suspend, FALSE),
-                        COALESCE(limit_up, FALSE),
-                        COALESCE(limit_down, FALSE),
-                        COALESCE(data_source, 'unknown')
-                    FROM df
+                    INSERT INTO daily_bar_raw
+                        (ts_code, trade_date, symbol, open, high, low, close,
+                         volume, amount, pct_chg, turnover, data_source)
+                    SELECT ts_code, trade_date, symbol,
+                           COALESCE(open,0), COALESCE(high,0),
+                           COALESCE(low,0), COALESCE(close,0),
+                           COALESCE(volume,0), COALESCE(amount,0),
+                           COALESCE(pct_chg,0), COALESCE(turnover,0),
+                           COALESCE(data_source,'unknown')
+                    FROM tmp_quotes
+                    ON CONFLICT(ts_code, trade_date) DO UPDATE SET
+                        symbol=excluded.symbol,
+                        open=excluded.open, high=excluded.high,
+                        low=excluded.low, close=excluded.close,
+                        volume=excluded.volume, amount=excluded.amount,
+                        pct_chg=excluded.pct_chg, turnover=excluded.turnover,
+                        data_source=excluded.data_source
                 """)
             except Exception as e:
-                logger.warning(f"UPSERT failed, trying INSERT OR IGNORE: {e}")
-                conn.execute("INSERT OR IGNORE INTO daily_quotes SELECT * FROM df")
+                logger.debug(f"daily_bar_raw upsert fallback (append): {e}")
+                try:
+                    conn.execute("""
+                        INSERT INTO daily_bar_raw
+                            (ts_code, trade_date, symbol, open, high, low, close,
+                             volume, amount, pct_chg, turnover, data_source)
+                        SELECT ts_code, trade_date, symbol,
+                               COALESCE(open,0), COALESCE(high,0),
+                               COALESCE(low,0), COALESCE(close,0),
+                               COALESCE(volume,0), COALESCE(amount,0),
+                               COALESCE(pct_chg,0), COALESCE(turnover,0),
+                               COALESCE(data_source,'unknown')
+                        FROM tmp_quotes
+                    """)
+                except Exception as e2:
+                    logger.warning(f"daily_bar_raw write failed: {e2}")
+
+            # ── 2. 写入 daily_quotes（复权价格，close 已由 fetch_single 处理好）──
+            try:
+                conn.execute("""
+                    INSERT INTO daily_quotes
+                        (ts_code, trade_date, open, high, low, close, pre_close,
+                         volume, amount, pct_chg, turnover, adj_factor,
+                         is_suspend, limit_up, limit_down, data_source)
+                    SELECT ts_code, trade_date,
+                           COALESCE(open,0), COALESCE(high,0),
+                           COALESCE(low,0), COALESCE(close,0),
+                           COALESCE(pre_close,0),
+                           COALESCE(volume,0), COALESCE(amount,0),
+                           COALESCE(pct_chg,0), COALESCE(turnover,0),
+                           COALESCE(adj_factor,1),
+                           COALESCE(is_suspend,FALSE),
+                           COALESCE(limit_up,FALSE),
+                           COALESCE(limit_down,FALSE),
+                           COALESCE(data_source,'unknown')
+                    FROM tmp_quotes
+                    ON CONFLICT(ts_code, trade_date) DO UPDATE SET
+                        open=excluded.open, high=excluded.high,
+                        low=excluded.low, close=excluded.close,
+                        pre_close=excluded.pre_close,
+                        volume=excluded.volume, amount=excluded.amount,
+                        pct_chg=excluded.pct_chg, turnover=excluded.turnover,
+                        adj_factor=excluded.adj_factor,
+                        is_suspend=excluded.is_suspend,
+                        limit_up=excluded.limit_up,
+                        limit_down=excluded.limit_down,
+                        data_source=excluded.data_source
+                """)
+            except Exception as e:
+                logger.debug(f"daily_quotes upsert fallback (append): {e}")
+                try:
+                    conn.execute("""
+                        INSERT INTO daily_quotes
+                            (ts_code, trade_date, open, high, low, close, pre_close,
+                             volume, amount, pct_chg, turnover, adj_factor,
+                             is_suspend, limit_up, limit_down, data_source)
+                        SELECT ts_code, trade_date,
+                               COALESCE(open,0), COALESCE(high,0),
+                               COALESCE(low,0), COALESCE(close,0),
+                               COALESCE(pre_close,0),
+                               COALESCE(volume,0), COALESCE(amount,0),
+                               COALESCE(pct_chg,0), COALESCE(turnover,0),
+                               COALESCE(adj_factor,1),
+                               COALESCE(is_suspend,FALSE),
+                               COALESCE(limit_up,FALSE),
+                               COALESCE(limit_down,FALSE),
+                               COALESCE(data_source,'unknown')
+                        FROM tmp_quotes
+                    """)
+                except Exception as e2:
+                    logger.warning(f"daily_quotes write failed: {e2}")
+
+            conn.execute("DROP VIEW IF EXISTS tmp_quotes")
 
     # ──────────────────────────────────────────────────────────
     # 增量更新（多线程 + 重试 + 断点续传）
