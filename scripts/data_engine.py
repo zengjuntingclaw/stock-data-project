@@ -72,40 +72,25 @@ except ImportError:
 # ──────────────────────────────────────────────────────────────
 
 def detect_board(symbol: str) -> str:
-    """根据股票代码识别板块（统一实现，供所有模块复用）
-    
-    科创板(688xxx): 科创板, 创业板(30xxxx): 创业板,
-    北交所(8xxxxx/4xxxxx): 北交所, 其余: 主板
+    """根据股票代码识别板块
+
+    统一委托给 exchange_mapping.classify_exchange()，禁止自行实现。
+    确保 920xxx（北交所2024新代码）、4xxxxx、8xxxxx 全部正确识别。
     """
-    import re
-    s = str(symbol).zfill(6)
-    if re.match(r'^688[0-9]{3}$', s):
-        return '科创板'
-    elif re.match(r'^30[0-9]{4}$', s):
-        return '创业板'
-    elif re.match(r'^8[0-9]{5}$', s) or re.match(r'^4[0-9]{5}$', s):
-        return '北交所'
-    else:
-        return '主板'
+    from scripts.exchange_mapping import classify_exchange
+    _, board = classify_exchange(symbol)
+    return board
 
 
 def detect_limit(code: str) -> float:
     """根据股票代码返回涨跌停幅度（基础版，仅用于数据验证）
-    
-    注意：这是简化版，不含时间维度。
-    完整涨跌停逻辑请使用 AShareTradingRules.get_price_limit()
-    
-    科创板(688): 20%, 创业板(30): 20%, 北交所(4/8): 30%, 主板: 10%
+
+    统一委托给 exchange_mapping.get_price_limit_pct()，禁止自行实现。
+    注意：这是简化版（不含时间维度）。完整涨跌停逻辑请用 AShareTradingRules。
+    科创板(688): 20%, 创业板(30): 20%, 北交所(4/8/920): 30%, 主板: 10%
     """
-    c = str(code).zfill(6)
-    if c.startswith("688"):
-        return 0.20
-    elif c.startswith("30"):
-        return 0.20
-    elif c.startswith("4") or c.startswith("8"):
-        return 0.30
-    else:
-        return 0.10
+    from scripts.exchange_mapping import get_price_limit_pct
+    return get_price_limit_pct(code)
 
 
 def build_ts_code(symbol: str) -> str:
