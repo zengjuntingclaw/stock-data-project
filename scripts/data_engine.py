@@ -2419,6 +2419,8 @@ class DataEngine:
         codes_df = pd.DataFrame({"ts_code": ts_codes})
         with self.get_connection() as conn:
             conn.register('tmp_batch_codes', codes_df)
+            # 注意：daily_quotes.close = AkShare前复权价（adj_factor=1.0时close本身已是复权价）
+            # daily_bar_raw.close = 原始未复权价，供未来动态复权使用
             df = conn.execute("""
                 SELECT d.ts_code, d.trade_date, d.open, d.high, d.low, d.close,
                        d.volume, d.amount, d.pct_chg, d.pre_close,
