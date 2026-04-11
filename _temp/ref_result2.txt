@@ -1,0 +1,61 @@
+港股Data files: ['港股分钟行情.md', '港股列表.md', '港股日线行情.md']
+A股行情 files: ['历史分钟.md', '历史日线.md', '周月线复权行情(每日更新).md', '周月线行情(每日更新).md', '周线行情.md', '备用行情.md', '复权因子.md', '复权行情.md', '实时Tick（爬虫）.md', '实时分钟.md', '实时成交（爬虫）.md', '实时排名（爬虫）.md', '实时日线.md', '月线行情.md', '每日停复牌信息.md', '每日指标.md', '每日涨跌停价格.md', '沪深股通十大成交股.md', '港股通十大成交股.md', '港股通每日成交统计.md', '港股通每月成交统计.md', '通用行情接口.md']
+
+=== 港股日线行情.md ===
+# 港股日线行情
+
+> 接口：`hk_daily` | 获取港股日线行情数据，每日18时左右更新
+
+## 请求参数
+
+| 参数 | 类型 | 必选 | 说明 |
+|------|------|------|------|
+| ts_code | str | N | 股票代码 |
+| trade_date | str | N | 交易日期 |
+| start_date | str | N | 开始日期 |
+| end_date | str | N | 结束日期 |
+
+## 返回字段
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| ts_code | str | 股票代码 |
+| trade_date | str | 交易日期 |
+| open | float | 开盘价 |
+| high | float | 最高价 |
+| low | float | 最低价 |
+| close | float | 收盘价 |
+| pre_close | float | 昨收价 |
+| change | float | 涨跌额 |
+| pct_chg | float | 涨跌幅（%） |
+| vol | float | 成交量（股） |
+| amount | float | 成交金额（元） |
+
+## 调用示例
+
+```bash
+curl -X POST https://www.codebuddy.cn/v2/tool/financedata \
+  -H "Content-Type: application/json" \
+  -d '{
+    "api_name": "hk_daily",
+    "params": {"ts_code": "00700.HK", "start_date": "20250201", "end_date": "20250228"},
+    "fields": "ts_code,trade_date,open,high,low,close,pct_chg,vol,amount"
+  }'
+```
+
+## 返回示例
+
+```json
+{
+  "code": 0,
+  "msg": "",
+  "data": {
+    "fields": ["ts_code", "trade_date", "open", "high", "low", "close", "pre_close", "change", "pct_chg", "vol", "amount"],
+    "items": [
+      ["00700.HK", "20250228", 492.8, 497.8, 476.0, 478.6, 495.4, -16.8, -3.39, 52160819.0, 25187448106.61],
+      ["00700.HK", "20250227", 503.5, 512.0, 491.6, 495.4, 501.5, -6.1, -1.22, 38902820.0, 19434077170.407],
+      ["00700.HK", "20250226", 488.0, 508.0, 487.8, 501.5, 484.8, 16.7, 3.44, 40489654.0, 20234072819.205]
+    ]
+  }
+}
+```
