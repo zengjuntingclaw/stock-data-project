@@ -53,11 +53,24 @@ refactor: 补全标准化schema + 修复模块导入路径
 标准化表结构已固化到 schema 文件：
 - `stock_basic_history` - PIT 股票主数据
 - `daily_bar_raw` - 原始行情（不复权）
-- `daily_bar_adjusted` - 复权行情（含 adj_factor）
+- `daily_bar_adjusted` - 复权行情（含 adj_factor + qfq/hfq 字段）
 - `index_constituents_history` - 指数成分历史（区间型）
 - `sync_progress` - 增量同步进度
 - `data_quality_alert` - 数据质量告警
 - 旧表 `stock_basic/daily_quotes/index_constituents` 已标注废弃
+
+## Schema Refactoring v3 (2026-04-11 19:55)
+
+### Commit: 5b00ff6
+```
+refactor: 收口旧口径 - 补全复权价格、可配置起始日期、废弃 get_all_stocks
+```
+
+### 核心收口完成
+1. **daily_bar_adjusted 复权字段**: qfq_open/high/low/close + hfq_open/high/low/close 共 8 个字段
+2. **历史数据回填**: 1,408,552 条记录 qfq_close 100% 填充
+3. **DEFAULT_START_DATE 可配置**: DataEngine(start_date='2020-01-01') 或环境变量 STOCK_START_DATE
+4. **get_all_stocks() 已废弃**: 标记为 [废弃]，主流程使用 get_active_stocks(trade_date) PIT 查询
 
 ### Import Path Fix
 - `data_engine.py`: data_validator 导入兼容
