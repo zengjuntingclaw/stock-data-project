@@ -112,7 +112,10 @@ def build_ts_code(symbol: str) -> str:
 # ──────────────────────────────────────────────────────────────
 # 数据验证器（已拆分到 data_validator.py，保留向后兼容导入）
 # ──────────────────────────────────────────────────────────────
-from scripts.data_validator import DataValidator
+try:
+    from scripts.data_validator import DataValidator
+except ModuleNotFoundError:
+    from data_validator import DataValidator
 
 
 # ──────────────────────────────────────────────────────────────

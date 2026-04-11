@@ -12,7 +12,10 @@ def _get_now() -> _dt:
     """获取当前时间（支持单测 mock）。"""
     return _dt.now()
 
-from scripts.data_engine import DEFAULT_ADJ_TOLERANCE, DEFAULT_SAMPLE_RATIO
+try:
+    from scripts.data_engine import DEFAULT_ADJ_TOLERANCE, DEFAULT_SAMPLE_RATIO
+except (ModuleNotFoundError, ImportError):
+    from data_engine import DEFAULT_ADJ_TOLERANCE, DEFAULT_SAMPLE_RATIO
 
 
 def _detect_limit(code: str) -> float:

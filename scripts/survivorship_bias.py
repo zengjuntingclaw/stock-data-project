@@ -21,7 +21,10 @@ import threading
 from loguru import logger
 
 # 复用 data_engine.py 中的统一交易所映射函数（避免代码重复）
-from scripts.data_engine import build_ts_code
+try:
+    from scripts.data_engine import build_ts_code
+except ModuleNotFoundError:
+    from data_engine import build_ts_code
 
 # Baostock 全局会话锁（Baostock 不支持并发，全局单会话）
 _BS_LOCK = threading.Lock()
@@ -315,7 +318,10 @@ class SurvivorshipBiasHandler:
         
         # 尝试从数据库获取最后交易状态
         try:
-            from scripts.data_engine import DataEngine
+            try:
+                from scripts.data_engine import DataEngine
+            except ModuleNotFoundError:
+                from data_engine import DataEngine
             engine = DataEngine()
             
             # 获取退市前最后5个交易日的数据
@@ -419,7 +425,10 @@ class SurvivorshipBiasHandler:
     
     def _detect_board(self, symbol: str) -> str:
         """识别板块（委托到公共函数）"""
-        from scripts.data_engine import detect_board
+        try:
+            from scripts.data_engine import detect_board
+        except ModuleNotFoundError:
+            from data_engine import detect_board
         return detect_board(symbol)
     
     def get_universe(
