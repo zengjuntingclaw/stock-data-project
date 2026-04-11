@@ -40,6 +40,29 @@ All date parameters use `YYYY-MM-DD` format (e.g., `'2024-01-01'`)
 - PowerShell output may be wrapped in CLIXML format - read files directly for clean output
 - Unit tests: 33 tests, all passing
 - Auto-commit 习惯: 完成任务后主动提交和 push，不需要用户每次提醒
+- 模块导入路径: 使用 `try: from scripts.xxx import yyy except: from xxx import yyy` 兼容相对/绝对导入
+
+## Schema Refactoring v2 (2026-04-11 19:31)
+
+### Commit: ac5796e
+```
+refactor: 补全标准化schema + 修复模块导入路径
+```
+
+### stock_history_schema.sql v2.0
+标准化表结构已固化到 schema 文件：
+- `stock_basic_history` - PIT 股票主数据
+- `daily_bar_raw` - 原始行情（不复权）
+- `daily_bar_adjusted` - 复权行情（含 adj_factor）
+- `index_constituents_history` - 指数成分历史（区间型）
+- `sync_progress` - 增量同步进度
+- `data_quality_alert` - 数据质量告警
+- 旧表 `stock_basic/daily_quotes/index_constituents` 已标注废弃
+
+### Import Path Fix
+- `data_engine.py`: data_validator 导入兼容
+- `data_validator.py`: data_engine 常量导入兼容
+- `survivorship_bias.py`: data_engine 函数导入兼容
 
 ## Critical Bug Fix (2026-04-11 下午)
 ### Commit: 3761df1
