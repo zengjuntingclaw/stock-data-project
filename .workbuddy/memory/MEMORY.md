@@ -59,6 +59,27 @@ refactor: 补全标准化schema + 修复模块导入路径
 - `data_quality_alert` - 数据质量告警
 - 旧表 `stock_basic/daily_quotes/index_constituents` 已标注废弃
 
+## Schema Refactoring v4 (2026-04-11 20:12)
+
+### Commit: 57c2dc4
+```
+refactor: 彻底移除旧口径 - 新增_fetch_remote_stocks/收紧get_all_stocks/修复security_master
+```
+
+### 核心收口完成
+1. **新增 `_fetch_remote_stocks()`**: 封装 AkShare 远程获取，内部不再静默回退到 `_get_local_stocks()`
+2. **`get_all_stocks()` 彻底移除静默回退**: 远程获取失败时直接抛出 RuntimeError
+3. **`save_stock_basic_snapshot()`**: 改用 `_fetch_remote_stocks()` 直接获取
+4. **`sync_stock_list()`**: 改用 `_fetch_remote_stocks()`，远程失败时抛出 RuntimeError
+5. **`security_master.py`**: 改用 `get_active_stocks(today)`，不再依赖废弃的 `get_all_stocks()`
+
+### 主流程调用链（已验证）
+```
+SurvivorshipBiasHandler.get_universe(date)
+  └── de.get_active_stocks(date)  [PIT ✅]
+        └── stock_basic_history (JOIN eff_date <= trade_date)
+```
+
 ## Schema Refactoring v3 (2026-04-11 19:55)
 
 ### Commit: 5b00ff6
