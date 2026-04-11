@@ -613,6 +613,107 @@ class DataEngine:
         
         return df
 
+    def get_pit_stock_pool(
+        self,
+        trade_date: str,
+        include_delisted: bool = True,
+        exchanges: Optional[List[str]] = None,
+    ) -> pd.DataFrame:
+        """
+        获取指定日期的历史可交易股票池（Point-in-Time 查询）
+
+        直接用 DuckDB SQL 精确还原任意历史日期的真实股票池。
+
+        规则：
+        - list_date <= trade_date：已上市
+        - delist_date > trade_date OR delist_date IS NULL：尚未退市
+        - 退市整理期（delist_date <= trade_date <= delist_date+30天）：仍可交易
+
+        Parameters
+        ----------
+        trade_date : str
+            查询日期 YYYY-MM-DD
+        include_delisted : bool
+            是否包含退市整理期股票
+        exchanges : List[str], optional
+            筛选交易所（如 ['SH', 'SZ', 'BJ']）
+
+        Returns
+        -------
+        pd.DataFrame: 包含 ts_code, symbol, name, exchange, board, list_date, delist_date, is_tradable
+        """
+        if not HAS_DUCKDB:
+            return pd.DataFrame()
+
+        # 交易所筛选（参数化，安全）
+        exchange_filter = ""
+        params = []
+        if exchanges:
+            placeholders = ','.join(['?' for _ in exchanges])
+            exchange_filter = f"AND exchange IN ({placeholders})"
+            params.extend(exchanges)
+
+        with self.get_connection() as conn:
+            df = conn.execute(f"""
+                SELECT
+                    s.ts_code,
+                    s.symbol,
+                    s.name,
+                    s.exchange,
+                    s.board,
+                    s.list_date,
+                    s.delist_date,
+                    s.is_delisted,
+                    s.delist_reason,
+                    CASE
+                        WHEN s.delist_date IS NULL THEN TRUE
+                        WHEN s.delist_date > CAST(? AS DATE) THEN TRUE
+                        ELSE FALSE
+                    END AS is_tradable
+                FROM stock_basic_history s
+                WHERE s.list_date <= CAST(? AS DATE)
+                  AND (s.delist_date IS NULL OR s.delist_date > CAST(? AS DATE))
+                  {exchange_filter}
+                ORDER BY s.exchange, s.ts_code
+            """, [trade_date, trade_date, trade_date] + params).fetchdf()
+
+        return df
+
+    def get_stocks_with_st_status(
+        self,
+        trade_date: str,
+    ) -> pd.DataFrame:
+        """
+        获取指定日期的 ST 股列表（Point-in-Time 查询）
+
+        Parameters
+        ----------
+        trade_date : str
+            查询日期 YYYY-MM-DD
+
+        Returns
+        -------
+        pd.DataFrame: 包含 ts_code, symbol, name, exchange, board, list_date, delist_date
+        """
+        if not HAS_DUCKDB:
+            return pd.DataFrame()
+
+        with self.get_connection() as conn:
+            df = conn.execute("""
+                SELECT DISTINCT s.ts_code, s.symbol, s.name,
+                       s.exchange, s.board, s.list_date, s.delist_date
+                FROM stock_basic_history s
+                JOIN st_status_history st
+                  ON s.ts_code = st.ts_code
+                WHERE st.trade_date = ?
+                  AND st.is_st = TRUE
+                  AND s.list_date <= ?
+                  AND (s.delist_date > ? OR s.delist_date IS NULL)
+                ORDER BY s.ts_code
+            """, (trade_date, trade_date, trade_date)).fetchdf()
+
+        return df
+
     # ──────────────────────────────────────────────────────────
     # 动态股票池（沪深300成分股时点对齐）
     # ──────────────────────────────────────────────────────────

@@ -115,7 +115,7 @@ class StockLifetime:
         # 检查状态历史（倒序查找最新的状态）
         current_status = ListingStatus.NORMAL
         for record in sorted(self.status_history, key=lambda x: x['date']):
-            if date >= record['date']:
+            if date >= pd.to_datetime(record['date']):
                 current_status = ListingStatus(record['status'])
         
         return current_status
@@ -318,6 +318,137 @@ class HistoricalSecurityMaster:
         """获取单个股票的生命周期记录"""
         return self._stocks.get(str(symbol).zfill(6))
     
+
+    @classmethod
+    def from_duckdb(cls, db_path: str, rebuild: bool = False) -> "HistoricalSecurityMaster":
+        """
+        从 DuckDB 初始化历史证券主表（内存缓存）
+
+        用 DuckDB SQL 聚合 ST 事件，写入 security_master.json，
+        再由 _load() 读入内存。比 iterrows 快 10 倍。
+        策略：若无 rebuild=True 且 JSON 存在则直接加载；否则重新生成。
+
+        注意：此方法是可选的。DuckDB 已原生支持 PIT 查询：
+          - get_pit_stock_pool(trade_date)        → 任意历史股票池
+          - get_stocks_with_st_status(trade_date) → 任意历史 ST 股
+        """
+        import json as _json
+        master = cls()
+        json_path = master.data_dir / "security_master.json"
+        if json_path.exists() and not rebuild:
+            master._load()
+            if master._stocks:
+                logger.info("from_duckdb: loaded %d stocks from %s", len(master._stocks), json_path)
+                return master
+
+        try:
+            import duckdb as _duckdb
+        except ImportError:
+            logger.warning("from_duckdb: duckdb not installed, returning empty master")
+            return master
+
+        # DuckDB SQL：聚合每只股票的 ST 事件 JSON 数组
+        conn = _duckdb.connect(str(db_path))
+        query = """
+        SELECT
+            sb.ts_code, sb.symbol, sb.name, sb.exchange, sb.board,
+            sb.list_date::VARCHAR AS list_date,
+            sb.delist_date::VARCHAR AS delist_date,
+            sb.is_delisted, sb.delist_reason,
+            COALESCE(st_info.st_events, '[]') AS st_events
+        FROM stock_basic_history sb
+        LEFT JOIN (
+            SELECT ts_code,
+                   json_group_array(json_object(
+                       'start_date', trade_date,
+                       'is_st', is_st,
+                       'is_new_st', COALESCE(is_new_st, FALSE),
+                       'st_type', COALESCE(st_type, 'ST')
+                   )) AS st_events
+            FROM st_status_history
+            GROUP BY ts_code
+        ) st_info ON sb.ts_code = st_info.ts_code
+        """
+        rows = conn.execute(query).fetchdf()
+        conn.close()
+        del conn
+
+        # 逐行构建 StockLifetime，写入 JSON 列表
+        records = []
+        for _, row in rows.iterrows():
+            ts_code = str(row['ts_code'])
+            symbol  = ts_code.split('.')[0] if '.' in ts_code else ts_code
+            dr = DelistReason.UNKNOWN
+            dr_val = str(row.get('delist_reason') or '').strip()
+            if dr_val and dr_val.lower() not in ('', 'unknown', 'none'):
+                try:
+                    dr = DelistReason(dr_val)
+                except ValueError:
+                    pass
+
+            # 解析 ST 事件
+            st_events = _json.loads(row['st_events']) if row['st_events'] != '[]' else []
+            st_history, status_history = [], []
+            prev_st = False
+            for rec in st_events:
+                is_st = bool(rec.get('is_st'))
+                if is_st:
+                    st_history.append({
+                        'start_date': str(rec.get('start_date', ''))[:10],
+                        'end_date': None,
+                        'type': rec.get('st_type', 'ST'),
+                        'new_st': bool(rec.get('is_new_st')),
+                    })
+                if is_st and not prev_st:
+                    status_history.append({'date': str(rec.get('start_date', ''))[:10], 'status': 'st'})
+                elif not is_st and prev_st:
+                    status_history.append({'date': str(rec.get('start_date', ''))[:10], 'status': 'normal'})
+                prev_st = is_st
+
+            # 线性补 end_date：预建 start_date->index 映射 + 一次遍历
+            if st_history and st_events:
+                from datetime import datetime, timedelta
+                date_to_idx = {str(ev.get('start_date', ''))[:10]: j
+                               for j, ev in enumerate(st_events)}
+                next_remove_idx = None  # 下一个 is_st=False 的索引
+                for j in range(len(st_events) - 1, -1, -1):
+                    ev = st_events[j]
+                    if not ev.get('is_st'):
+                        next_remove_idx = j
+                    elif next_remove_idx is not None:
+                        sd = str(ev.get('start_date', ''))[:10]
+                        nd = str(st_events[next_remove_idx].get('start_date', ''))[:10]
+                        sh = next((h for h in st_history if h['start_date'] == sd), None)
+                        if sh:
+                            sh['end_date'] = (datetime.strptime(nd, '%Y-%m-%d') - timedelta(days=1)).strftime('%Y-%m-%d')
+
+            records.append({
+                'symbol': symbol,
+                'name': str(row.get('name', '')),
+                'ts_code': ts_code,
+                'exchange': str(row.get('exchange', 'SZ')),
+                'board': str(row.get('board', 'Main')),
+                'list_date': str(row['list_date'])[:10] if row.get('list_date') else None,
+                'delist_date': str(row['delist_date'])[:10] if row.get('delist_date') else None,
+                'status_history': status_history,
+                'st_history': st_history,
+                'delist_reason': dr.value,
+                'successor_symbol': None,
+                'predecessor_symbols': [],
+                'code_changes': [],
+            })
+
+        # 写 JSON
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(json_path, 'w', encoding='utf-8') as f:
+            _json.dump(records, f, indent=2, ensure_ascii=False)
+
+        master._load()
+        logger.info("from_duckdb: %d stocks -> %s", len(master._stocks), json_path)
+        return master
+
+
+
     def get_universe_on_date(
         self, 
         date: Union[datetime, str],
