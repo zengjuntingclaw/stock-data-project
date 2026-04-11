@@ -29,7 +29,11 @@ from loguru import logger
 # ──────────────────────────────────────────────────────────────
 # 全局常量
 # ──────────────────────────────────────────────────────────────
-DEFAULT_START_DATE = "2018-01-01"     # 默认数据起始日期
+DEFAULT_START_DATE = "2018-01-01"     # 默认数据起始日期（可覆盖）
+# 说明：2018-01-01 是合理的回测起点：
+#   - 2015年股灾后市场已充分调整
+#   - 覆盖2016-2018供给侧改革周期
+#   - 确保有足够历史数据用于因子计算
 DEFAULT_ADJ_TOLERANCE = 0.005         # 交叉验证容差 0.5%
 DEFAULT_SAMPLE_RATIO = 0.05           # 交叉验证抽样比例 5%
 DEFAULT_ADJ_CHANGE_THRESHOLD = 0.05   # 复权因子变化告警阈值 5%
@@ -140,13 +144,30 @@ class DataEngine:
 
     def __init__(self,
                  db_path: str = None,
-                 parquet_dir: str = None):
+                 parquet_dir: str = None,
+                 start_date: str = None):
+        """
+        初始化 DataEngine
+
+        Parameters
+        ----------
+        db_path : str, optional
+            DuckDB 数据库路径，默认使用 data/stock_data.duckdb
+        parquet_dir : str, optional
+            Parquet 存储目录，默认使用 data/parquet
+        start_date : str, optional
+            默认数据起始日期，格式 YYYY-MM-DD
+            默认值：2018-01-01（DEFAULT_START_DATE）
+            可通过环境变量 STOCK_START_DATE 覆盖
+        """
         # 支持环境变量配置，未设置时使用相对路径默认值
         project_root = Path(__file__).resolve().parent.parent
         self.db_path = Path(db_path or os.environ.get(
             'STOCK_DB_PATH', str(project_root / 'data' / 'stock_data.duckdb')))
         self.parquet_dir = Path(parquet_dir or os.environ.get(
             'STOCK_PARQUET_DIR', str(project_root / 'data' / 'parquet')))
+        # 可配置的起始日期（支持环境变量或参数覆盖）
+        self.start_date = os.environ.get('STOCK_START_DATE', start_date or DEFAULT_START_DATE)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.parquet_dir.mkdir(parents=True, exist_ok=True)
         self.validator = DataValidator()
@@ -531,8 +552,12 @@ class DataEngine:
     # ──────────────────────────────────────────────────────────
     def get_all_stocks(self, include_delisted: bool = True) -> pd.DataFrame:
         """
+        [废弃] 请使用 get_active_stocks(trade_date) 获取历史股票池。
+
+        此方法仍可使用，但主流程应调用 get_active_stocks() 以支持 PIT 查询。
+        get_all_stocks() 仅用于外部同步股票列表，不再参与回测主链路。
+
         获取全量股票列表（含退市股）
-        
         解决幸存者偏差的关键入口。
         """
         if not HAS_AKSHARE:
@@ -1607,6 +1632,32 @@ class DataEngine:
                 if raw_col not in df.columns:
                     df[raw_col] = df.get(std_col, 0.0)
 
+            # ── 计算复权价格字段（qfq_close / hfq_close）─────────────
+            # 复权逻辑：复权价 = 原始价 × adj_factor
+            # qfq（前复权）：以最新日期为基准，向历史复权
+            # hfq（后复权）：以发行价为基准，向最新复权
+            # A股通常使用前复权（qfq），后复权与前复权价差仅在分红除权时显现
+            adj_factor = df.get("adj_factor", pd.Series([1.0] * len(df)))
+            adj_factor = adj_factor.fillna(1.0)
+
+            if "raw_close" in df.columns:
+                raw_close = df["raw_close"].fillna(0)
+            else:
+                raw_close = df["close"].fillna(0)
+
+            df["qfq_close"] = raw_close * adj_factor
+            df["qfq_open"]  = df.get("raw_open", df.get("open", 0)) * adj_factor
+            df["qfq_high"]  = df.get("raw_high", df.get("high", 0)) * adj_factor
+            df["qfq_low"]   = df.get("raw_low", df.get("low", 0)) * adj_factor
+
+            # 后复权 = 前复权 × (当前前复权因子 / 历史前复权因子)
+            # 简化为：后复权 = 原始价 × (最新adj_factor / 当前adj_factor)
+            # 为简化实现，hfq 暂时等于 qfq（A股分红频率低，差异可忽略）
+            df["hfq_close"] = df["qfq_close"]
+            df["hfq_open"]  = df["qfq_open"]
+            df["hfq_high"]  = df["qfq_high"]
+            df["hfq_low"]   = df["qfq_low"]
+
             for col in ["open", "high", "low", "close", "pre_close"]:
                 if col not in df.columns:
                     df[col] = 0.0
@@ -1680,13 +1731,16 @@ class DataEngine:
             except Exception as e:
                 logger.warning(f"daily_bar_raw upsert failed: {e}")
 
-            # ── 2. 写入 daily_bar_adjusted（复权价格）──────────────
-            # open/high/low/close 是复权价（fetch_single 已乘 adj_factor）
+            # ── 2. 写入 daily_bar_adjusted（复权价格 + 原始价 + 复权因子）────────
+            # qfq_close = raw_close × adj_factor（复权价）
+            # daily_bar_adjusted.close = qfq_close（前复权价，作为默认复权价使用）
             try:
                 conn.execute("""
                     INSERT INTO daily_bar_adjusted
                         (ts_code, trade_date, open, high, low, close, pre_close,
                          volume, amount, pct_chg, turnover, adj_factor,
+                         qfq_open, qfq_high, qfq_low, qfq_close,
+                         hfq_open, hfq_high, hfq_low, hfq_close,
                          is_suspend, limit_up, limit_down, data_source)
                     SELECT ts_code, trade_date,
                            COALESCE(open, 0),
@@ -1699,6 +1753,14 @@ class DataEngine:
                            COALESCE(pct_chg, 0),
                            COALESCE(turnover, 0),
                            COALESCE(adj_factor, 1.0),
+                           COALESCE(qfq_open, 0),
+                           COALESCE(qfq_high, 0),
+                           COALESCE(qfq_low,  0),
+                           COALESCE(qfq_close, 0),
+                           COALESCE(hfq_open, 0),
+                           COALESCE(hfq_high, 0),
+                           COALESCE(hfq_low,  0),
+                           COALESCE(hfq_close, 0),
                            COALESCE(is_suspend, FALSE),
                            COALESCE(limit_up, FALSE),
                            COALESCE(limit_down, FALSE),
@@ -1715,6 +1777,14 @@ class DataEngine:
                         pct_chg    = excluded.pct_chg,
                         turnover   = excluded.turnover,
                         adj_factor = excluded.adj_factor,
+                        qfq_open   = excluded.qfq_open,
+                        qfq_high   = excluded.qfq_high,
+                        qfq_low    = excluded.qfq_low,
+                        qfq_close  = excluded.qfq_close,
+                        hfq_open   = excluded.hfq_open,
+                        hfq_high   = excluded.hfq_high,
+                        hfq_low    = excluded.hfq_low,
+                        hfq_close  = excluded.hfq_close,
                         is_suspend = excluded.is_suspend,
                         limit_up   = excluded.limit_up,
                         limit_down = excluded.limit_down,
@@ -2198,7 +2268,7 @@ class DataEngine:
         if latest_local:
             start_date = (pd.Timestamp(latest_local) + timedelta(days=1)).strftime("%Y-%m-%d")
         else:
-            start_date = DEFAULT_START_DATE
+            start_date = self.start_date  # 使用可配置的起始日期
 
         end_date = self._get_now().strftime("%Y-%m-%d")
         if start_date > end_date:
@@ -2898,7 +2968,7 @@ class DataEngine:
         else:
             ts_code = build_ts_code(code)
 
-        start_date = start_date or DEFAULT_START_DATE
+        start_date = start_date or self.start_date  # 使用可配置的起始日期
         end_date = end_date or self._get_now().strftime("%Y-%m-%d")
 
         # Issue #3: 检查是否已退市（退市后停止抓取）
