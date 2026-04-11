@@ -810,6 +810,7 @@ class DataEngine:
         不依赖"当前快照 + 退市补丁"的近似方案。
 
         规则：
+        - 取每个 ts_code 的 eff_date <= trade_date 的最新记录
         - list_date <= trade_date：已上市
         - delist_date IS NULL OR delist_date > trade_date：尚未退市
         - 退市整理期（delist_date + 30天内）仍视为可交易
@@ -826,12 +827,22 @@ class DataEngine:
         if not HAS_DUCKDB:
             return []
 
+        # PIT 查询：对每个 ts_code 取 eff_date <= trade_date 的最新记录
         df = self.query(f"""
-            SELECT DISTINCT ts_code FROM stock_basic_history
-            WHERE list_date <= CAST(? AS DATE)
-              AND (delist_date IS NULL OR delist_date > CAST(? AS DATE))
-            ORDER BY ts_code
-        """, (trade_date, trade_date))
+            SELECT h.ts_code
+            FROM (
+                SELECT ts_code, MAX(eff_date) as latest_eff
+                FROM stock_basic_history
+                WHERE eff_date <= CAST(? AS DATE)
+                GROUP BY ts_code
+            ) latest
+            JOIN stock_basic_history h
+              ON h.ts_code = latest.ts_code
+             AND h.eff_date = latest.latest_eff
+            WHERE h.list_date <= CAST(? AS DATE)
+              AND (h.delist_date IS NULL OR h.delist_date > CAST(? AS DATE))
+            ORDER BY h.ts_code
+        """, (trade_date, trade_date, trade_date))
 
         return df["ts_code"].tolist() if not df.empty else []
 
@@ -972,7 +983,7 @@ class DataEngine:
         Parameters
         ----------
         index_code : str
-            指数代码，如 '000300.SH'
+            指数代码，如 '000300.SH' 或 '000300.XSHG'（两种格式都支持）
         trade_date : str
             查询日期 YYYY-MM-DD
 
@@ -983,21 +994,31 @@ class DataEngine:
         if not HAS_DUCKDB:
             return pd.DataFrame()
 
+        # 标准化 index_code 格式：.XSHG → .SH（兼容 Tushare 格式）
+        norm_code = index_code.replace('.XSHG', '.SH').replace('.XSHE', '.SZ')
+        if not norm_code.endswith(('.SH', '.SZ')) and '.' not in norm_code:
+            norm_code = norm_code + '.SH'
+
         return self.query("""
             SELECT
                 h.ts_code,
-                b.name,
-                b.exchange,
-                b.board,
+                s.name,
+                s.exchange,
+                s.board,
                 h.in_date,
                 h.out_date
             FROM index_constituents_history h
-            LEFT JOIN stock_basic b ON h.ts_code = b.ts_code
+            LEFT JOIN (
+                SELECT ts_code, name, exchange, board,
+                       MAX(eff_date) as latest_eff
+                FROM stock_basic_history
+                GROUP BY ts_code, name, exchange, board
+            ) s ON h.ts_code = s.ts_code
             WHERE h.index_code = ?
               AND h.in_date <= ?
-              AND (h.out_date IS NULL OR h.out_date > ?)
+              AND (h.out_date IS NULL OR h.out_date >= ?)
             ORDER BY h.ts_code
-        """, (index_code, trade_date, trade_date))
+        """, (norm_code, trade_date, trade_date))
 
     def get_universe_at_date(self, index_code: str, trade_date: str) -> List[str]:
         """
@@ -1010,12 +1031,17 @@ class DataEngine:
         if not HAS_DUCKDB:
             return []
 
+        # 标准化 index_code 格式
+        norm_code = index_code.replace('.XSHG', '.SH').replace('.XSHE', '.SZ')
+        if not norm_code.endswith(('.SH', '.SZ')) and '.' not in norm_code:
+            norm_code = norm_code + '.SH'
+
         df = self.query("""
             SELECT ts_code FROM index_constituents_history
             WHERE index_code = ?
-            AND in_date <= ?
-            AND (out_date IS NULL OR out_date > ?)
-        """, (index_code, trade_date, trade_date))
+              AND in_date <= ?
+              AND (out_date IS NULL OR out_date >= ?)
+        """, (norm_code, trade_date, trade_date))
         return df["ts_code"].tolist() if not df.empty else []
 
     # ──────────────────────────────────────────────────────────
