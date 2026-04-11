@@ -29,10 +29,15 @@ from loguru import logger
 # ──────────────────────────────────────────────────────────────
 # 全局常量
 # ──────────────────────────────────────────────────────────────
-# 数据起始日期：环境变量 STOCK_START_DATE 优先，否则使用默认值
+# 数据起始日期配置优先级（由高到低）：
+#   1. DataEngine(start_date=...) 构造函数参数
+#   2. 环境变量 STOCK_START_DATE
+#   3. 配置文件 data/config.toml 的 [data] start_date
+#   4. 硬编码默认值 "2018-01-01"
 # 默认 2018-01-01：合理回测起点（2015年股灾后市场充分调整，
 # 覆盖2016-2018供给侧改革周期，确保有足够历史数据用于因子计算）
-DEFAULT_START_DATE = os.environ.get("STOCK_START_DATE", "2018-01-01")
+_DEFAULT_START_DATE_FALLBACK = "2018-01-01"
+DEFAULT_START_DATE = os.environ.get("STOCK_START_DATE", _DEFAULT_START_DATE_FALLBACK)
 DEFAULT_ADJ_TOLERANCE = 0.005         # 交叉验证容差 0.5%
 DEFAULT_SAMPLE_RATIO = 0.05           # 交叉验证抽样比例 5%
 DEFAULT_ADJ_CHANGE_THRESHOLD = 0.05   # 复权因子变化告警阈值 5%
@@ -122,6 +127,65 @@ except ModuleNotFoundError:
 
 
 # ──────────────────────────────────────────────────────────────
+# 统一配置层
+# ──────────────────────────────────────────────────────────────
+# 配置文件路径：data/config.toml
+_CONFIG_PATH = Path(__file__).resolve().parent.parent / "data" / "config.toml"
+
+
+def _load_config() -> dict:
+    """
+    从 data/config.toml 加载配置（若不存在则返回空字典）。
+
+    优先级由 DataEngine 构造函数统一决定，此函数仅负责读文件。
+    """
+    if not _CONFIG_PATH.exists():
+        return {}
+    try:
+        import configparser
+        cp = configparser.ConfigParser()
+        cp.read(str(_CONFIG_PATH), encoding="utf-8")
+        return {s: dict(cp.items(s)) for s in cp.sections()}
+    except Exception:
+        return {}
+
+
+def _resolve_start_date(param_value: Optional[str]) -> str:
+    """
+    解析最终生效的起始日期。
+
+    优先级（由高到低）：
+      1. 构造函数参数 start_date
+      2. 环境变量 STOCK_START_DATE
+      3. 配置文件 data/config.toml → [data] → start_date
+      4. 硬编码默认值 "2018-01-01"
+
+    Parameters
+    ----------
+    param_value : str or None
+        构造函数传入的 start_date 参数
+
+    Returns
+    -------
+    str: 最终生效的 YYYY-MM-DD 日期字符串
+    """
+    # 1. 构造函数参数（最高优先）
+    if param_value:
+        return param_value
+    # 2. 环境变量
+    env_val = os.environ.get("STOCK_START_DATE", "")
+    if env_val:
+        return env_val
+    # 3. 配置文件
+    config = _load_config()
+    cfg_val = config.get("data", {}).get("start_date", "")
+    if cfg_val:
+        return cfg_val
+    # 4. 硬编码默认值
+    return _DEFAULT_START_DATE_FALLBACK
+
+
+# ──────────────────────────────────────────────────────────────
 # 核心 DataEngine
 # ──────────────────────────────────────────────────────────────
 class DataEngine:
@@ -165,8 +229,13 @@ class DataEngine:
             'STOCK_DB_PATH', str(project_root / 'data' / 'stock_data.duckdb')))
         self.parquet_dir = Path(parquet_dir or os.environ.get(
             'STOCK_PARQUET_DIR', str(project_root / 'data' / 'parquet')))
-        # 可配置的起始日期：参数优先，否则使用 DEFAULT_START_DATE（含环境变量优先级）
-        self.start_date = start_date if start_date else DEFAULT_START_DATE
+        # 统一配置入口：参数 > 环境变量 > 配置文件 > 硬编码默认值
+        # 优先级由 _resolve_start_date() 统一管理
+        self.start_date = _resolve_start_date(start_date)
+        logger.info(f"[DataEngine] start_date resolved: {self.start_date} "
+                    f"(param={start_date}, "
+                    f"env={os.environ.get('STOCK_START_DATE','<unset>')}, "
+                    f"config={_CONFIG_PATH})")
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.parquet_dir.mkdir(parents=True, exist_ok=True)
         self.validator = DataValidator()
@@ -937,6 +1006,32 @@ class DataEngine:
     # ──────────────────────────────────────────────────────────
     # 动态股票池（沪深300成分股时点对齐）
     # ──────────────────────────────────────────────────────────
+    @staticmethod
+    def _normalize_index_code(index_code: str) -> str:
+        """
+        标准化指数代码格式。
+
+        转换规则：
+          - .XSHG / .XSH → .SH
+          - .XSHE / .XSZ → .SZ
+          - 纯数字 → 默认加 .SH（中证系列指数均为上交所）
+          - .SH / .SZ → 保持不变
+
+        用于：sync_index_constituents / get_index_constituents / get_universe_at_date
+        """
+        if not index_code:
+            return index_code
+        normalized = (index_code
+                      .replace('.XSHG', '.SH')
+                      .replace('.XSHE', '.SZ')
+                      .replace('.XSH', '.SH')
+                      .replace('.XSZ', '.SZ')
+                      .replace('.SZ', '.SZ')
+                      .replace('.SH', '.SH'))
+        if '.' not in normalized:
+            normalized = normalized + '.SH'
+        return normalized
+
     def sync_index_constituents(self, index_code: str = "000300.SH") -> None:
         """
         同步指数成分股历史（解决幸存者偏差）
@@ -954,8 +1049,10 @@ class DataEngine:
 
         with self.get_connection() as conn:
             try:
-                # 解析指数代码（支持 "000300" 或 "000300.SH"）
-                index_symbol = index_code.replace(".SH", "").replace(".SZ", "")
+                # 标准化 index_code（统一格式：000300.SH / 000905.SH / 000852.SH）
+                norm_code = self._normalize_index_code(index_code)
+                # 取纯数字部分用于 API 调用
+                index_symbol = norm_code.replace(".SH", "").replace(".SZ", "")
                 
                 # 获取当前成分股快照
                 if index_symbol == "000300":
@@ -979,7 +1076,8 @@ class DataEngine:
                     '成分券名称': 'name',
                     '交易所': 'exchange_cn',
                 })
-                df['index_code'] = df['index_code'] + '.SH'
+                # 使用标准化后的 index_code（统一存储格式：000300.SH / 000905.SH / 000852.SH）
+                df['index_code'] = norm_code
                 df['ts_code'] = df['ts_code_raw'].apply(build_ts_code)
                 df['snapshot_date'] = pd.to_datetime(df['snapshot_date']).dt.strftime('%Y-%m-%d')
                 df['in_date'] = df['snapshot_date']  # 快照日期 = 该股票进入指数的日期
@@ -1016,14 +1114,14 @@ class DataEngine:
                     WHERE index_code = ?
                       AND out_date IS NULL
                       AND ts_code NOT IN (SELECT ts_code FROM tmp_current_codes)
-                """, (from_date, index_code))
+                """, (from_date, norm_code))
 
                 conn.execute("DROP VIEW IF EXISTS tmp_constituents")
                 conn.execute("DROP VIEW IF EXISTS tmp_current_codes")
 
                 new_count = len(df)
                 logger.info(
-                    f"Synced {index_code}: {new_count} current constituents, "
+                    f"Synced {norm_code}: {new_count} current constituents, "
                     f"out_date updated for removed stocks"
                 )
             except Exception as e:
@@ -1047,10 +1145,8 @@ class DataEngine:
         if not HAS_DUCKDB:
             return pd.DataFrame()
 
-        # 标准化 index_code 格式：.XSHG → .SH（兼容 Tushare 格式）
-        norm_code = index_code.replace('.XSHG', '.SH').replace('.XSHE', '.SZ')
-        if not norm_code.endswith(('.SH', '.SZ')) and '.' not in norm_code:
-            norm_code = norm_code + '.SH'
+        # 标准化 index_code 格式（委托给 _normalize_index_code）
+        norm_code = self._normalize_index_code(index_code)
 
         return self.query("""
             SELECT
@@ -1084,10 +1180,8 @@ class DataEngine:
         if not HAS_DUCKDB:
             return []
 
-        # 标准化 index_code 格式
-        norm_code = index_code.replace('.XSHG', '.SH').replace('.XSHE', '.SZ')
-        if not norm_code.endswith(('.SH', '.SZ')) and '.' not in norm_code:
-            norm_code = norm_code + '.SH'
+        # 标准化 index_code（委托给统一方法）
+        norm_code = self._normalize_index_code(index_code)
 
         df = self.query("""
             SELECT ts_code FROM index_constituents_history
@@ -1824,34 +1918,35 @@ class DataEngine:
 
             conn.execute("DROP VIEW IF EXISTS tmp_quotes")
 
-            # ── 3. 更新 sync_progress（断点续跑状态跟踪）──────────
+            # ── 3. 更新 sync_progress（分表独立跟踪）────────────────
+            # 写入后，两张表独立跟踪各自的同步进度，
+            # 排障时可精确判断是 raw 层还是 adjusted 层出了问题。
             try:
-                # 按股票聚合最新日期
-                progress_df = (
-                    df.groupby("ts_code")["trade_date"]
-                    .max()
-                    .reset_index()
-                    .rename(columns={"trade_date": "last_sync_date"})
-                )
-                progress_df["table_name"]    = "daily_bar_raw"
-                progress_df["status"]        = "ok"
-                progress_df["error_msg"]     = None
-                progress_df["total_records"] = (
-                    df.groupby("ts_code").size().reset_index(name="cnt")["cnt"].values
-                )
-                conn.register("tmp_progress", progress_df)
-                conn.execute("""
-                    INSERT INTO sync_progress
-                        (ts_code, table_name, last_sync_date, total_records, status)
-                    SELECT ts_code, table_name, last_sync_date, total_records, status
-                    FROM tmp_progress
-                    ON CONFLICT (ts_code, table_name) DO UPDATE SET
-                        last_sync_date = GREATEST(sync_progress.last_sync_date, excluded.last_sync_date),
-                        total_records  = sync_progress.total_records + excluded.total_records,
-                        last_sync_at   = NOW(),
-                        status         = excluded.status
-                """)
-                conn.execute("DROP VIEW IF EXISTS tmp_progress")
+                # 按股票聚合最新日期 + 记录数
+                agg = df.groupby("ts_code").agg(
+                    last_sync_date=("trade_date", "max"),
+                    total_records=("trade_date", "count")
+                ).reset_index()
+
+                # 分别对 raw 和 adjusted 各写入一条进度记录
+                for table_name in ("daily_bar_raw", "daily_bar_adjusted"):
+                    prog = agg.copy()
+                    prog["table_name"] = table_name
+                    prog["status"]     = "ok"
+                    prog["error_msg"]  = None
+                    conn.register("tmp_progress", prog)
+                    conn.execute("""
+                        INSERT INTO sync_progress
+                            (ts_code, table_name, last_sync_date, total_records, status)
+                        SELECT ts_code, table_name, last_sync_date, total_records, status
+                        FROM tmp_progress
+                        ON CONFLICT (ts_code, table_name) DO UPDATE SET
+                            last_sync_date = GREATEST(sync_progress.last_sync_date, excluded.last_sync_date),
+                            total_records  = sync_progress.total_records + excluded.total_records,
+                            last_sync_at   = NOW(),
+                            status         = excluded.status
+                    """)
+                    conn.execute("DROP VIEW IF EXISTS tmp_progress")
             except Exception as e:
                 logger.debug(f"sync_progress update skipped: {e}")
 
@@ -2559,16 +2654,20 @@ class DataEngine:
         对 daily_bar_raw / daily_bar_adjusted 执行全面数据质量校验。
 
         校验项（结果写入 data_quality_alert 表）：
-        1. duplicate_rows           — (ts_code, trade_date) 重复行
-        2. ohlc_violation           — high < low 或 close 超出 [low, high] 范围
-        3. pct_chg_extreme          — 单日涨跌幅绝对值 > 60%（超出任何板块限制）
-        4. adj_factor_jump          — 相邻两日 adj_factor 变化 > 5%（可能分红/拆股但未记录）
-        5. zero_volume_non_suspend  — volume=0 但未标记 is_suspend
-        6. delisted_with_future_data — 已退市股票（delist_date 非空）仍有晚于退市日的数据
-        7. adj_raw_ratio_invalid    — daily_bar_adjusted.close / daily_bar_raw.close 偏离 adj_factor > 1%
-        8. volume_amount_inconsistent — 成交额与成交量/收盘价关系偏差 > 20%
-        9. index_date_invalid       — 指数成分 in_date > out_date
+        1.  duplicate_rows               — (ts_code, trade_date) 重复行
+        2.  ohlc_violation              — high < low 或 close 超出 [low, high] 范围
+        3.  pct_chg_extreme             — 单日涨跌幅绝对值 > 60%（超出任何板块限制）
+        4.  adj_factor_jump             — 相邻两日 adj_factor 变化 > 5%（可能分红/拆股但未记录）
+        5.  zero_volume_non_suspend     — volume=0 但未标记 is_suspend
+        6.  delisted_with_future_data   — 已退市股票（delist_date 非空）仍有晚于退市日的数据
+        7.  adj_raw_ratio_invalid       — daily_bar_adjusted.close / daily_bar_raw.close 偏离 adj_factor > 1%
+        8.  volume_amount_inconsistent  — 成交额与成交量/收盘价关系偏差 > 20%
+        9.  index_date_invalid          — 指数成分 in_date > out_date
         10. pit_universe_size_suspicious — PIT 查询股票池大小异常（< 1000 或 > 6000）
+        11. raw_adj_row_count_mismatch  — raw 与 adjusted 行数不一致
+        12. raw_adj_pk_missing          — 同一 (ts_code, trade_date) 在 raw 或 adjusted 缺失
+        13. qfq_close_mismatch          — qfq_close ≠ raw_close × adj_factor（容差 ±0.1%）
+        14. adj_factor_invalid          — adj_factor 缺失 / ≤ 0 / > 100
 
         Parameters
         ----------
@@ -2836,6 +2935,126 @@ class DataEngine:
                     stats["pit_universe_size_suspicious"] = stats.get("pit_universe_size_suspicious", 0)
         except Exception as e:
             logger.warning(f"pit_universe_size_suspicious check failed: {e}")
+
+        # ── 11. raw / adjusted 行数一致性 ─────────────────────
+        # 验证：(ts_code, trade_date) 在 raw 和 adjusted 两表的行数是否一致
+        row_cnt_sql = f"""
+            WITH raw_cnt AS (
+                SELECT ts_code, trade_date, COUNT(*) AS raw_cnt
+                FROM daily_bar_raw
+                WHERE trade_date BETWEEN ? AND ? {code_filter_raw}
+                GROUP BY ts_code, trade_date
+            ),
+            adj_cnt AS (
+                SELECT ts_code, trade_date, COUNT(*) AS adj_cnt
+                FROM daily_bar_adjusted
+                WHERE trade_date BETWEEN ? AND ? {code_filter_adj}
+                GROUP BY ts_code, trade_date
+            )
+            SELECT r.ts_code, r.trade_date, r.raw_cnt, a.adj_cnt,
+                   ABS(r.raw_cnt - a.adj_cnt) AS diff
+            FROM raw_cnt r
+            LEFT JOIN adj_cnt a ON r.ts_code = a.ts_code AND r.trade_date = a.trade_date
+            WHERE a.ts_code IS NULL OR r.raw_cnt != a.adj_cnt
+        """
+        try:
+            row_params = [start_date, end_date, start_date, end_date]
+            if ts_codes:
+                row_params += ts_codes + ts_codes
+            rc_df = self.query(row_cnt_sql, tuple(row_params))
+            for _, row in rc_df.iterrows():
+                adj_cnt_val = int(row["adj_cnt"]) if not pd.isna(row["adj_cnt"]) else 0
+                alerts.append(("raw_adj_row_count_mismatch", row["ts_code"], row["trade_date"],
+                              f"raw={int(row['raw_cnt'])} adj={adj_cnt_val}"))
+            stats["raw_adj_row_count_mismatch"] = len(rc_df)
+        except Exception as e:
+            logger.warning(f"raw_adj_row_count_mismatch check failed: {e}")
+            stats["raw_adj_row_count_mismatch"] = -1
+
+        # ── 12. raw 层缺 adjusted 记录（或反之）─────────────────
+        # 每张表有另一张表没有的 (ts_code, trade_date)
+        pk_missing_sql = f"""
+            WITH raw_keys AS (
+                SELECT ts_code, trade_date FROM daily_bar_raw
+                WHERE trade_date BETWEEN ? AND ? {code_filter_raw}
+            ),
+            adj_keys AS (
+                SELECT ts_code, trade_date FROM daily_bar_adjusted
+                WHERE trade_date BETWEEN ? AND ? {code_filter_adj}
+            )
+            SELECT 'raw_only' AS side, r.ts_code, r.trade_date
+            FROM raw_keys r LEFT JOIN adj_keys a ON r.ts_code = a.ts_code AND r.trade_date = a.trade_date
+            WHERE a.ts_code IS NULL
+            UNION ALL
+            SELECT 'adj_only' AS side, a.ts_code, a.trade_date
+            FROM adj_keys a LEFT JOIN raw_keys r ON a.ts_code = r.ts_code AND a.trade_date = r.trade_date
+            WHERE r.ts_code IS NULL
+            LIMIT 200
+        """
+        try:
+            pk_params = [start_date, end_date, start_date, end_date]
+            if ts_codes:
+                pk_params += ts_codes + ts_codes
+            pm_df = self.query(pk_missing_sql, tuple(pk_params))
+            for _, row in pm_df.iterrows():
+                alerts.append(("raw_adj_pk_missing", row["ts_code"], row["trade_date"],
+                              f"{row['side']}: pk exists in {row['side'].replace('_only','')} but not in the other layer"))
+            stats["raw_adj_pk_missing"] = len(pm_df)
+        except Exception as e:
+            logger.warning(f"raw_adj_pk_missing check failed: {e}")
+            stats["raw_adj_pk_missing"] = -1
+
+        # ── 13. qfq_close 与 raw_close × adj_factor 关系校验 ────
+        # 验证：daily_bar_adjusted.qfq_close = daily_bar_raw.close × daily_bar_adjusted.adj_factor
+        # 容差 ±0.1%（浮点误差允许范围）
+        qfq_sql = f"""
+            SELECT adj.ts_code, adj.trade_date,
+                   adj.qfq_close,
+                   raw.close AS raw_close,
+                   adj.adj_factor,
+                   adj.qfq_close - raw.close * adj.adj_factor AS abs_diff
+            FROM daily_bar_adjusted adj
+            JOIN daily_bar_raw raw
+              ON adj.ts_code = raw.ts_code AND adj.trade_date = raw.trade_date
+            WHERE adj.trade_date BETWEEN ? AND ?
+              AND raw.close > 0 AND adj.adj_factor > 0
+              AND ABS(adj.qfq_close - raw.close * adj.adj_factor) > raw.close * adj.adj_factor * 0.001
+              {code_filter_adj.replace('AND ts_code', 'AND adj.ts_code')}
+            LIMIT 100
+        """
+        try:
+            qfq_params = [start_date, end_date] + (ts_codes or [])
+            qfq_df = self.query(qfq_sql, tuple(qfq_params))
+            for _, row in qfq_df.iterrows():
+                alerts.append(("qfq_close_mismatch", row["ts_code"], row["trade_date"],
+                              f"qfq_close={row['qfq_close']:.4f} vs "
+                              f"raw_close({row['raw_close']:.4f}) × adj({row['adj_factor']:.4f}) "
+                              f"={row['raw_close']*row['adj_factor']:.4f}"))
+            stats["qfq_close_mismatch"] = len(qfq_df)
+        except Exception as e:
+            logger.warning(f"qfq_close_mismatch check failed: {e}")
+            stats["qfq_close_mismatch"] = -1
+
+        # ── 14. adj_factor 缺失 / 为 0 / 为负 ───────────────────
+        adj_invalid_sql = f"""
+            SELECT ts_code, trade_date, adj_factor
+            FROM daily_bar_raw
+            WHERE trade_date BETWEEN ? AND ?
+              AND (adj_factor IS NULL OR adj_factor <= 0 OR adj_factor > 100)
+              {code_filter_raw}
+            LIMIT 100
+        """
+        try:
+            ai_df = self.query(adj_invalid_sql, tuple(code_params_raw))
+            for _, row in ai_df.iterrows():
+                val = row["adj_factor"]
+                val_str = str(val) if val is not None else "NULL"
+                alerts.append(("adj_factor_invalid", row["ts_code"], row["trade_date"],
+                              f"adj_factor={val_str} (must be > 0 and <= 100)"))
+            stats["adj_factor_invalid"] = len(ai_df)
+        except Exception as e:
+            logger.warning(f"adj_factor_invalid check failed: {e}")
+            stats["adj_factor_invalid"] = -1
 
         # ── 写入 data_quality_alert 表（批量插入）────────────────
         if alerts:

@@ -1,9 +1,9 @@
 -- ============================================================
--- 数据仓库标准化 Schema v2.2
+-- 数据仓库标准化 Schema v2.3
 -- ============================================================
--- 更新日期: 2026-04-11
--- 说明: 对齐 data_engine.py __init_schema__；daily_bar_raw/daily_bar_adjusted 字段完整
---       daily_bar_adjusted 含完整 qfq/hfq 8字段；清理旧 stock_basic 表
+-- 更新日期: 2026-04-12
+-- 说明: 对齐 data_engine.py v3.3；sync_progress 分层跟踪 raw/adjusted；
+--       14 项数据质量校验（新增层间一致性 4 项）
 -- ============================================================
 
 -- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -238,10 +238,11 @@ CREATE INDEX IF NOT EXISTS idx_sync_status
 -- 10. data_quality_alert - 数据质量告警表（对齐 data_engine.py）
 -- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 -- INSERT 由 run_data_quality_check() 和 data_qa_pipeline.py 批量执行
--- 校验项（10项）：duplicate_rows / ohlc_violation / pct_chg_extreme /
+-- 校验项（14项）：duplicate_rows / ohlc_violation / pct_chg_extreme /
 --   adj_factor_jump / zero_volume_non_suspend / delisted_with_future_data /
 --   adj_raw_ratio_invalid / volume_amount_inconsistent / index_date_invalid /
---   pit_universe_size_suspicious
+--   pit_universe_size_suspicious /
+--   raw_adj_row_count_mismatch / raw_adj_pk_missing / qfq_close_mismatch / adj_factor_invalid
 CREATE SEQUENCE IF NOT EXISTS seq_dqa_id START 1;
 
 CREATE TABLE IF NOT EXISTS data_quality_alert (

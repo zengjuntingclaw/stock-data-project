@@ -2,7 +2,7 @@
 
 # A股多因子回测框架
 
-**准实盘级量化回测系统 v3.2**
+**准实盘级量化回测系统 v3.3 (Schema v2.3)**
 
 [![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://www.python.org/)
 [![DuckDB](https://img.shields.io/badge/DuckDB-0.9+-orange.svg)](https://duckdb.org/)
@@ -204,11 +204,14 @@ engine = DataEngine()
 # 增量更新全市场数据（多线程，自动重试）
 engine.incremental_update(max_workers=12)
 
-# 获取指定日期行情
-df = engine.get_daily_quotes(trade_date='2024-06-30')
+# 获取原始行情（未复权）
+df_raw = engine.get_daily_raw("600519.SH", "2024-01-01", "2024-06-30")
 
-# 获取股票列表（含退市）
-stocks = engine.get_stock_list(include_delisted=True)
+# 获取复权行情（含 qfq/hfq 8字段）
+df_adj = engine.get_daily_adjusted("600519.SH", "2024-01-01", "2024-06-30")
+
+# 获取当前可交易股票池（PIT 查询）
+stocks = engine.get_active_stocks("2024-06-30")
 
 # 板块识别
 from scripts.data_engine import detect_board, detect_limit
@@ -227,9 +230,9 @@ limit = detect_limit('688001')      # → 0.20 (科创板 20%)
 | 复权因子监测 | 变化 >5% 自动记录日志 |
 | 断点续传 | 检测最新数据完整性，损坏自动回退 |
 | **9 层数据分层** | 原始层 / 复权层 / 主表层 / 因子层，历史回溯零污染 |
-| **PIT 历史查询** | `get_stock_list()` / `get_index_components()` 支持历史时点快照 |
-| **增量同步** | `sync_progress` 表记录断点，`incremental_update()` 可随时中断续跑 |
-| **8 类质量校验** | OHLC 违规 / 价格异常 / 成交量归零 / 复权因子跳变 / 成分股滞后 / 停牌日交易 / 退市后数据 / 上市前历史，问题写入 `data_quality_alert` 表 |
+| **PIT 历史查询** | `get_active_stocks()` / `get_index_constituents()` 支持历史时点快照 |
+| **增量同步** | `sync_progress` 分层记录断点，`update_daily_data()` 可随时中断续跑 |
+| **14 类质量校验** | OHLC 违规 / 价格异常 / 成交量归零 / 复权因子跳变 / 停牌日交易 / 退市后数据 / raw/adjusted 层间一致性等，问题写入 `data_quality_alert` 表 |
 
 ### 2. ExecutionEngineV3 — 执行引擎
 
@@ -539,29 +542,29 @@ Parquet  (导出) ←── 快速加载、长期归档、跨平台共享
 
 ### 9 层数据分层架构
 
-v3.x 重构确立严格的数据分层，各层职责清晰，杜绝历史回溯污染：
+Schema v2.3 / v3.3确立严格的数据分层，各层职责清晰，杜绝历史回溯污染：
 
 | 层级 | 表名 | 说明 |
 |------|------|------|
 | L1 | `daily_bar_raw` | 原始数据层：下载即入库，不做修改，保证可复现 |
-| L2 | `daily_bar_adjusted` | 复权调整层：统一前复权因子，消除历史价格失真 |
-| L3 | `stock_basic_history` | 股票主表层：`(ts_code, list_date, delist_date)` 复合 PK，支持 PIT 查询 |
-| L4 | `security_master` | 证券主表层：含交易所映射 (688/30/4/8/920)、全量历史证券（含退市） |
-| L5 | `index_components_history` | 指数成分历史：`in_date`/`out_date` 区间，精确历史成分股 |
-| L6 | `sync_progress` | 同步进度层：各数据类型的最新同步位置，断点续跑 |
-| L7 | `data_quality_alert` | 质量告警层：8 类数据异常记录，可审计追溯 |
-| L8 | `financial_data` | 因子层：财务数据，`ann_date` 作为 PIT 对齐依据 |
-| L9 | `daily_bar_derived` | 衍生指标层：预处理因子、收益率、波动率等 |
+| L2 | `daily_bar_adjusted` | 复权调整层：统一前复权因子（含 qfq/hfq 8字段），消除历史价格失真 |
+| L3 | `stock_basic_history` | 股票主表层：`(ts_code, eff_date)` 复合 PK，支持 PIT 历史时点查询 |
+| L4 | `index_constituents_history` | 指数成分历史：`in_date`/`out_date` 区间，精确历史成分股（支持 000300/000905/000852） |
+| L5 | `trade_calendar` | 交易日历：2018-2027 年 A 股节假日 |
+| L6 | `corporate_actions` | 除权除息事件表：adj_factor 跳变检测，自动记录分红/拆股事件 |
+| L7 | `sync_progress` | 同步进度层：raw/adjusted 双层独立跟踪，断点续跑 |
+| L8 | `data_quality_alert` | 质量告警层：14 类数据异常（含层间一致性），可审计追溯 |
+| L9 | `financial_data` | 因子层：财务数据，`ann_date` 作为 PIT 对齐依据 |
 
 **PIT 查询示例**（查询 2022-06-30 时的沪深 300 成分股）：
 
 ```python
 engine = DataEngine()
 # 获取历史上某一天有效的股票列表
-stocks = engine.get_stock_list(date='2022-06-30')
+stocks = engine.get_active_stocks('2022-06-30')
 
 # 获取历史上某一天某指数的成分股
-members = engine.get_index_components('000300.SH', date='2022-06-30')
+members = engine.get_index_constituents('000300.SH', '2022-06-30')
 ```
 
 ---
@@ -628,11 +631,17 @@ python -m unittest discover -s tests -p test_refactor_v2.py
 
 ## 版本历史
 
+### v3.3 (2026-04-12)
+- **Schema v2.3**：新增 4 项层间一致性校验（raw/adjusted 行数、PK 完整性、qfq_close 关系、adj_factor 合法性），校验项从 10 项扩充至 14 项
+- **统一配置入口**：`DEFAULT_START_DATE` 升级为优先级链（构造函数 > 环境变量 > data/config.toml > 硬编码），日志明确显示最终生效值
+- **sync_progress 分层跟踪**：`save_quotes` 同步写入 `daily_bar_raw` 和 `daily_bar_adjusted` 各自独立的进度记录，排障时可精确判断是哪层出问题
+- **README 收口**：版本号对齐 Schema v2.3，清理旧口径表引用（`security_master`/`daily_bar_derived`/`index_components_history`），修正 API 示例方法名
+
 ### v3.2 (2026-04-11)
-- **数据架构重构**：重构 `security_master` / `stock_basic_history` 为真正的历史主表（含上市/退市日期）
-- **日线数据分层**：拆分为 `daily_bar_raw`（原始前复权）和 `daily_bar_adjusted`（复权因子标准化），历史回溯零污染
+- **数据架构重构**：`stock_basic_history` 为真正的历史主表（含上市/退市日期）
+- **日线数据分层**：拆分为 `daily_bar_raw`（原始）和 `daily_bar_adjusted`（含 qfq/hfq 8字段），历史回溯零污染
 - **指数成分股历史**：从快照表改为 `in_date`/`out_date` 区间表，支持 PIT 历史时点查询
-- **8 类数据质量校验**：OHLC 违规 / 价格异常 / 成交量归零 / 复权因子跳变 / 成分股滞后 / 停牌日交易 / 退市后异常数据 / 上市前历史，异常写入 `data_quality_alert` 表
+- **10 类数据质量校验**：OHLC 违规 / 价格异常 / 成交量归零 / 复权因子跳变 / 成分股滞后 / 停牌日交易 / 退市后异常数据 / 上市前历史，异常写入 `data_quality_alert` 表
 - **增量同步与断点续跑**：`sync_progress` 表记录各数据类型的最新同步位置，`incremental_update()` 可随时中断后续跑
 - **DuckDB Bug 修复**：`CURRENT_TIMESTAMP` → `NOW()`、`INTEGER PRIMARY KEY` + SEQUENCE 自增、`delist_sql` JOIN 列名歧义
 - **测试补齐**：`test_refactor_v2.py` 33 用例覆盖所有重构模块
