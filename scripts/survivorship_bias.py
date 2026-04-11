@@ -103,9 +103,10 @@ class SurvivorshipBiasHandler:
     2. 退市股票最后交易状态固化
     3. 精确停牌处理（is_tradable布尔值）
     4. 代码变更映射追踪
+    5. PIT历史查询支持（优先使用 stock_basic_history）
     """
     
-    def __init__(self, data_dir: Optional[str] = None):
+    def __init__(self, data_dir: Optional[str] = None, data_engine=None):
         self._stocks: Dict[str, StockLifetime] = {}
         self._delisted: Set[str] = set()
         self._st_history: Dict[str, List[Tuple[datetime, Optional[datetime]]]] = {}
@@ -115,6 +116,9 @@ class SurvivorshipBiasHandler:
         
         # 吸收合并映射：被吸收代码 -> 继承代码
         self._merger_map: Dict[str, str] = {}
+        
+        # DataEngine 引用（用于 PIT 查询）
+        self._data_engine = data_engine
         
         # 数据目录（用于持久化退市信息）
         project_root = Path(__file__).resolve().parent.parent
@@ -427,6 +431,10 @@ class SurvivorshipBiasHandler:
         """
         获取指定日期的有效股票池
         
+        优先级：
+        1. 如果有 DataEngine，使用 stock_basic_history PIT 查询（推荐）
+        2. 否则回退到内存字典查询
+        
         Parameters
         ----------
         date : datetime
@@ -441,6 +449,18 @@ class SurvivorshipBiasHandler:
         List[str]
             股票代码列表
         """
+        # 优先使用 PIT 查询（推荐路径）
+        if self._data_engine is not None:
+            date_str = date.strftime("%Y-%m-%d") if isinstance(date, datetime) else str(date)
+            try:
+                pit_stocks = self._data_engine.get_active_stocks(date_str)
+                if pit_stocks:
+                    logger.debug(f"PIT query for {date_str}: {len(pit_stocks)} stocks")
+                    return pit_stocks
+            except Exception as e:
+                logger.warning(f"PIT query failed, falling back to memory: {e}")
+        
+        # 回退到内存字典查询
         result = []
         
         for symbol, lifetime in self._stocks.items():

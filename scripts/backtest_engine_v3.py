@@ -110,7 +110,7 @@ class ProductionBacktestEngine:
             min_commission=config.min_commission,
             slippage_rate=config.slippage_rate,
         )
-        self.survivorship = SurvivorshipBiasHandler()
+        self.survivorship = SurvivorshipBiasHandler(data_engine=data_engine)
         self.pit_aligner = PITDataAligner()
         self.performance = EnhancedPerformanceAnalyzer()
         

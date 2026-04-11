@@ -1280,7 +1280,22 @@ class DataEngine:
                     conn.execute(f"INSERT OR IGNORE INTO financial_data ({col_str}) SELECT {col_str} FROM df")
 
     def _get_local_stocks(self) -> pd.DataFrame:
-        """从本地数据库获取股票列表"""
+        """
+        从本地数据库获取股票列表。
+        
+        优先使用 stock_basic_history（PIT 历史表）获取当前有效股票池，
+        确保与 get_active_stocks() 口径一致。
+        仅当 stock_basic_history 为空时回退到 stock_basic。
+        """
+        # 优先从 PIT 历史表获取（推荐路径）
+        pit_result = self.query("""
+            SELECT * FROM stock_basic_history 
+            WHERE eff_date = (SELECT MAX(eff_date) FROM stock_basic_history)
+        """)
+        if not pit_result.empty:
+            return pit_result
+        
+        # 回退到旧表（兼容性）
         return self.query("SELECT * FROM stock_basic")
 
     def sync_stock_list(self, include_delisted: bool = True):
