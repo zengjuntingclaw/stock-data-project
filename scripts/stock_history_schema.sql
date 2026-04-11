@@ -1,8 +1,8 @@
 -- ============================================================
--- 数据仓库标准化 Schema v2.0
+-- 数据仓库标准化 Schema v2.1
 -- ============================================================
 -- 更新日期: 2026-04-11
--- 说明: 统一 PIT / 分层 / 幸存者偏差消除口径
+-- 说明: 统一 PIT / 分层 / 幸存者偏差消除口径 / schema与代码完全对齐
 -- ============================================================
 
 -- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -134,25 +134,26 @@ CREATE INDEX IF NOT EXISTS idx_cal_open
 
 
 -- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
--- 6. corporate_actions - 上市公司行为（分红、送股、拆合）
+-- 6. corporate_actions - 除权除息事件表（对齐 data_engine.py）
 -- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+-- 来源：adj_factor 跳变检测 或 Baostock 分红数据
+-- INSERT 由 adj_factor 跳变检测自动执行
 CREATE TABLE IF NOT EXISTS corporate_actions (
-    id          BIGINT   NOT NULL DEFAULT nextval('action_seq'),
-    ts_code     TEXT     NOT NULL,
-    trade_date  DATE     NOT NULL,        -- 股权登记日
-    ex_date     DATE     NOT NULL,        -- 除权除息日
-    ann_date    DATE     NOT NULL,        -- 公告日期
-    action      TEXT,                     -- 分红/送股/配股类型
-    dividend    DOUBLE,                   -- 分红金额
-    shares      DOUBLE,                   -- 送股比例
-    unit        TEXT,                     -- 单位
-    eff_date    DATE,                     -- 生效日期（PIT）
+    ts_code       VARCHAR NOT NULL,   -- 证券代码
+    action_date   DATE    NOT NULL,   -- 除权除息生效日期
+    ann_date      DATE,               -- 公告日期（用于PIT约束）
+    prev_adj      DOUBLE,             -- 变化前复权因子
+    curr_adj      DOUBLE,             -- 变化后复权因子
+    action_type   VARCHAR,            -- dividend/split/reverse_split/rights_issue
+    change_ratio  DOUBLE,             -- 变化幅度（curr/prev - 1）
+    reason        VARCHAR,             -- 事件描述（如"分红0.5元/股"）
+    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
-    PRIMARY KEY (id, eff_date)
+    PRIMARY KEY (ts_code, action_date)
 );
 
-CREATE INDEX IF NOT EXISTS idx_action_code
-    ON corporate_actions(ts_code, trade_date, eff_date);
+CREATE INDEX IF NOT EXISTS idx_action_code_date
+    ON corporate_actions(ts_code, action_date, ann_date);
 
 
 -- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -174,13 +175,17 @@ CREATE INDEX IF NOT EXISTS idx_st_code_date
 
 
 -- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
--- 8. adj_factor_log - 复权因子变更日志
+-- 8. adj_factor_log - 复权因子变更日志（对齐 data_engine.py）
 -- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+-- 记录相邻交易日之间的复权因子跳变（>5%），用于检测分红/拆股事件
+-- INSERT 由 _check_adj_factor_change() 自动执行
 CREATE TABLE IF NOT EXISTS adj_factor_log (
-    ts_code     TEXT    NOT NULL,
-    trade_date  DATE    NOT NULL,
-    adj_factor  DOUBLE  NOT NULL,
-    eff_date    DATE    NOT NULL,
+    ts_code        TEXT      NOT NULL,   -- 股票代码
+    trade_date     DATE      NOT NULL,   -- 发生跳变的交易日
+    adj_factor_old DOUBLE,              -- 跳变前的因子值
+    adj_factor_new DOUBLE,              -- 跳变后的因子值
+    change_ratio   DOUBLE,              -- 变化幅度（绝对值 > 5% 才记录）
+    detected_at    TIMESTAMP  DEFAULT CURRENT_TIMESTAMP,  -- 检测时间
 
     PRIMARY KEY (ts_code, trade_date)
 );
@@ -193,54 +198,53 @@ CREATE INDEX IF NOT EXISTS idx_adj_factor_code
 -- 9. sync_progress - 增量同步进度表
 -- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CREATE TABLE IF NOT EXISTS sync_progress (
-    id            BIGINT   NOT NULL DEFAULT nextval('sync_seq'),
-    task_name     TEXT     NOT NULL,        -- 任务名: sync_stock_list / sync_daily
-    data_source   TEXT,                     -- 数据源: tushare / baostock
-    ts_code       TEXT,                     -- 股票代码（可选）
-    index_code    TEXT,                     -- 指数代码（可选）
-    start_date    DATE,                     -- 起始日期
-    end_date      DATE,                     -- 结束日期
-    last_success  DATE,                     -- 最后成功日期
-    total_count   INTEGER DEFAULT 0,        -- 总数量
-    success_count INTEGER DEFAULT 0,        -- 成功数量
-    status        TEXT     NOT NULL,        -- running/success/failed/paused
-    error_msg     TEXT,                     -- 错误信息
-    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    -- 实际使用的结构（与 data_engine.py __init_schema__ 对齐）：
+    -- 每只股票 × 每个表独立跟踪，支持断点续跑
+    ts_code        TEXT       NOT NULL,   -- 股票代码
+    table_name     TEXT       NOT NULL,   -- 目标表: daily_bar_raw / daily_bar_adjusted / stock_basic_history
+    last_sync_date DATE,                  -- 最后成功同步的交易日（断点续跑核心）
+    last_sync_at   TIMESTAMP  DEFAULT CURRENT_TIMESTAMP,  -- 最后同步时间戳
+    total_records  INTEGER    DEFAULT 0,  -- 累计同步记录数
+    status         TEXT       DEFAULT 'ok',  -- ok / failed / in_progress
+    error_msg      TEXT,                  -- 最后一次错误信息
 
-    PRIMARY KEY (id)
+    PRIMARY KEY (ts_code, table_name)
 );
 
-CREATE INDEX IF NOT EXISTS idx_sync_task
-    ON sync_progress(task_name, ts_code, status);
+CREATE INDEX IF NOT EXISTS idx_sync_progress_date
+    ON sync_progress(last_sync_date);
 
-CREATE INDEX IF NOT EXISTS idx_sync_last
-    ON sync_progress(last_success, status);
+CREATE INDEX IF NOT EXISTS idx_sync_status
+    ON sync_progress(status, ts_code);
 
 
 -- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 -- 10. data_quality_alert - 数据质量告警表
 -- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CREATE TABLE IF NOT EXISTS data_quality_alert (
-    id            BIGINT   NOT NULL DEFAULT nextval('alert_seq'),
-    check_type    TEXT     NOT NULL,        -- 检查类型
-    ts_code       TEXT,                     -- 股票代码（可选）
-    trade_date    DATE,                     -- 交易日期（可选）
-    severity      TEXT     NOT NULL,        -- critical/high/medium/low
-    alert_msg     TEXT     NOT NULL,        -- 告警信息
-    details       JSON,                     -- 详细数据（JSON）
-    resolved      BOOLEAN  DEFAULT FALSE,
-    resolved_at   TIMESTAMP,
-    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+-- 10. data_quality_alert - 数据质量告警表（对齐 data_engine.py）
+-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+-- INSERT 由 run_data_quality_check() 和 data_qa_pipeline.py 批量执行
+-- 校验项（10项）：duplicate_rows / ohlc_violation / pct_chg_extreme /
+--   adj_factor_jump / zero_volume_non_suspend / delisted_with_future_data /
+--   adj_raw_ratio_invalid / volume_amount_inconsistent / index_date_invalid /
+--   pit_universe_size_suspicious
+CREATE SEQUENCE IF NOT EXISTS seq_dqa_id START 1;
 
-    PRIMARY KEY (id)
+CREATE TABLE IF NOT EXISTS data_quality_alert (
+    id          INTEGER   PRIMARY KEY DEFAULT nextval('seq_dqa_id'),
+    alert_type  TEXT,                  -- 告警类型（如 'duplicate_rows'）
+    ts_code     TEXT,                  -- 股票代码（可选）
+    trade_date  DATE,                  -- 交易日期（可选）
+    detail      TEXT,                  -- 详细描述
+    created_at  TIMESTAMP DEFAULT NOW() -- 记录时间
 );
 
 CREATE INDEX IF NOT EXISTS idx_alert_code_date
-    ON data_quality_alert(ts_code, trade_date, severity);
+    ON data_quality_alert(ts_code, trade_date);
 
-CREATE INDEX IF NOT EXISTS idx_alert_unresolved
-    ON data_quality_alert(resolved, created_at);
+CREATE INDEX IF NOT EXISTS idx_alert_type
+    ON data_quality_alert(alert_type);
 
 
 -- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -282,24 +286,22 @@ CREATE INDEX IF NOT EXISTS idx_fin_ann_date
 
 
 -- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
--- 12. update_log - 数据更新日志
+-- 12. update_log - 数据更新日志（对齐 data_engine.py）
 -- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CREATE TABLE IF NOT EXISTS update_log (
-    id            BIGINT   NOT NULL DEFAULT nextval('update_seq'),
-    source        TEXT     NOT NULL,        -- 数据源
-    table_name    TEXT     NOT NULL,
-    record_count  INTEGER,
-    status        TEXT,
-    start_time    TIMESTAMP,
-    end_time      TIMESTAMP,
-    error_msg     TEXT,
-    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-
-    PRIMARY KEY (id)
+    id            INTEGER   PRIMARY KEY,
+    table_name    VARCHAR,               -- 目标表名
+    ts_code       VARCHAR,               -- 股票代码（可选）
+    start_date    DATE,                  -- 起始日期
+    end_date      DATE,                  -- 结束日期
+    record_count  INTEGER,               -- 本次同步记录数
+    update_time   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,  -- 更新时间
+    status        VARCHAR,               -- ok / failed / in_progress
+    error_message VARCHAR                -- 错误信息
 );
 
-CREATE INDEX IF NOT EXISTS idx_update_source_table
-    ON update_log(source, table_name, created_at);
+CREATE INDEX IF NOT EXISTS idx_update_table_time
+    ON update_log(table_name, update_time);
 
 
 -- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

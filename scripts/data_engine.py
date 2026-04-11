@@ -1222,9 +1222,18 @@ class DataEngine:
                 stats["failed"] = 1
             return stats
 
-        # 全量
-        local = self._get_local_stocks()
-        symbols = local["symbol"].tolist()
+        # 全量：使用 get_active_stocks() PIT 查询获取当前可交易股票池
+        # 不再依赖 _get_local_stocks()（旧表 stock_basic 已废弃）
+        today = self._get_now().strftime("%Y-%m-%d")
+        ts_codes = self.get_active_stocks(today)
+        if not ts_codes:
+            raise RuntimeError(
+                "get_active_stocks() 返回空列表，stock_basic_history 表可能为空。"
+                "请先调用 sync_stock_list() 同步数据。"
+            )
+        # get_active_stocks 返回 ts_code 列表（如 '000001.SZ'），需提取纯数字部分
+        symbols = [tc.split(".")[0].lstrip("0") or tc.split(".")[0]
+                   for tc in ts_codes]
 
         def _fetch_one(sym: str):
             df = self._fetch_financial_single(str(sym).zfill(6), start_year, end_year)
@@ -2552,14 +2561,16 @@ class DataEngine:
         对 daily_bar_raw / daily_bar_adjusted 执行全面数据质量校验。
 
         校验项（结果写入 data_quality_alert 表）：
-        1. duplicate_rows        — (ts_code, trade_date) 重复行
-        2. ohlc_violation        — high < low 或 close 超出 [low, high] 范围
-        3. pct_chg_extreme       — 单日涨跌幅绝对值 > 60%（超出任何板块限制）
-        4. adj_factor_jump       — 相邻两日 adj_factor 变化 > 5%（可能分红/拆股但未记录）
-        5. zero_volume_non_suspend — volume=0 但未标记 is_suspend
-        6. missing_trade_days    — 相对 trade_calendar 缺失的交易日（每只股票）
-        7. delisted_with_future_data — 已退市股票（delist_date 非空）仍有晚于退市日的数据
-        8. adj_raw_ratio_invalid — daily_bar_adjusted.close / daily_bar_raw.close 偏离 adj_factor > 1%
+        1. duplicate_rows           — (ts_code, trade_date) 重复行
+        2. ohlc_violation           — high < low 或 close 超出 [low, high] 范围
+        3. pct_chg_extreme          — 单日涨跌幅绝对值 > 60%（超出任何板块限制）
+        4. adj_factor_jump          — 相邻两日 adj_factor 变化 > 5%（可能分红/拆股但未记录）
+        5. zero_volume_non_suspend  — volume=0 但未标记 is_suspend
+        6. delisted_with_future_data — 已退市股票（delist_date 非空）仍有晚于退市日的数据
+        7. adj_raw_ratio_invalid    — daily_bar_adjusted.close / daily_bar_raw.close 偏离 adj_factor > 1%
+        8. volume_amount_inconsistent — 成交额与成交量/收盘价关系偏差 > 20%
+        9. index_date_invalid       — 指数成分 in_date > out_date
+        10. pit_universe_size_suspicious — PIT 查询股票池大小异常（< 1000 或 > 6000）
 
         Parameters
         ----------
@@ -2746,6 +2757,88 @@ class DataEngine:
             logger.warning(f"adj_raw_ratio_invalid check failed: {e}")
             stats["adj_raw_ratio_invalid"] = -1
 
+        # ── 8. 成交量/成交额一致性 ──────────────────────────────
+        # amount ≈ volume × close（允许 ±20% 误差，兼容停牌日等特殊情况）
+        vol_consistency_sql = f"""
+            SELECT ts_code, trade_date, volume, amount, close,
+                   ABS(amount - volume * close / 10000) / NULLIF(volume * close / 10000, 0) AS rel_diff
+            FROM daily_bar_raw
+            WHERE trade_date BETWEEN ? AND ? {code_filter_raw}
+              AND volume > 0 AND close > 0 AND amount > 0
+              AND ABS(amount - volume * close / 10000) / NULLIF(volume * close / 10000, 0) > 0.20
+        """
+        try:
+            vc_df = self.query(vol_consistency_sql, tuple(code_params_raw))
+            for _, row in vc_df.iterrows():
+                alerts.append(("volume_amount_inconsistent", row["ts_code"], row["trade_date"],
+                                f"volume={row['volume']}, amount={row['amount']}, "
+                                f"close={row['close']}, rel_diff={row['rel_diff']:.2%}"))
+            stats["volume_amount_inconsistent"] = len(vc_df)
+        except Exception as e:
+            logger.warning(f"volume_amount_inconsistent check failed: {e}")
+            stats["volume_amount_inconsistent"] = -1
+
+        # ── 9. 指数成分日期合法性 ───────────────────────────────
+        # in_date <= out_date；out_date IS NULL 或 >= in_date
+        idx_date_sql = """
+            SELECT index_code, ts_code, in_date, out_date,
+                   CASE WHEN out_date IS NOT NULL AND out_date < in_date
+                        THEN 'out_before_in' END AS issue
+            FROM index_constituents_history
+            WHERE out_date IS NOT NULL AND out_date < in_date
+        """
+        try:
+            idx_df = self.query(idx_date_sql)
+            for _, row in idx_df.iterrows():
+                alerts.append(("index_date_invalid", row["index_code"], None,
+                                f"ts_code={row['ts_code']}: in_date={row['in_date']} "
+                                f"but out_date={row['out_date']} (out_date < in_date)"))
+            stats["index_date_invalid"] = len(idx_df)
+        except Exception as e:
+            logger.warning(f"index_date_invalid check failed: {e}")
+            stats["index_date_invalid"] = -1
+
+        # ── 10. 历史股票池回放一致性 ────────────────────────────
+        # 验证 PIT 查询：对每个 eff_date，最大 eff_date <= trade_date 的记录数应一致
+        # 如果某只股票的 eff_date 缺失，会导致该日期的股票池快照缺少这只股票
+        pit_check_sql = f"""
+            WITH date_stocks AS (
+                SELECT
+                    '2020-01-01'::DATE AS check_date,
+                    COUNT(DISTINCT ts_code) AS stock_count
+                FROM stock_basic_history
+                WHERE eff_date <= CAST('2020-01-01' AS DATE)
+                  AND list_date <= CAST('2020-01-01' AS DATE)
+                  AND (delist_date IS NULL OR delist_date > CAST('2020-01-01' AS DATE))
+            ),
+            date_stocks_2024 AS (
+                SELECT
+                    '2024-01-01'::DATE AS check_date,
+                    COUNT(DISTINCT ts_code) AS stock_count
+                FROM stock_basic_history
+                WHERE eff_date <= CAST('2024-01-01' AS DATE)
+                  AND list_date <= CAST('2024-01-01' AS DATE)
+                  AND (delist_date IS NULL OR delist_date > CAST('2024-01-01' AS DATE))
+            )
+            SELECT check_date, stock_count FROM date_stocks
+            UNION ALL
+            SELECT check_date, stock_count FROM date_stocks_2024
+        """
+        try:
+            pit_df = self.query(pit_check_sql)
+            # 基本检查：股票池大小应在合理范围（1000~6000）
+            for _, row in pit_df.iterrows():
+                cnt = int(row["stock_count"])
+                if cnt < 1000 or cnt > 6000:
+                    alerts.append(("pit_universe_size_suspicious", None, str(row["check_date"])[:10],
+                                    f"get_active_stocks({row['check_date']}) returned {cnt} stocks "
+                                    f"(expected 1000~6000)"))
+                    stats["pit_universe_size_suspicious"] = stats.get("pit_universe_size_suspicious", 0) + 1
+                else:
+                    stats["pit_universe_size_suspicious"] = stats.get("pit_universe_size_suspicious", 0)
+        except Exception as e:
+            logger.warning(f"pit_universe_size_suspicious check failed: {e}")
+
         # ── 写入 data_quality_alert 表（批量插入）────────────────
         if alerts:
             with self.get_connection() as conn:
@@ -2755,7 +2848,8 @@ class DataEngine:
                             INSERT INTO data_quality_alert
                                 (alert_type, ts_code, trade_date, detail)
                             VALUES (?, ?, ?, ?)
-                        """, (alert_type, str(ts_code), str(trade_date)[:10], detail))
+                        """, (alert_type, str(ts_code),
+                              str(trade_date)[:10] if trade_date else None, detail))
                     except Exception as e:
                         logger.debug(f"alert insert failed: {e}")
 
