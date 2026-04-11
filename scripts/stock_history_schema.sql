@@ -1,8 +1,9 @@
 -- ============================================================
--- 数据仓库标准化 Schema v2.1
+-- 数据仓库标准化 Schema v2.2
 -- ============================================================
 -- 更新日期: 2026-04-11
--- 说明: 统一 PIT / 分层 / 幸存者偏差消除口径 / schema与代码完全对齐
+-- 说明: 对齐 data_engine.py __init_schema__；daily_bar_raw/daily_bar_adjusted 字段完整
+--       daily_bar_adjusted 含完整 qfq/hfq 8字段；清理旧 stock_basic 表
 -- ============================================================
 
 -- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -45,6 +46,7 @@ CREATE INDEX IF NOT EXISTS idx_basic_history_exchange
 CREATE TABLE IF NOT EXISTS daily_bar_raw (
     ts_code     TEXT    NOT NULL,        -- 证券代码
     trade_date  DATE    NOT NULL,        -- 交易日期
+    symbol      TEXT,                    -- 纯数字代码
     open        DOUBLE,                   -- 开盘价
     high        DOUBLE,                   -- 最高价
     low         DOUBLE,                   -- 最低价
@@ -54,6 +56,12 @@ CREATE TABLE IF NOT EXISTS daily_bar_raw (
     amount      DOUBLE,                   -- 成交额（元）
     pct_chg     DOUBLE,                   -- 涨跌幅（%）
     turnover    DOUBLE,                   -- 换手率（%）
+    adj_factor  DOUBLE DEFAULT 1.0,       -- 复权因子（>1.0=有复权，1.0=原始价）
+    is_suspend  BOOLEAN DEFAULT FALSE,   -- 是否停牌
+    limit_up    BOOLEAN DEFAULT FALSE,   -- 是否涨停
+    limit_down  BOOLEAN DEFAULT FALSE,   -- 是否跌停
+    data_source TEXT    DEFAULT 'akshare',  -- 数据来源
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
     PRIMARY KEY (ts_code, trade_date)
 );
@@ -71,11 +79,11 @@ CREATE INDEX IF NOT EXISTS idx_raw_code_date
 CREATE TABLE IF NOT EXISTS daily_bar_adjusted (
     ts_code     TEXT    NOT NULL,        -- 证券代码
     trade_date  DATE    NOT NULL,        -- 交易日期
-    open        DOUBLE,                   -- 开盘价（不复权）
-    high        DOUBLE,                   -- 最高价（不复权）
-    low         DOUBLE,                   -- 最低价（不复权）
-    close       DOUBLE,                   -- 收盘价（不复权）
-    pre_close   DOUBLE,                   -- 前收盘价
+    open        DOUBLE,                   -- 复权开盘价（=qfq_open）
+    high        DOUBLE,                   -- 复权最高价（=qfq_high）
+    low         DOUBLE,                   -- 复权最低价（=qfq_low）
+    close       DOUBLE,                   -- 复权收盘价（=qfq_close）
+    pre_close   DOUBLE,                   -- 前复权收盘价
     volume      BIGINT,                   -- 成交量（股）
     amount      DOUBLE,                   -- 成交额（元）
     pct_chg     DOUBLE,                   -- 涨跌幅（%）
@@ -89,6 +97,11 @@ CREATE TABLE IF NOT EXISTS daily_bar_adjusted (
     hfq_high    DOUBLE,                   -- 后复权最高价
     hfq_low     DOUBLE,                   -- 后复权最低价
     hfq_close   DOUBLE,                   -- 后复权收盘价
+    is_suspend  BOOLEAN DEFAULT FALSE,   -- 是否停牌
+    limit_up    BOOLEAN DEFAULT FALSE,   -- 是否涨停
+    limit_down  BOOLEAN DEFAULT FALSE,   -- 是否跌停
+    data_source TEXT    DEFAULT 'akshare',  -- 数据来源
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
     PRIMARY KEY (ts_code, trade_date)
 );

@@ -197,27 +197,13 @@ class DataEngine:
         conn = duckdb.connect(str(self.db_path))
         cur = conn.cursor()
 
-        # 股票基本信息（含退市标记）— exchange/board 由 exchange_mapping.py 统一派生
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS stock_basic (
-                ts_code       VARCHAR PRIMARY KEY,
-                symbol        VARCHAR,
-                name          VARCHAR,
-                exchange      VARCHAR,       -- 交易所代码：SH/SZ/BJ（由 classify_exchange() 派生）
-                board         VARCHAR,       -- 板块：main/chinext/kcb/bse（由 classify_exchange() 派生）
-                area          VARCHAR,
-                industry      VARCHAR,
-                market        VARCHAR,
-                list_date     DATE,
-                delist_date   DATE,
-                is_delisted   BOOLEAN DEFAULT FALSE,
-                delist_reason VARCHAR,
-                is_hs         BOOLEAN,
-                updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
+        # ── 清理旧口径残留表 ────────────────────────────────────────
+        # stock_basic（旧表，已废弃，由 stock_basic_history 替代）
+        # 使用 DROP TABLE IF EXISTS 幂等删除，确保旧 DB 升级后不再残留
+        cur.execute("DROP TABLE IF EXISTS stock_basic")
+        logger.debug("旧表 stock_basic 已清理（若存在）")
 
-        # 证券主表历史版本（时点版本，解决历史universe完整性问题）
+        # ── 证券主表历史版本（时点版本，解决历史universe完整性问题）
         # 设计：每只股票可有多条版本记录（ts_code + eff_date 联合主键）
         # PIT查询逻辑: WHERE list_date <= date AND (delist_date > date OR delist_date IS NULL)
         # eff_date = 本条记录的生效日期（通常=同步当日或 list_date）
@@ -343,20 +329,32 @@ class DataEngine:
         # ── 复权价日线表（派生层）──────────────────────────────────
         # 由 daily_bar_raw 乘 adj_factor 派生，close = raw_close × adj_factor
         # 注意：此表的 close/high/low/open 字段均为复权价
+        # 字段说明：
+        #   open/high/low/close   — 复权价（= qfq_xxx，由 raw × adj_factor 计算）
+        #   qfq_open/high/low/close — 前复权价（相对于当前时刻向前复权）
+        #   hfq_open/high/low/close — 后复权价（相对于发行价向后复权）
         cur.execute("""
             CREATE TABLE IF NOT EXISTS daily_bar_adjusted (
                 ts_code       VARCHAR,
                 trade_date    DATE,
-                open          DOUBLE,
-                high          DOUBLE,
-                low           DOUBLE,
-                close         DOUBLE,            -- 复权收盘价（=raw_close × adj_factor）
+                open          DOUBLE,             -- 复权开盘价（=qfq_open）
+                high          DOUBLE,             -- 复权最高价（=qfq_high）
+                low           DOUBLE,              -- 复权最低价（=qfq_low）
+                close         DOUBLE,             -- 复权收盘价（=qfq_close）
                 pre_close     DOUBLE,
                 volume        BIGINT,
                 amount        DOUBLE,
                 pct_chg       DOUBLE,
                 turnover      DOUBLE,
                 adj_factor    DOUBLE DEFAULT 1.0,  -- 复权因子（参考值）
+                qfq_open      DOUBLE,              -- 前复权开盘价
+                qfq_high      DOUBLE,              -- 前复权最高价
+                qfq_low       DOUBLE,              -- 前复权最低价
+                qfq_close     DOUBLE,              -- 前复权收盘价
+                hfq_open      DOUBLE,              -- 后复权开盘价
+                hfq_high      DOUBLE,              -- 后复权最高价
+                hfq_low       DOUBLE,              -- 后复权最低价
+                hfq_close     DOUBLE,              -- 后复权收盘价
                 is_suspend    BOOLEAN DEFAULT FALSE,
                 limit_up      BOOLEAN DEFAULT FALSE,
                 limit_down    BOOLEAN DEFAULT FALSE,
