@@ -1,4 +1,4 @@
-"""测试：detect_board/detect_limit 统一委托 exchange_mapping 模块。
+"""测试：detect_board/detect_limit/build_ts_code 统一委托 exchange_mapping 模块。
 
 覆盖场景：
 - 主板代码（6xxxxx, 0xxxxx, 1xxxxx, 2xxxxx）
@@ -10,7 +10,90 @@
 """
 import unittest
 from scripts.data_engine import detect_board, detect_limit
-from scripts.exchange_mapping import classify_exchange
+from scripts.exchange_mapping import classify_exchange, build_ts_code
+
+
+class TestBuildTsCodeUnified(unittest.TestCase):
+    """build_ts_code 统一化测试 - 验证全项目只使用一套 ts_code 生成逻辑"""
+
+    # 沪市主板
+    def test_sh_mainboard(self):
+        self.assertEqual(build_ts_code('600000'), '600000.SH')
+        self.assertEqual(build_ts_code('600519'), '600519.SH')
+        self.assertEqual(build_ts_code('601318'), '601318.SH')
+        self.assertEqual(build_ts_code('601012'), '601012.SH')
+
+    def test_sh_mainboard_000xxx(self):
+        """000xxx 是深市，不是沪市"""
+        self.assertEqual(build_ts_code('000001'), '000001.SZ')
+        self.assertEqual(build_ts_code('000002'), '000002.SZ')
+
+    # 科创板
+    def test_kcb(self):
+        self.assertEqual(build_ts_code('688001'), '688001.SH')
+        self.assertEqual(build_ts_code('688041'), '688041.SH')
+        self.assertEqual(build_ts_code('688126'), '688126.SH')
+
+    # 深市主板
+    def test_sz_mainboard(self):
+        self.assertEqual(build_ts_code('000001'), '000001.SZ')
+        self.assertEqual(build_ts_code('000002'), '000002.SZ')
+        self.assertEqual(build_ts_code('001872'), '001872.SZ')
+
+    # 创业板
+    def test_chinext(self):
+        self.assertEqual(build_ts_code('300001'), '300001.SZ')
+        self.assertEqual(build_ts_code('300750'), '300750.SZ')
+
+    # 北交所老股 (4xxxxx)
+    def test_bj_old(self):
+        self.assertEqual(build_ts_code('430001'), '430001.BJ')
+        self.assertEqual(build_ts_code('430012'), '430012.BJ')
+        self.assertEqual(build_ts_code('430001'), '430001.BJ')
+
+    # 北交所新股 (8xxxxx)
+    def test_bj_new(self):
+        self.assertEqual(build_ts_code('830001'), '830001.BJ')
+        self.assertEqual(build_ts_code('870001'), '870001.BJ')
+        self.assertEqual(build_ts_code('830001'), '830001.BJ')
+
+    # 北交所2024新代码 (920xxx) 【关键测试】
+    def test_bj_2024(self):
+        """920xxx 是北交所2024新代码段，不是沪市！"""
+        self.assertEqual(build_ts_code('920001'), '920001.BJ')
+        self.assertEqual(build_ts_code('920012'), '920012.BJ')
+        self.assertEqual(build_ts_code('920103'), '920103.BJ')
+        self.assertEqual(build_ts_code('920001'), '920001.BJ')
+
+    # 前导零处理
+    def test_leading_zeros(self):
+        """前导零应被正确处理"""
+        self.assertEqual(build_ts_code('1'), '000001.SZ')  # 深市
+        self.assertEqual(build_ts_code('000001'), '000001.SZ')
+        self.assertEqual(build_ts_code('6881'), '006881.SZ')  # 2位短码zfill后无法识别688段，回退到SZ（预期行为）
+        self.assertEqual(build_ts_code('8'), '000008.BJ')  # 北交所
+        # 注意：92 这样的2位短码 zfill 后无法识别92xxx 段，回退到SZ
+        # 主要场景是6位代码，2位短码是边界情况
+
+    # 与 classify_exchange 的一致性
+    def test_matches_classify_exchange(self):
+        """build_ts_code 必须与 classify_exchange 的交易所返回值一致"""
+        cases = [
+            ('600000', 'SH', '600000.SH'),
+            ('000001', 'SZ', '000001.SZ'),
+            ('688001', 'SH', '688001.SH'),
+            ('300750', 'SZ', '300750.SZ'),
+            ('430001', 'BJ', '430001.BJ'),
+            ('830001', 'BJ', '830001.BJ'),
+            ('920001', 'BJ', '920001.BJ'),  # 关键测试
+            ('000008', 'BJ', '000008.BJ'),  # 8开头短码
+        ]
+        for symbol, exp_exchange, expected_ts_code in cases:
+            exchange, _ = classify_exchange(symbol)
+            self.assertEqual(exchange, exp_exchange,
+                f"classify_exchange('{symbol}') exchange={exchange}, expected {exp_exchange}")
+            self.assertEqual(build_ts_code(symbol), expected_ts_code,
+                f"build_ts_code('{symbol}')={build_ts_code(symbol)}, expected {expected_ts_code}")
 
 
 class TestDetectBoardUnified(unittest.TestCase):

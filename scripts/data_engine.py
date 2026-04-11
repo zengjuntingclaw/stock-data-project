@@ -965,10 +965,44 @@ class DataEngine:
             except Exception as e:
                 logger.warning(f"Failed to sync index constituents: {e}")
 
+    def get_index_constituents(self, index_code: str, trade_date: str) -> pd.DataFrame:
+        """
+        获取指定日期的指数成分股列表（DataFrame格式，支持历史PIT查询）
+
+        Parameters
+        ----------
+        index_code : str
+            指数代码，如 '000300.SH'
+        trade_date : str
+            查询日期 YYYY-MM-DD
+
+        Returns
+        -------
+        pd.DataFrame: 包含 ts_code, name, exchange, board, in_date, out_date
+        """
+        if not HAS_DUCKDB:
+            return pd.DataFrame()
+
+        return self.query("""
+            SELECT
+                h.ts_code,
+                b.name,
+                b.exchange,
+                b.board,
+                h.in_date,
+                h.out_date
+            FROM index_constituents_history h
+            LEFT JOIN stock_basic b ON h.ts_code = b.ts_code
+            WHERE h.index_code = ?
+              AND h.in_date <= ?
+              AND (h.out_date IS NULL OR h.out_date > ?)
+            ORDER BY h.ts_code
+        """, (index_code, trade_date, trade_date))
+
     def get_universe_at_date(self, index_code: str, trade_date: str) -> List[str]:
         """
         获取指定日期的指数成分股列表（动态股票池）
-        
+
         Returns
         -------
         List[str]: 在该日期属于指数成分的股票代码列表
@@ -1670,6 +1704,84 @@ class DataEngine:
                 conn.execute("DROP VIEW IF EXISTS tmp_progress")
             except Exception as e:
                 logger.debug(f"sync_progress update skipped: {e}")
+
+    def get_daily_raw(
+        self,
+        ts_code: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """
+        获取原始行情数据（未复权价格）
+
+        Parameters
+        ----------
+        ts_code : str
+            股票代码，如 '000001.SZ'
+        start_date : str, optional
+            开始日期 YYYY-MM-DD
+        end_date : str, optional
+            结束日期 YYYY-MM-DD
+
+        Returns
+        -------
+        pd.DataFrame: 包含 ts_code, trade_date, open, high, low, close, volume, amount, pct_chg, turnover
+        """
+        if not HAS_DUCKDB:
+            return pd.DataFrame()
+
+        sql = "SELECT * FROM daily_bar_raw WHERE ts_code = ?"
+        params = [ts_code]
+
+        if start_date:
+            sql += " AND trade_date >= ?"
+            params.append(start_date)
+        if end_date:
+            sql += " AND trade_date <= ?"
+            params.append(end_date)
+
+        sql += " ORDER BY trade_date"
+
+        return self.query(sql, tuple(params))
+
+    def get_daily_adjusted(
+        self,
+        ts_code: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """
+        获取复权行情数据（前复权价格）
+
+        Parameters
+        ----------
+        ts_code : str
+            股票代码，如 '000001.SZ'
+        start_date : str, optional
+            开始日期 YYYY-MM-DD
+        end_date : str, optional
+            结束日期 YYYY-MM-DD
+
+        Returns
+        -------
+        pd.DataFrame: 包含 ts_code, trade_date, open, high, low, close, volume, amount, pct_chg, turnover, adj_factor
+        """
+        if not HAS_DUCKDB:
+            return pd.DataFrame()
+
+        sql = "SELECT * FROM daily_bar_adjusted WHERE ts_code = ?"
+        params = [ts_code]
+
+        if start_date:
+            sql += " AND trade_date >= ?"
+            params.append(start_date)
+        if end_date:
+            sql += " AND trade_date <= ?"
+            params.append(end_date)
+
+        sql += " ORDER BY trade_date"
+
+        return self.query(sql, tuple(params))
 
     # ──────────────────────────────────────────────────────────
     # 增量更新（多线程 + 重试 + 断点续传）
