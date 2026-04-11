@@ -29,11 +29,10 @@ from loguru import logger
 # ──────────────────────────────────────────────────────────────
 # 全局常量
 # ──────────────────────────────────────────────────────────────
-DEFAULT_START_DATE = "2018-01-01"     # 默认数据起始日期（可覆盖）
-# 说明：2018-01-01 是合理的回测起点：
-#   - 2015年股灾后市场已充分调整
-#   - 覆盖2016-2018供给侧改革周期
-#   - 确保有足够历史数据用于因子计算
+# 数据起始日期：环境变量 STOCK_START_DATE 优先，否则使用默认值
+# 默认 2018-01-01：合理回测起点（2015年股灾后市场充分调整，
+# 覆盖2016-2018供给侧改革周期，确保有足够历史数据用于因子计算）
+DEFAULT_START_DATE = os.environ.get("STOCK_START_DATE", "2018-01-01")
 DEFAULT_ADJ_TOLERANCE = 0.005         # 交叉验证容差 0.5%
 DEFAULT_SAMPLE_RATIO = 0.05           # 交叉验证抽样比例 5%
 DEFAULT_ADJ_CHANGE_THRESHOLD = 0.05   # 复权因子变化告警阈值 5%
@@ -166,8 +165,8 @@ class DataEngine:
             'STOCK_DB_PATH', str(project_root / 'data' / 'stock_data.duckdb')))
         self.parquet_dir = Path(parquet_dir or os.environ.get(
             'STOCK_PARQUET_DIR', str(project_root / 'data' / 'parquet')))
-        # 可配置的起始日期（支持环境变量或参数覆盖）
-        self.start_date = os.environ.get('STOCK_START_DATE', start_date or DEFAULT_START_DATE)
+        # 可配置的起始日期：参数优先，否则使用 DEFAULT_START_DATE（含环境变量优先级）
+        self.start_date = start_date if start_date else DEFAULT_START_DATE
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.parquet_dir.mkdir(parents=True, exist_ok=True)
         self.validator = DataValidator()
@@ -2283,8 +2282,15 @@ class DataEngine:
         }
 
         if symbols is None:
-            local = self._get_local_stocks()
-            symbols = local["symbol"].tolist()
+            # 使用 get_active_stocks() PIT 查询获取当前可交易股票池
+            # 不再依赖 _get_local_stocks()（仅保留为显式维护路径）
+            today = self._get_now().strftime("%Y-%m-%d")
+            symbols = self.get_active_stocks(today)
+            if not symbols:
+                raise RuntimeError(
+                    "get_active_stocks() 返回空列表，stock_basic_history 表可能为空。"
+                    "请先调用 sync_stock_list() 同步数据。"
+                )
             stats["total"] = len(symbols)
 
         latest_local = self.get_latest_date()
