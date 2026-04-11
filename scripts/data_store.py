@@ -73,10 +73,14 @@ class DataStore:
     def _init_schema(self) -> None:
         """初始化数据库Schema（使用SQL配置中心）"""
         with self.pool.get_connection() as conn:
-            # 使用SQL配置中心创建核心表
-            for table_name in ["stock_basic", "daily_quotes", "financial_data", "trade_calendar"]:
-                sql = get_sql("schema", table_name)
-                conn.execute(sql)
+            # 使用SQL配置中心创建核心表（使用新口径）
+            for table_name in ["stock_basic_history", "daily_bar_adjusted", "daily_bar_raw",
+                               "financial_data", "trade_calendar", "index_constituents_history"]:
+                try:
+                    sql = get_sql("schema", table_name)
+                    conn.execute(sql)
+                except Exception as e:
+                    logger.warning(f"Failed to init schema for {table_name}: {e}")
             
             conn.commit()
             logger.info(f"Schema initialized: {self.db_path}")

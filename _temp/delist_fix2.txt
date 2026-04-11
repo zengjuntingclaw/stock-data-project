@@ -1,0 +1,9 @@
+Delisted: 327 stocks
+Starting concurrent query (8 workers)...
+  Progress: 20/327
+  Progress: 40/327
+  Progress: 60/327
+  Progress: 80/327
+  Progress: 100/327
+  Progress: 120/327
+  Progress: 140/327

@@ -160,7 +160,7 @@ class PartitionedStorage:
             return DataTier.COLD
     
     def archive_to_parquet(self, 
-                          table: str = "daily_quotes",
+                          table: str = "daily_bar_adjusted",
                           year: Optional[int] = None,
                           compress: bool = True) -> Optional[Path]:
         """
@@ -311,17 +311,20 @@ class PartitionedStorage:
         return result
     
     # 允许的表白名单（防止SQL注入）
+    # 注意：旧表 daily_quotes/stock_basic/index_constituents 已废弃
     _ALLOWED_TABLES = frozenset({
-        'daily_quotes', 'stock_basic', 'financial_data', 'index_constituents',
+        'daily_bar_adjusted', 'daily_bar_raw', 'stock_basic_history',
+        'financial_data', 'index_constituents_history',
         'st_status_history', 'trade_calendar', 'daily_valuation'
     })
     
     # Parquet目录映射（表名 → 目录名，显式映射避免下划线规则歧义）
     _PARQUET_DIR_MAP = {
-        'daily_quotes': 'daily',
-        'stock_basic': 'basic',
+        'daily_bar_adjusted': 'daily_adj',
+        'daily_bar_raw': 'daily_raw',
+        'stock_basic_history': 'basic_hist',
         'financial_data': 'financial',
-        'index_constituents': 'index',
+        'index_constituents_history': 'index_hist',
         'st_status_history': 'status',
         'trade_calendar': 'calendar',
         'daily_valuation': 'valuation',

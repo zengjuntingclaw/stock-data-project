@@ -323,7 +323,7 @@ class SurvivorshipBiasHandler:
             start_date = (delist_date - timedelta(days=30)).strftime('%Y-%m-%d')
             
             df = engine.query("""
-                SELECT * FROM daily_quotes
+                SELECT * FROM daily_bar_adjusted
                 WHERE ts_code = ? AND trade_date BETWEEN ? AND ?
                 ORDER BY trade_date DESC
                 LIMIT 5

@@ -10,6 +10,75 @@ from typing import Dict
 # ─────────────────────────────────────────────────────────────
 
 SCHEMA_SQL: Dict[str, str] = {
+    # ── 新口径表（PIT支持）────────────────────────────
+    "stock_basic_history": """
+        CREATE TABLE IF NOT EXISTS stock_basic_history (
+            ts_code TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            name TEXT,
+            exchange TEXT,
+            board TEXT,
+            industry TEXT,
+            market TEXT,
+            list_date DATE,
+            delist_date DATE,
+            is_delisted BOOLEAN DEFAULT FALSE,
+            eff_date DATE NOT NULL,
+            end_date DATE,
+            PRIMARY KEY (ts_code, eff_date)
+        )
+    """,
+
+    "daily_bar_raw": """
+        CREATE TABLE IF NOT EXISTS daily_bar_raw (
+            ts_code TEXT NOT NULL,
+            trade_date DATE NOT NULL,
+            open DOUBLE,
+            high DOUBLE,
+            low DOUBLE,
+            close DOUBLE,
+            pre_close DOUBLE,
+            volume BIGINT,
+            amount DOUBLE,
+            pct_chg DOUBLE,
+            turnover DOUBLE,
+            PRIMARY KEY (ts_code, trade_date)
+        )
+    """,
+
+    "daily_bar_adjusted": """
+        CREATE TABLE IF NOT EXISTS daily_bar_adjusted (
+            ts_code TEXT NOT NULL,
+            trade_date DATE NOT NULL,
+            open DOUBLE,
+            high DOUBLE,
+            low DOUBLE,
+            close DOUBLE,
+            pre_close DOUBLE,
+            volume BIGINT,
+            amount DOUBLE,
+            pct_chg DOUBLE,
+            turnover DOUBLE,
+            adj_factor DOUBLE DEFAULT 1.0,
+            qfq_open DOUBLE,
+            qfq_high DOUBLE,
+            qfq_low DOUBLE,
+            qfq_close DOUBLE,
+            PRIMARY KEY (ts_code, trade_date)
+        )
+    """,
+
+    "index_constituents_history": """
+        CREATE TABLE IF NOT EXISTS index_constituents_history (
+            index_code TEXT NOT NULL,
+            ts_code TEXT NOT NULL,
+            in_date DATE NOT NULL,
+            out_date DATE,
+            PRIMARY KEY (index_code, ts_code, in_date)
+        )
+    """,
+
+    # ── 旧表（已废弃，保留用于兼容）────────────────────
     "stock_basic": """
         CREATE TABLE IF NOT EXISTS stock_basic (
             symbol TEXT PRIMARY KEY,
@@ -23,7 +92,7 @@ SCHEMA_SQL: Dict[str, str] = {
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """,
-    
+
     "daily_quotes": """
         CREATE TABLE IF NOT EXISTS daily_quotes (
             symbol TEXT NOT NULL,
@@ -244,100 +313,123 @@ SCHEMA_SQL: Dict[str, str] = {
 # ─────────────────────────────────────────────────────────────
 
 QUERY_SQL: Dict[str, str] = {
-    # 股票基础信息
+    # 股票基础信息（新口径 - 使用 stock_basic_history）
     "get_stock_basic": """
-        SELECT * FROM stock_basic 
-        WHERE symbol = ?
+        SELECT h.* FROM (
+            SELECT ts_code, MAX(eff_date) as latest_eff
+            FROM stock_basic_history WHERE ts_code = ? GROUP BY ts_code
+        ) latest
+        JOIN stock_basic_history h ON h.ts_code = latest.ts_code AND h.eff_date = latest.latest_eff
     """,
-    
+
     "get_stock_by_ts_code": """
-        SELECT * FROM stock_basic 
-        WHERE ts_code = ?
+        SELECT h.* FROM (
+            SELECT ts_code, MAX(eff_date) as latest_eff
+            FROM stock_basic_history WHERE ts_code = ? GROUP BY ts_code
+        ) latest
+        JOIN stock_basic_history h ON h.ts_code = latest.ts_code AND h.eff_date = latest.latest_eff
     """,
-    
+
     "get_all_stocks": """
-        SELECT * FROM stock_basic 
-        WHERE is_delisted = FALSE
-        ORDER BY symbol
+        SELECT h.* FROM (
+            SELECT ts_code, MAX(eff_date) as latest_eff
+            FROM stock_basic_history GROUP BY ts_code
+        ) latest
+        JOIN stock_basic_history h ON h.ts_code = latest.ts_code AND h.eff_date = latest.latest_eff
+        WHERE h.is_delisted = FALSE
+        ORDER BY h.symbol
     """,
-    
+
     "get_delisted_stocks": """
-        SELECT * FROM stock_basic 
-        WHERE is_delisted = TRUE
+        SELECT h.* FROM (
+            SELECT ts_code, MAX(eff_date) as latest_eff
+            FROM stock_basic_history GROUP BY ts_code
+        ) latest
+        JOIN stock_basic_history h ON h.ts_code = latest.ts_code AND h.eff_date = latest.latest_eff
+        WHERE h.is_delisted = TRUE
     """,
-    
-    # 日线数据
+
+    # 日线数据（新口径 - 使用 daily_bar_adjusted）
     "get_daily_quotes": """
-        SELECT * FROM daily_quotes 
-        WHERE symbol = ? AND trade_date BETWEEN ? AND ?
+        SELECT * FROM daily_bar_adjusted
+        WHERE ts_code = ? AND trade_date BETWEEN ? AND ?
         ORDER BY trade_date
     """,
-    
+
     "get_latest_quote": """
-        SELECT * FROM daily_quotes 
-        WHERE symbol = ?
-        ORDER BY trade_date DESC 
+        SELECT * FROM daily_bar_adjusted
+        WHERE ts_code = ?
+        ORDER BY trade_date DESC
         LIMIT 1
     """,
-    
+
     "get_max_trade_date": """
-        SELECT MAX(trade_date) as max_date 
-        FROM daily_quotes 
-        WHERE symbol = ?
+        SELECT MAX(trade_date) as max_date
+        FROM daily_bar_adjusted
+        WHERE ts_code = ?
     """,
-    
+
     # 交易日历
     "get_trade_dates": """
-        SELECT cal_date FROM trade_calendar 
+        SELECT cal_date FROM trade_calendar
         WHERE is_open = TRUE AND cal_date BETWEEN ? AND ?
         ORDER BY cal_date
     """,
-    
+
     "is_trade_date": """
-        SELECT is_open FROM trade_calendar 
+        SELECT is_open FROM trade_calendar
         WHERE cal_date = ?
     """,
-    
+
     # 财务数据（PIT查询）
     "get_financial_data_pit": """
-        SELECT * FROM financial_data 
-        WHERE ts_code = ? 
+        SELECT * FROM financial_data
+        WHERE ts_code = ?
         AND ann_date < ?
-        ORDER BY ann_date DESC 
+        ORDER BY ann_date DESC
         LIMIT 1
     """,
-    
+
     # 版本化数据
     "get_versioned_data_pit": """
-        SELECT * FROM versioned_data 
-        WHERE ts_code = ? 
+        SELECT * FROM versioned_data
+        WHERE ts_code = ?
         AND data_type = ?
         AND trade_date = ?
         AND effective_at < ?
-        ORDER BY version DESC 
+        ORDER BY version DESC
         LIMIT 1
     """,
-    
+
     "get_version_history": """
-        SELECT * FROM versioned_data 
-        WHERE ts_code = ? 
+        SELECT * FROM versioned_data
+        WHERE ts_code = ?
         AND data_type = ?
         AND trade_date = ?
         ORDER BY version DESC
     """,
-    
-    # 数据统计
+
+    # 数据统计（新口径）
     "count_daily_quotes": """
-        SELECT COUNT(*) as cnt FROM daily_quotes
+        SELECT COUNT(*) as cnt FROM daily_bar_adjusted
     """,
-    
+
     "count_stocks": """
-        SELECT COUNT(*) as cnt FROM stock_basic
+        SELECT COUNT(*) as cnt FROM (
+            SELECT ts_code, MAX(eff_date) as latest_eff
+            FROM stock_basic_history GROUP BY ts_code
+        ) latest
+        JOIN stock_basic_history h ON h.ts_code = latest.ts_code AND h.eff_date = latest.latest_eff
+        WHERE h.is_delisted = FALSE
     """,
-    
+
     "count_delisted": """
-        SELECT COUNT(*) as cnt FROM stock_basic 
-        WHERE is_delisted = TRUE
+        SELECT COUNT(*) as cnt FROM (
+            SELECT ts_code, MAX(eff_date) as latest_eff
+            FROM stock_basic_history GROUP BY ts_code
+        ) latest
+        JOIN stock_basic_history h ON h.ts_code = latest.ts_code AND h.eff_date = latest.latest_eff
+        WHERE h.is_delisted = TRUE
     """,
 
     # ── 2026-04-11 新增 PIT / 分层查询 ──────────────────────────
@@ -409,31 +501,85 @@ QUERY_SQL: Dict[str, str] = {
 # ─────────────────────────────────────────────────────────────
 
 DML_SQL: Dict[str, str] = {
-    # 股票列表
+    # 股票列表（新口径 - stock_basic_history）
     "upsert_stock": """
-        INSERT OR REPLACE INTO stock_basic 
-        (symbol, ts_code, name, industry, list_date, delist_date, is_delisted, board_type)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO stock_basic_history
+        (ts_code, symbol, name, exchange, board, industry, market,
+         list_date, delist_date, is_delisted, eff_date, end_date)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (ts_code, eff_date) DO UPDATE SET
+            name         = excluded.name,
+            exchange     = excluded.exchange,
+            board        = excluded.board,
+            industry     = excluded.industry,
+            market       = excluded.market,
+            list_date    = excluded.list_date,
+            delist_date  = excluded.delist_date,
+            is_delisted  = excluded.is_delisted,
+            end_date     = excluded.end_date
     """,
-    
+
     "delete_stock": """
-        DELETE FROM stock_basic WHERE symbol = ?
+        UPDATE stock_basic_history
+        SET end_date = CURRENT_DATE
+        WHERE ts_code = ? AND end_date IS NULL
     """,
-    
-    # 日线数据
+
+    # 日线数据（新口径 - daily_bar_raw / daily_bar_adjusted）
+    "upsert_daily_raw": """
+        INSERT INTO daily_bar_raw
+        (ts_code, trade_date, open, high, low, close, pre_close,
+         volume, amount, pct_chg, turnover)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (ts_code, trade_date) DO UPDATE SET
+            open      = excluded.open,
+            high      = excluded.high,
+            low       = excluded.low,
+            close     = excluded.close,
+            pre_close = excluded.pre_close,
+            volume    = excluded.volume,
+            amount    = excluded.amount,
+            pct_chg   = excluded.pct_chg,
+            turnover  = excluded.turnover
+    """,
+
+    "upsert_daily_adjusted": """
+        INSERT INTO daily_bar_adjusted
+        (ts_code, trade_date, open, high, low, close, pre_close,
+         volume, amount, pct_chg, turnover, adj_factor,
+         qfq_open, qfq_high, qfq_low, qfq_close)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (ts_code, trade_date) DO UPDATE SET
+            open       = excluded.open,
+            high       = excluded.high,
+            low        = excluded.low,
+            close      = excluded.close,
+            pre_close  = excluded.pre_close,
+            volume     = excluded.volume,
+            amount     = excluded.amount,
+            pct_chg    = excluded.pct_chg,
+            turnover   = excluded.turnover,
+            adj_factor = excluded.adj_factor,
+            qfq_open   = excluded.qfq_open,
+            qfq_high   = excluded.qfq_high,
+            qfq_low    = excluded.qfq_low,
+            qfq_close  = excluded.qfq_close
+    """,
+
+    # 旧表 DML（已废弃，仅保留兼容）
     "upsert_daily_quotes": """
-        INSERT OR REPLACE INTO daily_quotes 
+        INSERT OR REPLACE INTO daily_quotes
         (symbol, ts_code, trade_date, open, high, low, close, volume, amount, pct_chg, adj_factor, turnover)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """,
-    
+
     "delete_daily_by_symbol": """
-        DELETE FROM daily_quotes WHERE symbol = ?
+        DELETE FROM daily_bar_raw WHERE ts_code = ?
     """,
-    
+
     "delete_daily_by_date_range": """
-        DELETE FROM daily_quotes 
-        WHERE symbol = ? AND trade_date BETWEEN ? AND ?
+        DELETE FROM daily_bar_raw
+        WHERE ts_code = ? AND trade_date BETWEEN ? AND ?
     """,
     
     # 财务数据

@@ -147,13 +147,13 @@ class ProductionDataSystem:
         统一价格数据查询（自动路由热/冷数据）
         """
         return self.partitioned.query(
-            table='daily_quotes',
+            table='daily_bar_adjusted',  # 使用新口径
             start_date=start_date,
             end_date=end_date,
             ts_codes=ts_codes,
             columns=columns
         )
-    
+
     def get_rolling_window(self,
                           ts_code: str,
                           end_date: str,
@@ -162,23 +162,23 @@ class ProductionDataSystem:
         获取滚动窗口数据（缓存优化）
         """
         return self.ts_optimizer.get_rolling_window(
-            table='daily_quotes',
+            table='daily_bar_adjusted',  # 使用新口径
             ts_code=ts_code,
             end_date=end_date,
             window_days=window_days
         )
-    
+
     def archive_cold_data(self, year: Optional[int] = None):
         """
         归档冷数据到Parquet
-        
+
         Parameters
         ----------
         year : int, optional
             指定年份，默认归档所有超过2年的数据
         """
         return self.partitioned.archive_to_parquet(
-            table='daily_quotes',
+            table='daily_bar_adjusted',  # 使用新口径
             year=year,
             compress=True
         )

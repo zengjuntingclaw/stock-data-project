@@ -1,0 +1,90 @@
+﻿C:\Users\zengj\AppData\Local\Programs\Python\Python312\python.exe : [32m2026-04-11 12:50:14.931[0m | [1mINFO    [0m
+ | [36mscripts.data_engine[0m:[36m_init_schema[0m:[36m463[0m - [1mDataEngine schema initialized: C:\Users\zengj\
+AppData\Local\Temp\tmpvu1xba3b\test_2014187767520.duckdb[0m
+所在位置 行:1 字符: 164
++ ... ing]::UTF8; C:\Users\zengj\AppData\Local\Programs\Python\Python312\py ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ([32m2026-04-11...7520.duckdb[0m:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+.[32m2026-04-11 12:50:15.031[0m | [1mINFO    [0m | [36mscripts.data_engine[0m:[36m_init_schema[0m:[36m463[0m 
+- [1mDataEngine schema initialized: C:\Users\zengj\AppData\Local\Temp\tmpvu1xba3b\test_2014187767328.duckdb[0m
+.[32m2026-04-11 12:50:15.124[0m | [1mINFO    [0m | [36mscripts.data_engine[0m:[36m_init_schema[0m:[36m463[0m 
+- [1mDataEngine schema initialized: C:\Users\zengj\AppData\Local\Temp\tmpvu1xba3b\test_2014187766896.duckdb[0m
+.[32m2026-04-11 12:50:15.253[0m | [1mINFO    [0m | [36mscripts.data_engine[0m:[36m_init_schema[0m:[36m463[0m 
+- [1mDataEngine schema initialized: C:\Users\zengj\AppData\Local\Temp\tmpvu1xba3b\test_2014187767232.duckdb[0m
+.[32m2026-04-11 12:50:15.344[0m | [1mINFO    [0m | [36mscripts.data_engine[0m:[36m_init_schema[0m:[36m463[0m 
+- [1mDataEngine schema initialized: C:\Users\zengj\AppData\Local\Temp\tmplbvbcc4n\test_2014187771504.duckdb[0m
+[32m2026-04-11 12:50:15.523[0m | [1mINFO    [0m | [36mscripts.data_engine[0m:[36mrun_data_quality_check[0m:[36
+m2439[0m - [1mData quality check [2024-01-01~2024-01-31]: total=1 alerts | {'duplicate_rows': 0, 'ohlc_violation': 1,
+ 'pct_chg_extreme': 0, 'adj_factor_jump': 0, 'zero_volume_non_suspend': 0, 'delisted_with_future_data': 0, 'adj_raw_rat
+io_invalid': 0}[0m
+.[32m2026-04-11 12:50:15.563[0m | [1mINFO    [0m | [36mscripts.data_engine[0m:[36m_init_schema[0m:[36m463[0m 
+- [1mDataEngine schema initialized: C:\Users\zengj\AppData\Local\Temp\tmplbvbcc4n\test_2014187771408.duckdb[0m
+[32m2026-04-11 12:50:15.681[0m | [1mINFO    [0m | [36mscripts.data_engine[0m:[36mrun_data_quality_check[0m:[36
+m2439[0m - [1mData quality check [2024-01-01~2024-01-31]: total=1 alerts | {'duplicate_rows': 0, 'ohlc_violation': 0,
+ 'pct_chg_extreme': 1, 'adj_factor_jump': 0, 'zero_volume_non_suspend': 0, 'delisted_with_future_data': 0, 'adj_raw_rat
+io_invalid': 0}[0m
+.[32m2026-04-11 12:50:15.709[0m | [1mINFO    [0m | [36mscripts.data_engine[0m:[36m_init_schema[0m:[36m463[0m 
+- [1mDataEngine schema initialized: C:\Users\zengj\AppData\Local\Temp\tmplbvbcc4n\test_2014187771312.duckdb[0m
+[32m2026-04-11 12:50:15.789[0m | [1mINFO    [0m | [36mscripts.data_engine[0m:[36mrun_data_quality_check[0m:[36
+m2439[0m - [1mData quality check [2024-01-01~2024-01-31]: total=0 alerts | {'duplicate_rows': 0, 'ohlc_violation': 0,
+ 'pct_chg_extreme': 0, 'adj_factor_jump': 0, 'zero_volume_non_suspend': 0, 'delisted_with_future_data': 0, 'adj_raw_rat
+io_invalid': 0}[0m
+.[32m2026-04-11 12:50:15.823[0m | [1mINFO    [0m | [36mscripts.data_engine[0m:[36m_init_schema[0m:[36m463[0m 
+- [1mDataEngine schema initialized: C:\Users\zengj\AppData\Local\Temp\tmpcsjacehb\test_2014187772272.duckdb[0m
+.[32m2026-04-11 12:50:15.852[0m | [1mINFO    [0m | [36mscripts.data_engine[0m:[36m_init_schema[0m:[36m463[0m 
+- [1mDataEngine schema initialized: C:\Users\zengj\AppData\Local\Temp\tmpcsjacehb\test_2014185821088.duckdb[0m
+.[32m2026-04-11 12:50:15.881[0m | [1mINFO    [0m | [36mscripts.data_engine[0m:[36m_init_schema[0m:[36m463[0m 
+- [1mDataEngine schema initialized: C:\Users\zengj\AppData\Local\Temp\tmpcsjacehb\test_2014181522416.duckdb[0m
+.[32m2026-04-11 12:50:15.909[0m | [1mINFO    [0m | [36mscripts.data_engine[0m:[36m_init_schema[0m:[36m463[0m 
+- [1mDataEngine schema initialized: C:\Users\zengj\AppData\Local\Temp\tmpcsjacehb\test_2014187772176.duckdb[0m
+.[32m2026-04-11 12:50:15.940[0m | [1mINFO    [0m | [36mscripts.data_engine[0m:[36m_init_schema[0m:[36m463[0m 
+- [1mDataEngine schema initialized: C:\Users\zengj\AppData\Local\Temp\tmpcsjacehb\test_2014187772080.duckdb[0m
+.[32m2026-04-11 12:50:15.970[0m | [1mINFO    [0m | [36mscripts.data_engine[0m:[36m_init_schema[0m:[36m463[0m 
+- [1mDataEngine schema initialized: C:\Users\zengj\AppData\Local\Temp\tmpcsjacehb\test_2014187771984.duckdb[0m
+.[32m2026-04-11 12:50:15.999[0m | [1mINFO    [0m | [36mscripts.data_engine[0m:[36m_init_schema[0m:[36m463[0m 
+- [1mDataEngine schema initialized: C:\Users\zengj\AppData\Local\Temp\tmpcsjacehb\test_2014187771888.duckdb[0m
+.[32m2026-04-11 12:50:16.028[0m | [1mINFO    [0m | [36mscripts.data_engine[0m:[36m_init_schema[0m:[36m463[0m 
+- [1mDataEngine schema initialized: C:\Users\zengj\AppData\Local\Temp\tmpqse9f8p9\test_2014187772368.duckdb[0m
+.[32m2026-04-11 12:50:16.143[0m | [1mINFO    [0m | [36mscripts.data_engine[0m:[36m_init_schema[0m:[36m463[0m 
+- [1mDataEngine schema initialized: C:\Users\zengj\AppData\Local\Temp\tmpqse9f8p9\test_2014187771792.duckdb[0m
+.[32m2026-04-11 12:50:16.221[0m | [1mINFO    [0m | [36mscripts.data_engine[0m:[36m_init_schema[0m:[36m463[0m 
+- [1mDataEngine schema initialized: C:\Users\zengj\AppData\Local\Temp\tmpqse9f8p9\test_2014187771600.duckdb[0m
+.[32m2026-04-11 12:50:16.305[0m | [1mINFO    [0m | [36mscripts.data_engine[0m:[36m_init_schema[0m:[36m463[0m 
+- [1mDataEngine schema initialized: C:\Users\zengj\AppData\Local\Temp\tmp7vbp2cc_\test_2014187773040.duckdb[0m
+.[32m2026-04-11 12:50:16.500[0m | [1mINFO    [0m | [36mscripts.data_engine[0m:[36m_init_schema[0m:[36m463[0m 
+- [1mDataEngine schema initialized: C:\Users\zengj\AppData\Local\Temp\tmp7vbp2cc_\test_2014187772944.duckdb[0m
+.[32m2026-04-11 12:50:16.676[0m | [1mINFO    [0m | [36mscripts.data_engine[0m:[36m_init_schema[0m:[36m463[0m 
+- [1mDataEngine schema initialized: C:\Users\zengj\AppData\Local\Temp\tmp7vbp2cc_\test_2014187772848.duckdb[0m
+.[32m2026-04-11 12:50:16.848[0m | [1mINFO    [0m | [36mscripts.data_engine[0m:[36m_init_schema[0m:[36m463[0m 
+- [1mDataEngine schema initialized: C:\Users\zengj\AppData\Local\Temp\tmp7vbp2cc_\test_2014187772752.duckdb[0m
+.[32m2026-04-11 12:50:17.043[0m | [1mINFO    [0m | [36mscripts.data_engine[0m:[36m_init_schema[0m:[36m463[0m 
+- [1mDataEngine schema initialized: C:\Users\zengj\AppData\Local\Temp\tmp7vbp2cc_\test_2014187772656.duckdb[0m
+.[32m2026-04-11 12:50:17.231[0m | [1mINFO    [0m | [36mscripts.data_engine[0m:[36m_init_schema[0m:[36m463[0m 
+- [1mDataEngine schema initialized: C:\Users\zengj\AppData\Local\Temp\tmp7vbp2cc_\test_2014187772464.duckdb[0m
+.[32m2026-04-11 12:50:17.425[0m | [1mINFO    [0m | [36mscripts.data_engine[0m:[36m_init_schema[0m:[36m463[0m 
+- [1mDataEngine schema initialized: C:\Users\zengj\AppData\Local\Temp\tmp7vbp2cc_\test_2014187772560.duckdb[0m
+.[32m2026-04-11 12:50:17.635[0m | [1mINFO    [0m | [36mscripts.data_engine[0m:[36m_init_schema[0m:[36m463[0m 
+- [1mDataEngine schema initialized: C:\Users\zengj\AppData\Local\Temp\tmp8i6pjvz1\test_2014187777936.duckdb[0m
+.[32m2026-04-11 12:50:17.806[0m | [1mINFO    [0m | [36mscripts.data_engine[0m:[36m_init_schema[0m:[36m463[0m 
+- [1mDataEngine schema initialized: C:\Users\zengj\AppData\Local\Temp\tmp8i6pjvz1\test_2014187777888.duckdb[0m
+.[32m2026-04-11 12:50:17.892[0m | [1mINFO    [0m | [36mscripts.data_engine[0m:[36m_init_schema[0m:[36m463[0m 
+- [1mDataEngine schema initialized: C:\Users\zengj\AppData\Local\Temp\tmp8i6pjvz1\test_2014187773136.duckdb[0m
+.[32m2026-04-11 12:50:18.035[0m | [1mINFO    [0m | [36mscripts.data_engine[0m:[36m_init_schema[0m:[36m463[0m 
+- [1mDataEngine schema initialized: C:\Users\zengj\AppData\Local\Temp\tmp8i6pjvz1\test_2014187773232.duckdb[0m
+.[32m2026-04-11 12:50:18.130[0m | [1mINFO    [0m | [36mscripts.data_engine[0m:[36m_init_schema[0m:[36m463[0m 
+- [1mDataEngine schema initialized: C:\Users\zengj\AppData\Local\Temp\tmpme48j7w8\test_2014187778176.duckdb[0m
+.[32m2026-04-11 12:50:18.175[0m | [1mINFO    [0m | [36mscripts.data_engine[0m:[36m_init_schema[0m:[36m463[0m 
+- [1mDataEngine schema initialized: C:\Users\zengj\AppData\Local\Temp\tmpme48j7w8\test_2014187778128.duckdb[0m
+.[32m2026-04-11 12:50:18.230[0m | [1mINFO    [0m | [36mscripts.data_engine[0m:[36m_init_schema[0m:[36m463[0m 
+- [1mDataEngine schema initialized: C:\Users\zengj\AppData\Local\Temp\tmpme48j7w8\test_2014187778080.duckdb[0m
+.[32m2026-04-11 12:50:18.275[0m | [1mINFO    [0m | [36mscripts.data_engine[0m:[36m_init_schema[0m:[36m463[0m 
+- [1mDataEngine schema initialized: C:\Users\zengj\AppData\Local\Temp\tmpme48j7w8\test_2014187777984.duckdb[0m
+.[32m2026-04-11 12:50:18.328[0m | [1mINFO    [0m | [36mscripts.data_engine[0m:[36m_init_schema[0m:[36m463[0m 
+- [1mDataEngine schema initialized: C:\Users\zengj\AppData\Local\Temp\tmpme48j7w8\test_2014187778032.duckdb[0m
+.
+----------------------------------------------------------------------
+Ran 33 tests in 4.166s
+
+OK

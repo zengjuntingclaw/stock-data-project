@@ -431,7 +431,16 @@ class DataQAPipeline:
         
         # 获取股票列表 - 分层抽样确保覆盖
         if ts_codes is None:
-            stocks_df = self.data_engine.query("SELECT ts_code, industry FROM stock_basic WHERE is_delisted = FALSE")
+            # 使用 stock_basic_history 进行 PIT 查询（当前有效股票池）
+            stocks_df = self.data_engine.query("""
+                SELECT h.ts_code, h.industry FROM (
+                    SELECT ts_code, MAX(eff_date) as latest_eff
+                    FROM stock_basic_history GROUP BY ts_code
+                ) latest
+                JOIN stock_basic_history h
+                  ON h.ts_code = latest.ts_code AND h.eff_date = latest.latest_eff
+                WHERE h.is_delisted = FALSE
+            """)
             if not stocks_df.empty:
                 # 分层抽样：按行业抽样，确保各行业都有代表
                 if 'industry' in stocks_df.columns and not stocks_df['industry'].isna().all():
@@ -452,9 +461,9 @@ class DataQAPipeline:
         missing_report = []
         
         for ts_code in ts_codes[:100]:  # 抽样检查前100只
-            # 获取该股票的数据
+            # 获取该股票的数据（使用 daily_bar_adjusted 作为主表）
             df = self.data_engine.query("""
-                SELECT trade_date FROM daily_quotes
+                SELECT trade_date FROM daily_bar_adjusted
                 WHERE ts_code = ? AND trade_date BETWEEN ? AND ?
             """, (ts_code, start_date, end_date))
             
@@ -602,13 +611,13 @@ class DataQAPipeline:
                           start_date: str, 
                           end_date: str,
                           ts_codes: Optional[List[str]] = None) -> pd.DataFrame:
-        """获取价格数据"""
+        """获取价格数据（使用 daily_bar_adjusted 作为主表）"""
         if ts_codes:
             # 批量查询
             return self.data_engine.get_batch_stock_data(ts_codes, end_date)
         else:
             return self.data_engine.query("""
-                SELECT * FROM daily_quotes
+                SELECT * FROM daily_bar_adjusted
                 WHERE trade_date BETWEEN ? AND ?
             """, (start_date, end_date))
     

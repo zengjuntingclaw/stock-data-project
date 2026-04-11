@@ -1,0 +1,7 @@
+Step 1: Reset all is_delisted = FALSE
+Done
+Step 2: Get Baostock active stocks
+Baostock active: 7182
+Step 3: Local but not in Baostock: 327 (potential delisted)
+  Query 1-50/327...
+Step 1: Reset all is_delisted = FALSE

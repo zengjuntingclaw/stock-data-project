@@ -697,15 +697,23 @@ class DataEngine:
             return hist_df
         
         # 无历史数据，回退到当前表+日期过滤
-        logger.warning(f"No historical snapshot for {as_of_date}, using current data with date filter")
-        
+        # 使用 stock_basic_history 进行 PIT 查询
         with self.get_connection() as conn:
             df = conn.execute("""
-                SELECT * FROM stock_basic
-                WHERE (list_date IS NULL OR list_date <= ?)
-                  AND (delist_date IS NULL OR delist_date >= ?)
-            """, (as_of_date, as_of_date)).fetchdf()
-        
+                SELECT h.*
+                FROM (
+                    SELECT ts_code, MAX(eff_date) as latest_eff
+                    FROM stock_basic_history
+                    WHERE eff_date <= ?
+                    GROUP BY ts_code
+                ) latest
+                JOIN stock_basic_history h
+                  ON h.ts_code = latest.ts_code
+                 AND h.eff_date = latest.latest_eff
+                WHERE h.list_date <= ?
+                  AND (h.delist_date IS NULL OR h.delist_date > ?)
+            """, (as_of_date, as_of_date, as_of_date)).fetchdf()
+
         return df
 
     def get_all_stocks_historical(self, 
@@ -1060,12 +1068,19 @@ class DataEngine:
             return
 
         with self.get_connection() as conn:
-            # 从 stock_basic 获取含 ST 的股票列表
+            # 从 stock_basic_history 获取含 ST 的股票列表（当前快照）
             try:
-                # 先找到所有历史上曾是 ST 的股票
+                # 先找到所有历史上曾是 ST 的股票（取最新 eff_date 的记录）
                 st_stocks = conn.execute("""
-                    SELECT ts_code, name FROM stock_basic 
-                    WHERE name LIKE '%ST%' OR name LIKE '%*ST%'
+                    SELECT h.ts_code, h.name FROM (
+                        SELECT ts_code, MAX(eff_date) as latest_eff
+                        FROM stock_basic_history
+                        GROUP BY ts_code
+                    ) latest
+                    JOIN stock_basic_history h
+                      ON h.ts_code = latest.ts_code
+                     AND h.eff_date = latest.latest_eff
+                    WHERE h.name LIKE '%ST%' OR h.name LIKE '%*ST%'
                 """).fetchdf()
                 
                 if st_stocks.empty:
@@ -1308,28 +1323,32 @@ class DataEngine:
     def _get_local_stocks(self) -> pd.DataFrame:
         """
         从本地数据库获取股票列表。
-        
-        优先使用 stock_basic_history（PIT 历史表）获取当前有效股票池，
-        确保与 get_active_stocks() 口径一致。
-        仅当 stock_basic_history 为空时回退到 stock_basic。
+
+        只使用 stock_basic_history（PIT 历史表）获取当前有效股票池。
+        旧表 stock_basic 已废弃，不再使用。
+
+        Returns
+        -------
+        pd.DataFrame: 包含当前有效股票池（最新 eff_date 版本）
         """
-        # 优先从 PIT 历史表获取（推荐路径）
+        # 使用 PIT 历史表：取最新 eff_date 的记录作为当前状态
         pit_result = self.query("""
-            SELECT * FROM stock_basic_history 
+            SELECT * FROM stock_basic_history
             WHERE eff_date = (SELECT MAX(eff_date) FROM stock_basic_history)
         """)
-        if not pit_result.empty:
-            return pit_result
-        
-        # 回退到旧表（兼容性）
-        return self.query("SELECT * FROM stock_basic")
+        if pit_result.empty:
+            raise RuntimeError(
+                "stock_basic_history 表为空，请先调用 sync_stock_list() 同步数据。"
+                "旧表 stock_basic 已废弃，不支持回退。"
+            )
+        return pit_result
 
     def sync_stock_list(self, include_delisted: bool = True):
         """
         同步股票列表到本地数据库（含 list_date/delist_date/exchange/board）
 
         改进点：
-        1. 同时写入 stock_basic（当前快照）和 stock_basic_history（历史PIT版本）
+        1. 只写入 stock_basic_history（历史PIT版本），旧表 stock_basic 已废弃
         2. Baostock 补充精确的 list_date / delist_date
         3. exchange / board 统一由 exchange_mapping.classify_exchange() 派生，禁止自行拼接
         4. stock_basic_history 使用 UPSERT（ON CONFLICT DO UPDATE）防止重复记录
@@ -1387,22 +1406,10 @@ class DataEngine:
         df["end_date"] = pd.NaT
 
         with self.get_connection() as conn:
-            # ── 1. 写入 stock_basic（当前快照，全量覆盖）────────────
-            basic_cols = ["ts_code", "symbol", "name", "exchange", "board",
-                          "industry", "market", "list_date", "delist_date",
-                          "is_delisted"]
-            write_cols = [c for c in basic_cols if c in df.columns]
-            conn.execute("DELETE FROM stock_basic")
-            conn.register("tmp_basic", df[write_cols])
-            conn.execute(
-                f"INSERT INTO stock_basic ({','.join(write_cols)}) "
-                f"SELECT {','.join(write_cols)} FROM tmp_basic"
-            )
-            conn.execute("DROP VIEW IF EXISTS tmp_basic")
-
-            # ── 2. 写入 stock_basic_history（历史PIT层，仅追加/更新当日版本）──
+            # ── 只写入 stock_basic_history（历史PIT层）──────────────────────
             # UPSERT：同一 (ts_code, eff_date) 已存在则更新，不存在则插入
             # 保留历史版本：不删除旧 eff_date 的记录
+            # 旧表 stock_basic 已废弃，不再写入
             hist_cols = ["ts_code", "symbol", "name", "exchange", "board",
                          "industry", "market", "list_date", "delist_date",
                          "is_delisted", "eff_date", "end_date"]
@@ -2750,36 +2757,48 @@ class DataEngine:
         return df
 
     def is_delisted(self, ts_code: str) -> bool:
-        """检查股票是否已退市
-        
+        """检查股票是否已退市（PIT 查询，取当前最新状态）
+
         Parameters
         ----------
         ts_code : str
             股票代码如 '000001.SZ'
-            
+
         Returns
         -------
         bool: True 表示已退市
         """
-        result = self.query(
-            "SELECT is_delisted FROM stock_basic WHERE ts_code = ?",
-            (ts_code,)
-        )
+        # 使用 stock_basic_history 取最新 eff_date 的记录
+        result = self.query("""
+            SELECT is_delisted FROM (
+                SELECT ts_code, MAX(eff_date) as latest_eff
+                FROM stock_basic_history GROUP BY ts_code
+            ) latest
+            JOIN stock_basic_history h
+              ON h.ts_code = latest.ts_code AND h.eff_date = latest.latest_eff
+            WHERE h.ts_code = ?
+        """, (ts_code,))
         if result.empty:
             return False
         return bool(result.iloc[0, 0])
 
     def get_delist_date(self, ts_code: str) -> Optional[str]:
-        """获取退市日期
-        
+        """获取退市日期（PIT 查询，取当前最新状态）
+
         Returns
         -------
         str or None: 退市日期 YYYY-MM-DD，未退市返回 None
         """
-        result = self.query(
-            "SELECT delist_date FROM stock_basic WHERE ts_code = ? AND is_delisted = TRUE",
-            (ts_code,)
-        )
+        # 使用 stock_basic_history 取最新 eff_date 的记录
+        result = self.query("""
+            SELECT delist_date FROM (
+                SELECT ts_code, MAX(eff_date) as latest_eff
+                FROM stock_basic_history GROUP BY ts_code
+            ) latest
+            JOIN stock_basic_history h
+              ON h.ts_code = latest.ts_code AND h.eff_date = latest.latest_eff
+            WHERE h.ts_code = ? AND h.is_delisted = TRUE
+        """, (ts_code,))
         if result.empty or pd.isna(result.iloc[0, 0]):
             return None
         return pd.Timestamp(result.iloc[0, 0]).strftime("%Y-%m-%d")
@@ -2809,14 +2828,23 @@ class DataEngine:
         
         with self.get_connection() as conn:
             conn.register('tmp_delisted_filter', codes_df)
+            # 使用 stock_basic_history 进行 PIT 查询
             df = conn.execute("""
-                SELECT t.ts_code, s.symbol
+                SELECT t.ts_code, latest.symbol
                 FROM tmp_delisted_filter t
-                LEFT JOIN stock_basic s ON t.ts_code = s.ts_code
-                WHERE s.is_delisted IS NULL 
-                   OR s.is_delisted = FALSE
-                   OR s.delist_date IS NULL
-                   OR s.delist_date > ?
+                LEFT JOIN (
+                    SELECT h2.ts_code, h2.symbol, h2.is_delisted, h2.delist_date
+                    FROM (
+                        SELECT ts_code, MAX(eff_date) as latest_eff
+                        FROM stock_basic_history GROUP BY ts_code
+                    ) latest
+                    JOIN stock_basic_history h2
+                      ON h2.ts_code = latest.ts_code AND h2.eff_date = latest.latest_eff
+                ) latest ON t.ts_code = latest.ts_code
+                WHERE latest.is_delisted IS NULL
+                   OR latest.is_delisted = FALSE
+                   OR latest.delist_date IS NULL
+                   OR latest.delist_date > ?
             """, (as_of_date,)).fetchdf()
             conn.execute("DROP VIEW tmp_delisted_filter")
         
@@ -3188,8 +3216,10 @@ class DataEngine:
     # Parquet 导出
     # ──────────────────────────────────────────────────────────
     # 允许导出的表白名单（防止路径遍历和SQL注入）
+    # 注意：旧表 stock_basic/daily_quotes/index_constituents 已废弃
     _EXPORT_TABLE_WHITELIST = frozenset({
-        'daily_bar_adjusted', 'stock_basic', 'financial_data', 'index_constituents',
+        'daily_bar_adjusted', 'daily_bar_raw', 'stock_basic_history',
+        'financial_data', 'index_constituents_history',
         'st_status_history', 'trade_calendar', 'daily_valuation',
         'update_log', 'adj_factor_log', 'data_quality_alert',
     })
@@ -3227,9 +3257,15 @@ class DataEngine:
             AND (close <= 0 OR volume < 0 OR adj_factor <= 0)
         """, (start_date, end_date)).iloc[0, 0]
 
-        delisted = self.query(
-            "SELECT COUNT(*) FROM stock_basic WHERE is_delisted = TRUE"
-        ).iloc[0, 0]
+        delisted = self.query("""
+            SELECT COUNT(*) FROM (
+                SELECT ts_code, MAX(eff_date) as latest_eff
+                FROM stock_basic_history GROUP BY ts_code
+            ) latest
+            JOIN stock_basic_history h
+              ON h.ts_code = latest.ts_code AND h.eff_date = latest.latest_eff
+            WHERE h.is_delisted = TRUE
+        """).iloc[0, 0]
 
         return {
             "total_records": int(total),
