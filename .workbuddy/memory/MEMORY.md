@@ -78,6 +78,47 @@ refactor: 彻底移除旧口径 - 新增_fetch_remote_stocks/收紧get_all_stock
 SurvivorshipBiasHandler.get_universe(date)
   └── de.get_active_stocks(date)  [PIT ✅]
         └── stock_basic_history (JOIN eff_date <= trade_date)
+
+ProductionBacktestEngine (main_v2)
+  └── SurvivorshipBiasHandler(data_engine=de)
+        └── de.get_active_stocks(date)      [股票池 PIT ✅]
+        └── de.get_index_constituents()      [指数成分历史 ✅]
+        └── de.get_daily_raw/adjusted()     [双层行情 ✅]
+```
+
+## Schema Refactoring v5 (2026-04-11 20:27)
+
+### Commit: 121933a
+```
+refactor: 收口最后残留旧口径 - update_daily_data改用get_active_stocks/DEFAULT_START_DATE环境变量优先
+```
+
+### 核心收口完成
+1. **`update_daily_data(symbols=None)` 改用 `get_active_stocks(today)`**:
+   - 不再回退到 `_get_local_stocks()`（旧表快照路径）
+   - 使用 PIT 查询获取当前可交易股票池
+   - 空列表时明确抛出 RuntimeError
+
+2. **`DEFAULT_START_DATE` 环境变量优先**:
+   - `DEFAULT_START_DATE = os.environ.get('STOCK_START_DATE', '2018-01-01')`
+   - 构造函数简化为: `self.start_date = start_date if start_date else DEFAULT_START_DATE`
+   - 不再重复读取 os.environ
+
+3. **`_get_local_stocks()` 保留为显式维护路径**:
+   - 仅被极少量内部维护代码调用
+   - 主流程（回测/因子/策略）完全不经过此路径
+
+### 旧口径清理状态（v5.0 完成）
+| 路径 | 状态 | 说明 |
+|------|------|------|
+| `get_all_stocks()` | ✅ 废弃 | 失败时抛 RuntimeError |
+| `_get_local_stocks()` | ✅ 仅维护用 | 主流程不再调用 |
+| `update_daily_data` | ✅ 已修复 | symbols=None 走 get_active_stocks |
+| `save_snapshot` | ✅ 已修复 | 走 _fetch_remote_stocks |
+| `sync_stock_list` | ✅ 已修复 | 走 _fetch_remote_stocks |
+| `security_master` | ✅ 已修复 | 走 get_active_stocks |
+| `DEFAULT_START_DATE` | ✅ 可配置 | 环境变量优先 |
+        └── stock_basic_history (JOIN eff_date <= trade_date)
 ```
 
 ## Schema Refactoring v3 (2026-04-11 19:55)
