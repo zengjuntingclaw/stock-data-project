@@ -200,6 +200,43 @@ SCHEMA_SQL: Dict[str, str] = {
             PRIMARY KEY (index_code, ts_code, in_date)
         )
     """,
+
+    # ── 2026-04-11 补充缺失的 daily_bar_adjusted 和 sync_progress ──
+    "daily_bar_adjusted": """
+        CREATE TABLE IF NOT EXISTS daily_bar_adjusted (
+            ts_code       VARCHAR  NOT NULL,
+            trade_date    DATE     NOT NULL,
+            open          DOUBLE,
+            high          DOUBLE,
+            low           DOUBLE,
+            close         DOUBLE   NOT NULL,   -- 复权收盘价（= raw_close × adj_factor）
+            pre_close     DOUBLE,              -- 复权前收（用于复权 pct_chg 计算）
+            volume        BIGINT,
+            amount        DOUBLE,
+            pct_chg       DOUBLE,
+            turnover      DOUBLE,
+            adj_factor    DOUBLE DEFAULT 1.0,  -- 前复权因子（qfq）
+            is_suspend    BOOLEAN DEFAULT FALSE,
+            limit_up      BOOLEAN DEFAULT FALSE,
+            limit_down    BOOLEAN DEFAULT FALSE,
+            data_source   VARCHAR,
+            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (ts_code, trade_date)
+        )
+    """,
+
+    "sync_progress": """
+        CREATE TABLE IF NOT EXISTS sync_progress (
+            ts_code        VARCHAR NOT NULL,
+            table_name     VARCHAR NOT NULL,
+            last_sync_date DATE,
+            last_sync_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            total_records  INTEGER DEFAULT 0,
+            status         VARCHAR DEFAULT 'ok',
+            error_msg      VARCHAR,
+            PRIMARY KEY (ts_code, table_name)
+        )
+    """,
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -302,6 +339,69 @@ QUERY_SQL: Dict[str, str] = {
         SELECT COUNT(*) as cnt FROM stock_basic 
         WHERE is_delisted = TRUE
     """,
+
+    # ── 2026-04-11 新增 PIT / 分层查询 ──────────────────────────
+
+    # 按历史日期查询股票池（PIT，解决幸存者偏差）
+    "get_pit_stock_pool": """
+        SELECT ts_code, symbol, name, exchange, board,
+               list_date, delist_date, is_delisted,
+               CASE
+                   WHEN delist_date IS NULL THEN TRUE
+                   WHEN delist_date > CAST(? AS DATE) THEN TRUE
+                   ELSE FALSE
+               END AS is_tradable
+        FROM stock_basic_history
+        WHERE list_date <= CAST(? AS DATE)
+          AND (delist_date IS NULL OR delist_date > CAST(? AS DATE))
+        ORDER BY exchange, ts_code
+    """,
+
+    # 原始日线数据查询（不复权）
+    "get_daily_bar_raw": """
+        SELECT * FROM daily_bar_raw
+        WHERE ts_code = ? AND trade_date BETWEEN ? AND ?
+        ORDER BY trade_date
+    """,
+
+    # 复权日线数据查询
+    "get_daily_bar_adjusted": """
+        SELECT * FROM daily_bar_adjusted
+        WHERE ts_code = ? AND trade_date BETWEEN ? AND ?
+        ORDER BY trade_date
+    """,
+
+    # 两表联合查询（同时返回原始价和复权价，供回测比对）
+    "get_daily_bar_both": """
+        SELECT
+            r.ts_code, r.trade_date,
+            r.open  AS raw_open,  r.high  AS raw_high,
+            r.low   AS raw_low,   r.close AS raw_close,
+            a.open  AS adj_open,  a.high  AS adj_high,
+            a.low   AS adj_low,   a.close AS adj_close,
+            r.volume, r.amount, r.pct_chg, r.turnover,
+            a.adj_factor, a.is_suspend, a.limit_up, a.limit_down
+        FROM daily_bar_raw r
+        LEFT JOIN daily_bar_adjusted a
+          ON r.ts_code = a.ts_code AND r.trade_date = a.trade_date
+        WHERE r.ts_code = ? AND r.trade_date BETWEEN ? AND ?
+        ORDER BY r.trade_date
+    """,
+
+    # 增量同步进度查询
+    "get_sync_progress": """
+        SELECT ts_code, last_sync_date, total_records, status, error_msg, last_sync_at
+        FROM sync_progress
+        WHERE table_name = 'daily_bar_raw'
+        ORDER BY last_sync_date DESC
+    """,
+
+    # 最新数据质量报警（最近 N 条）
+    "get_recent_quality_alerts": """
+        SELECT * FROM data_quality_alert
+        ORDER BY created_at DESC
+        LIMIT ?
+    """,
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -380,6 +480,71 @@ DML_SQL: Dict[str, str] = {
         INSERT INTO data_audit 
         (ts_code, data_type, trade_date, check_type, check_result, details)
         VALUES (?, ?, ?, ?, ?, ?)
+    """,
+
+    # ── 2026-04-11 补充缺失的 DML ────────────────────────────────
+
+    # 原始日线数据（daily_bar_raw）写入
+    "upsert_daily_bar_raw": """
+        INSERT INTO daily_bar_raw
+            (ts_code, trade_date, symbol, open, high, low, close,
+             volume, amount, pct_chg, turnover, data_source)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (ts_code, trade_date) DO UPDATE SET
+            symbol      = excluded.symbol,
+            open        = excluded.open,
+            high        = excluded.high,
+            low         = excluded.low,
+            close       = excluded.close,
+            volume      = excluded.volume,
+            amount      = excluded.amount,
+            pct_chg     = excluded.pct_chg,
+            turnover    = excluded.turnover,
+            data_source = excluded.data_source
+    """,
+
+    # 复权日线数据（daily_bar_adjusted）写入
+    "upsert_daily_bar_adjusted": """
+        INSERT INTO daily_bar_adjusted
+            (ts_code, trade_date, open, high, low, close, pre_close,
+             volume, amount, pct_chg, turnover, adj_factor,
+             is_suspend, limit_up, limit_down, data_source)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (ts_code, trade_date) DO UPDATE SET
+            open        = excluded.open,
+            high        = excluded.high,
+            low         = excluded.low,
+            close       = excluded.close,
+            pre_close   = excluded.pre_close,
+            volume      = excluded.volume,
+            amount      = excluded.amount,
+            pct_chg     = excluded.pct_chg,
+            turnover    = excluded.turnover,
+            adj_factor  = excluded.adj_factor,
+            is_suspend  = excluded.is_suspend,
+            limit_up    = excluded.limit_up,
+            limit_down  = excluded.limit_down,
+            data_source = excluded.data_source
+    """,
+
+    # 同步进度（sync_progress）UPSERT
+    "upsert_sync_progress": """
+        INSERT INTO sync_progress
+            (ts_code, table_name, last_sync_date, total_records, status, error_msg)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT (ts_code, table_name) DO UPDATE SET
+            last_sync_date = GREATEST(sync_progress.last_sync_date, excluded.last_sync_date),
+            total_records  = sync_progress.total_records + excluded.total_records,
+            last_sync_at   = CURRENT_TIMESTAMP,
+            status         = excluded.status,
+            error_msg      = excluded.error_msg
+    """,
+
+    # 数据质量报警写入
+    "insert_data_quality_alert": """
+        INSERT INTO data_quality_alert
+            (alert_type, ts_code, trade_date, detail)
+        VALUES (?, ?, ?, ?)
     """,
 }
 

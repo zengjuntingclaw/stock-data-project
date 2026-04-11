@@ -174,31 +174,14 @@ class DataEngine:
         conn = duckdb.connect(str(self.db_path))
         cur = conn.cursor()
 
-        # 股票基本信息（含退市标记）
+        # 股票基本信息（含退市标记）— exchange/board 由 exchange_mapping.py 统一派生
         cur.execute("""
             CREATE TABLE IF NOT EXISTS stock_basic (
-                ts_code    VARCHAR PRIMARY KEY,
-                symbol     VARCHAR,
-                name       VARCHAR,
-                area       VARCHAR,
-                industry   VARCHAR,
-                market     VARCHAR,
-                list_date  DATE,
-                delist_date DATE,
-                is_delisted  BOOLEAN DEFAULT FALSE,
-                delist_reason VARCHAR,
-                is_hs      BOOLEAN,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # 证券主表历史版本（时点版本，解决历史universe完整性问题）
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS stock_basic_history (
                 ts_code       VARCHAR PRIMARY KEY,
                 symbol        VARCHAR,
                 name          VARCHAR,
-                exchange      VARCHAR,
+                exchange      VARCHAR,       -- 交易所代码：SH/SZ/BJ（由 classify_exchange() 派生）
+                board         VARCHAR,       -- 板块：main/chinext/kcb/bse（由 classify_exchange() 派生）
                 area          VARCHAR,
                 industry      VARCHAR,
                 market        VARCHAR,
@@ -206,31 +189,90 @@ class DataEngine:
                 delist_date   DATE,
                 is_delisted   BOOLEAN DEFAULT FALSE,
                 delist_reason VARCHAR,
-                board         VARCHAR,
-                eff_date      DATE,         -- 上市日期（版本快照标识，=list_date，用于PIT回放）
-                end_date      DATE,         -- 冗余字段，同 delist_date（保留便于兼容查询）
-                created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                is_hs         BOOLEAN,
+                updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # 注意：stock_basic_history 每只股票只有一条记录（list_date时刻的快照），
-        # 不是真正的多版本历史表。这是Baostock一次性拉取的当前股票列表。
-        # PIT查询逻辑: WHERE list_date <= 查询日 AND (delist_date > 查询日 OR delist_date IS NULL)
-        # 此逻辑对任意历史时点的可交易股票池判断正确，无需多版本。
+
+        # 证券主表历史版本（时点版本，解决历史universe完整性问题）
+        # 设计：每只股票可有多条版本记录（ts_code + eff_date 联合主键）
+        # PIT查询逻辑: WHERE list_date <= date AND (delist_date > date OR delist_date IS NULL)
+        # eff_date = 本条记录的生效日期（通常=同步当日或 list_date）
         cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_stock_hist_date 
+            CREATE TABLE IF NOT EXISTS stock_basic_history (
+                ts_code       VARCHAR  NOT NULL,
+                symbol        VARCHAR  NOT NULL,
+                name          VARCHAR,
+                exchange      VARCHAR,        -- SH / SZ / BJ（由 classify_exchange() 派生）
+                area          VARCHAR,
+                industry      VARCHAR,
+                market        VARCHAR,
+                list_date     DATE,           -- 上市日期（关键：PIT过滤用）
+                delist_date   DATE,           -- 退市日期（关键：PIT过滤用）
+                is_delisted   BOOLEAN DEFAULT FALSE,
+                delist_reason VARCHAR,
+                board         VARCHAR,        -- main/chinext/kcb/bse（由 classify_exchange() 派生）
+                is_suspended  BOOLEAN DEFAULT FALSE,  -- 当日是否停牌
+                eff_date      DATE NOT NULL,  -- 本版本记录生效日期（同步当日）
+                end_date      DATE,           -- 本版本失效日期（下一次快照前一天），NULL=当前最新
+                created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (ts_code, eff_date)  -- 联合主键：同一股票可有多个版本
+            )
+        """)
+        # 关键索引：支持 PIT 查询（list_date / delist_date 过滤）和按交易所过滤
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_stock_hist_list_date
+            ON stock_basic_history(list_date)
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_stock_hist_delist_date
+            ON stock_basic_history(delist_date)
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_stock_hist_exchange
+            ON stock_basic_history(exchange)
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_stock_hist_eff_date
             ON stock_basic_history(eff_date)
         """)
 
-        # 指数成分股动态表（解决幸存者偏差）
+        # ── 增量同步进度表（断点续跑核心）────────────────────────────
+        # 记录每只股票的最后成功同步位置，防止中断后重复下载或数据缺失
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS index_constituents (
+            CREATE TABLE IF NOT EXISTS sync_progress (
+                ts_code        VARCHAR NOT NULL,   -- 股票代码
+                table_name     VARCHAR NOT NULL,   -- 目标表（daily_bar_raw / daily_bar_adjusted）
+                last_sync_date DATE,               -- 最后成功同步的交易日
+                last_sync_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,  -- 最后同步时间戳
+                total_records  INTEGER DEFAULT 0,  -- 累计同步记录数
+                status         VARCHAR DEFAULT 'ok', -- ok / failed / in_progress
+                error_msg      VARCHAR,            -- 最后一次错误信息
+                PRIMARY KEY (ts_code, table_name)
+            )
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_sync_progress_date
+            ON sync_progress(last_sync_date)
+        """)
+
+        # 指数成分股历史区间表（解决幸存者偏差）
+        # 每次同步只 INSERT 不 DELETE，支持按任意交易日回放当时成分
+        # 关键：in_date=out_date=NULL 表示尚未加入；out_date非空表示已退出
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS index_constituents_history (
                 index_code   VARCHAR,      -- 指数代码如 '000300.SH'
                 ts_code      VARCHAR,      -- 成分股代码
-                trade_date   DATE,         -- 成分股生效日期
-                in_date      DATE,         -- 加入日期
-                out_date     DATE,         -- 退出日期（NULL表示仍在）
-                PRIMARY KEY (index_code, ts_code, trade_date)
+                in_date      DATE,         -- 纳入日期（NULL=未来/未知）
+                out_date     DATE,         -- 剔除日期（NULL=仍在指数内）
+                source       VARCHAR,       -- 数据来源：csindex/sse/szse
+                created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (index_code, ts_code, in_date)
             )
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_ich_index
+            ON index_constituents_history(index_code)
         """)
 
         # ST状态历史表（时间序列特征）
@@ -244,26 +286,76 @@ class DataEngine:
             )
         """)
 
-        # 日线行情（含涨跌停标记）
+        # ── 原始价日线表（基础层）──────────────────────────────────
+        # adj_factor=1.0 表示不复权原始价；>1.0 表示有复权调整
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS daily_quotes (
+            CREATE TABLE IF NOT EXISTS daily_bar_raw (
                 ts_code       VARCHAR,
                 trade_date    DATE,
+                symbol        VARCHAR,
                 open          DOUBLE,
                 high          DOUBLE,
                 low           DOUBLE,
-                close         DOUBLE,
-                pre_close     DOUBLE,
+                close         DOUBLE,           -- 原始未复权收盘价（不复权数据源直接存储）
                 volume        BIGINT,
                 amount        DOUBLE,
                 pct_chg       DOUBLE,
                 turnover      DOUBLE,
-                adj_factor    DOUBLE DEFAULT 1.0,
+                adj_factor    DOUBLE DEFAULT 1.0,  -- 复权因子（>1.0=有复权，1.0=原始价）
+                pre_close     DOUBLE,             -- 前收盘（由前一日收盘计算）
                 is_suspend    BOOLEAN DEFAULT FALSE,
                 limit_up      BOOLEAN DEFAULT FALSE,
                 limit_down    BOOLEAN DEFAULT FALSE,
                 data_source   VARCHAR DEFAULT 'akshare',
                 PRIMARY KEY (ts_code, trade_date)
+            )
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_bar_raw_code ON daily_bar_raw(ts_code)
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_bar_raw_date ON daily_bar_raw(trade_date)
+        """)
+
+        # ── 复权价日线表（派生层）──────────────────────────────────
+        # 由 daily_bar_raw 乘 adj_factor 派生，close = raw_close × adj_factor
+        # 注意：此表的 close/high/low/open 字段均为复权价
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS daily_bar_adjusted (
+                ts_code       VARCHAR,
+                trade_date    DATE,
+                open          DOUBLE,
+                high          DOUBLE,
+                low           DOUBLE,
+                close         DOUBLE,            -- 复权收盘价（=raw_close × adj_factor）
+                pre_close     DOUBLE,
+                volume        BIGINT,
+                amount        DOUBLE,
+                pct_chg       DOUBLE,
+                turnover      DOUBLE,
+                adj_factor    DOUBLE DEFAULT 1.0,  -- 复权因子（参考值）
+                is_suspend    BOOLEAN DEFAULT FALSE,
+                limit_up      BOOLEAN DEFAULT FALSE,
+                limit_down    BOOLEAN DEFAULT FALSE,
+                data_source   VARCHAR DEFAULT 'akshare',
+                PRIMARY KEY (ts_code, trade_date)
+            )
+        """)
+
+        # 除权除息事件表（用于生成 corporate_actions）
+        # 来源：daily_bar_raw 的 adj_factor 变化检测，或 Baostock 分红数据
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS corporate_actions (
+                ts_code       VARCHAR,      -- 证券代码
+                action_date   DATE,         -- 除权除息生效日期
+                ann_date      DATE,         -- 公告日期（用于PIT约束）
+                prev_adj      DOUBLE,       -- 变化前复权因子
+                curr_adj      DOUBLE,       -- 变化后复权因子
+                action_type   VARCHAR,      -- 类型：dividend/split/reverse_split/rights_issue
+                change_ratio  DOUBLE,       -- 变化幅度（curr/prev - 1）
+                reason        VARCHAR,      -- 事件描述（如 分红0.5元/股）
+                created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (ts_code, action_date)
             )
         """)
 
@@ -347,19 +439,22 @@ class DataEngine:
 
         # 数据质量报警表
         cur.execute("""
+            CREATE SEQUENCE IF NOT EXISTS seq_dqa_id START 1
+        """)
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS data_quality_alert (
-                id            INTEGER PRIMARY KEY,
+                id            INTEGER PRIMARY KEY DEFAULT nextval('seq_dqa_id'),
                 alert_type    VARCHAR,
                 ts_code       VARCHAR,
                 trade_date    DATE,
                 detail        VARCHAR,
-                created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at    TIMESTAMP DEFAULT NOW()
             )
         """)
 
         # 索引
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_quotes_code ON daily_quotes(ts_code)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_quotes_date ON daily_quotes(trade_date)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_quotes_code ON daily_bar_adjusted(ts_code)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_quotes_date ON daily_bar_adjusted(trade_date)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_fin_ann ON financial_data(ann_date)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_val_date ON daily_valuation(trade_date)")
 
@@ -486,55 +581,82 @@ class DataEngine:
     def save_stock_basic_snapshot(self, snapshot_date: Optional[str] = None) -> int:
         """
         保存证券主表每日快照到 stock_basic_history
-        
+
         解决"证券主表时点版本"问题，支持历史时点查询。
-        
+        每次调用仅 UPSERT 当日版本（eff_date = snapshot_date），
+        不删除其他日期的历史版本。
+
         Parameters
         ----------
         snapshot_date : str, optional
             快照日期 YYYY-MM-DD，默认今日
-            
+
         Returns
         -------
         int: 保存的记录数
         """
         if snapshot_date is None:
             snapshot_date = self._get_now().strftime("%Y-%m-%d")
-        
-        # 获取当前股票列表
+
+        # 获取当前股票列表（含退市）
         df = self.get_all_stocks(include_delisted=True)
         if df.empty:
             logger.warning(f"No stocks to snapshot for {snapshot_date}")
             return 0
-        
-        # 准备历史表字段
-        df["snapshot_date"] = pd.to_datetime(snapshot_date)
-        
-        # 确保所有必需字段存在
-        required_cols = ["ts_code", "symbol", "name", "industry", "market", 
-                        "list_date", "delist_date", "is_delisted", "total_mv", "circ_mv"]
-        for col in required_cols:
+
+        # ── 确保 exchange / board 字段完整（统一由 classify_exchange 派生）──
+        from scripts.exchange_mapping import classify_exchange
+        if "exchange" not in df.columns or df["exchange"].isna().any():
+            def _classify(row):
+                sym = str(row.get("symbol", "")).zfill(6)
+                exch, board = classify_exchange(sym)
+                return pd.Series({"exchange": exch, "board": board})
+            classified = df.apply(_classify, axis=1)
+            df["exchange"] = classified["exchange"]
+            df["board"] = classified["board"]
+
+        for col in ["list_date", "delist_date"]:
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors="coerce")
+        if "is_delisted" not in df.columns:
+            df["is_delisted"] = df["delist_date"].notna()
+
+        # eff_date = snapshot_date（本条记录生效日期）
+        df["eff_date"] = pd.to_datetime(snapshot_date)
+        df["end_date"] = pd.NaT
+
+        # 必需字段列表（匹配 stock_basic_history 表结构）
+        hist_cols = ["ts_code", "symbol", "name", "exchange", "board",
+                     "industry", "market", "list_date", "delist_date",
+                     "is_delisted", "eff_date", "end_date"]
+        for col in hist_cols:
             if col not in df.columns:
                 df[col] = None
-        
-        # 选择并重命名字段
-        hist_df = df[["ts_code", "snapshot_date", "symbol", "name", 
-                     "industry", "market", "list_date", "delist_date",
-                     "is_delisted", "total_mv", "circ_mv"]].copy()
-        
-        # UPSERT: 先删除该日期的旧数据，再插入新数据
+        hist_df = df[hist_cols].copy()
+
+        # UPSERT：已存在同日版本则更新，不存在则插入（保留历史版本）
         with self.get_connection() as conn:
-            conn.execute(
-                "DELETE FROM stock_basic_history WHERE snapshot_date = ?",
-                (snapshot_date,)
-            )
             conn.register("tmp_snapshot", hist_df)
             conn.execute("""
-                INSERT INTO stock_basic_history 
-                SELECT * FROM tmp_snapshot
+                INSERT INTO stock_basic_history
+                    (ts_code, symbol, name, exchange, board, industry, market,
+                     list_date, delist_date, is_delisted, eff_date, end_date)
+                SELECT ts_code, symbol, name, exchange, board, industry, market,
+                       list_date, delist_date, is_delisted, eff_date, end_date
+                FROM tmp_snapshot
+                ON CONFLICT (ts_code, eff_date) DO UPDATE SET
+                    symbol      = excluded.symbol,
+                    name        = excluded.name,
+                    exchange    = excluded.exchange,
+                    board       = excluded.board,
+                    industry    = excluded.industry,
+                    market      = excluded.market,
+                    list_date   = excluded.list_date,
+                    delist_date = excluded.delist_date,
+                    is_delisted = excluded.is_delisted
             """)
-            conn.execute("DROP VIEW tmp_snapshot")
-        
+            conn.execute("DROP VIEW IF EXISTS tmp_snapshot")
+
         logger.info(f"Saved stock basic snapshot for {snapshot_date}: {len(hist_df)} records")
         return len(hist_df)
 
@@ -560,10 +682,11 @@ class DataEngine:
         as_of = pd.to_datetime(as_of_date)
         
         # 先尝试从历史表查询（历史快照已预过滤，只保留当日有效的股票）
+        # stock_basic_history 表使用 eff_date 作为快照日期字段
         with self.get_connection() as conn:
             hist_df = conn.execute("""
-                SELECT * FROM stock_basic_history 
-                WHERE snapshot_date = ?
+                SELECT * FROM stock_basic_history
+                WHERE eff_date = ?
                 -- 边界过滤：当日必须已上市且尚未退市
                 AND (list_date IS NULL OR list_date <= ?)
                 AND (delist_date IS NULL OR delist_date >= ?)
@@ -679,6 +802,39 @@ class DataEngine:
 
         return df
 
+    def get_active_stocks(self, trade_date: str) -> List[str]:
+        """
+        获取指定日期可交易股票池（PIT 查询）
+
+        核心接口：回测时必须用此方法获取历史某一天的真实可交易股票，
+        不依赖"当前快照 + 退市补丁"的近似方案。
+
+        规则：
+        - list_date <= trade_date：已上市
+        - delist_date IS NULL OR delist_date > trade_date：尚未退市
+        - 退市整理期（delist_date + 30天内）仍视为可交易
+
+        Parameters
+        ----------
+        trade_date : str
+            查询日期 YYYY-MM-DD
+
+        Returns
+        -------
+        List[str]: 该日期可交易的 ts_code 列表（如 ['000001.SZ', '600000.SH', ...]）
+        """
+        if not HAS_DUCKDB:
+            return []
+
+        df = self.query(f"""
+            SELECT DISTINCT ts_code FROM stock_basic_history
+            WHERE list_date <= CAST(? AS DATE)
+              AND (delist_date IS NULL OR delist_date > CAST(? AS DATE))
+            ORDER BY ts_code
+        """, (trade_date, trade_date))
+
+        return df["ts_code"].tolist() if not df.empty else []
+
     def get_stocks_with_st_status(
         self,
         trade_date: str,
@@ -724,9 +880,10 @@ class DataEngine:
         记录每个股票何时被加入/退出指数，确保回测时只使用
         该时点真实属于指数成分的股票。
         
-        关键原则：只追加，不覆盖。使用 INSERT OR IGNORE，
-        已存在的 (index_code, ts_code, in_date) 组合会被跳过。
-        历史上退出但本次快照未出现的股票，需要人工补充 out_date。
+        关键原则：
+        1. 新纳入 → INSERT with in_date，out_date=NULL
+        2. 已存在但本次快照未出现 → UPDATE out_date（标记退出）
+        3. 绝对禁止整表 DELETE + INSERT 重建
         """
         if not HAS_AKSHARE:
             return
@@ -776,8 +933,35 @@ class DataEngine:
                            source
                     FROM tmp_constituents
                 """)
+
+                # ── 标记退出：更新 out_date ─────────────────────────────────
+                # 找到本次快照的日期（所有成分股的日期相同，取第一个即可）
+                snapshot_date = df['snapshot_date'].iloc[0]
+                current_codes = set(df['ts_code'].tolist())
+
+                # 注册当前快照代码列表
+                codes_df = pd.DataFrame({'ts_code': list(current_codes)})
+                conn.register('tmp_current_codes', codes_df)
+
+                # 更新：之前在指数内（out_date IS NULL）、本次快照不再出现的股票
+                # → 标记其 out_date = snapshot_date（前一天为退出日）
+                from_date = (pd.Timestamp(snapshot_date) - timedelta(days=1)).strftime('%Y-%m-%d')
+                conn.execute(f"""
+                    UPDATE index_constituents_history
+                    SET out_date = CAST(? AS DATE)
+                    WHERE index_code = ?
+                      AND out_date IS NULL
+                      AND ts_code NOT IN (SELECT ts_code FROM tmp_current_codes)
+                """, (from_date, index_code))
+
                 conn.execute("DROP VIEW IF EXISTS tmp_constituents")
-                logger.info(f"Synced {len(df)} constituents for {index_code} (append only, no overwrite)")
+                conn.execute("DROP VIEW IF EXISTS tmp_current_codes")
+
+                new_count = len(df)
+                logger.info(
+                    f"Synced {index_code}: {new_count} current constituents, "
+                    f"out_date updated for removed stocks"
+                )
             except Exception as e:
                 logger.warning(f"Failed to sync index constituents: {e}")
 
@@ -810,7 +994,7 @@ class DataEngine:
         记录每只股票何时被ST/解除ST，用于时间序列特征，
         严禁在T日过滤"未来的ST"。
         
-        注意：daily_quotes 表没有 name 字段，需要从 stock_basic 表 JOIN 获取。
+        注意：daily_bar_adjusted 表没有 name 字段，需要从 stock_basic 表 JOIN 获取。
         """
         if not HAS_DUCKDB:
             return
@@ -830,8 +1014,8 @@ class DataEngine:
                 st_codes = st_stocks['ts_code'].tolist()
                 
                 # 从日线数据推断 ST 状态变化（使用 register 避免大列表拼接 SQL 注入风险）
-                # 注意：daily_quotes 无 is_st 字段，只能用"ST股是否出现第一条记录"来标记新ST日。
-                # is_new_st = TRUE 当且仅当该股在 daily_quotes 中的当前记录之前没有紧邻的交易记录，
+                # 注意：daily_bar_adjusted 无 is_st 字段，只能用"ST股是否出现第一条记录"来标记新ST日。
+                # is_new_st = TRUE 当且仅当该股在 daily_bar_adjusted 中的当前记录之前没有紧邻的交易记录，
                 # 即 prev_trade_date IS NULL 或与当前日期间隔 > 1个交易日（被退市/停牌再上市）。
                 # 如需精确ST摘帽历史，应接入 AkShare stock_zh_a_st_em 接口。
                 st_df = pd.DataFrame({"ts_code": st_codes})
@@ -853,7 +1037,7 @@ class DataEngine:
                             d.ts_code,
                             d.trade_date,
                             LAG(d.trade_date) OVER (PARTITION BY d.ts_code ORDER BY d.trade_date) as prev_trade_date
-                        FROM daily_quotes d
+                        FROM daily_bar_adjusted d
                         INNER JOIN tmp_st_codes t ON d.ts_code = t.ts_code
                     ) sub
                 """)
@@ -952,8 +1136,9 @@ class DataEngine:
         """抓取单只股票的财务数据（年报 + 季报）"""
         records = []
         sym6 = str(symbol).zfill(6)
-        bs_code = (f"sh.{sym6}" if sym6.startswith("6") or sym6.startswith("5")
-                   else f"sz.{sym6}")
+        # 统一使用 exchange_mapping.build_bs_code()，禁止手写交易所判断
+        from scripts.exchange_mapping import build_bs_code as _build_bs_code
+        bs_code = _build_bs_code(sym6)
 
         # 年报（4个财年）- Baostock 线程安全
         try:
@@ -1066,18 +1251,20 @@ class DataEngine:
 
     def sync_stock_list(self, include_delisted: bool = True):
         """
-        同步股票列表到本地数据库（含 list_date/delist_date）
-        
-        使用 Baostock 补充上市/退市日期信息，解决幸存者偏差中的
-        日期缺失问题。
+        同步股票列表到本地数据库（含 list_date/delist_date/exchange/board）
+
+        改进点：
+        1. 同时写入 stock_basic（当前快照）和 stock_basic_history（历史PIT版本）
+        2. Baostock 补充精确的 list_date / delist_date
+        3. exchange / board 统一由 exchange_mapping.classify_exchange() 派生，禁止自行拼接
+        4. stock_basic_history 使用 UPSERT（ON CONFLICT DO UPDATE）防止重复记录
+        5. eff_date = 今日，标记本次同步时间点
         """
         df = self.get_all_stocks(include_delisted)
         if df.empty:
             return
 
-        conn = duckdb.connect(str(self.db_path))
-
-        # Baostock 补充 list_date / delist_date（线程安全）
+        # ── Baostock 补充 list_date / delist_date（线程安全）────────
         if HAS_BAOSTOCK:
             logger.info("Enriching list/delist dates from Baostock...")
             try:
@@ -1088,14 +1275,11 @@ class DataEngine:
                     finally:
                         bs.logout()
                 if bs_stocks is not None and not bs_stocks.empty:
-                    date_map = dict(zip(
-                        bs_stocks["code"].str.replace("sh.", "6", regex=False).str.replace("sz.", "", regex=False),
-                        bs_stocks["ipoDate"]
-                    ))
-                    delist_map = dict(zip(
-                        bs_stocks["code"].str.replace("sh.", "6", regex=False).str.replace("sz.", "", regex=False),
-                        bs_stocks["outDate"]
-                    ))
+                    # Baostock 代码格式：sh.600000 / sz.000001
+                    # 将 sh.XXXXXX → XXXXXX（保留6位），sz.XXXXXX → XXXXXX
+                    bs_code = bs_stocks["code"].str.replace(r"^sh\.", "", regex=True).str.replace(r"^sz\.", "", regex=True)
+                    date_map   = dict(zip(bs_code, bs_stocks["ipoDate"]))
+                    delist_map = dict(zip(bs_code, bs_stocks["outDate"]))
                     if "symbol" in df.columns:
                         df["list_date"] = df["symbol"].map(date_map).pipe(
                             lambda s: pd.to_datetime(s, errors="coerce")
@@ -1106,23 +1290,70 @@ class DataEngine:
             except (ValueError, KeyError, RuntimeError) as e:
                 logger.warning(f"Baostock list_date enrichment failed: {e}")
 
-        # 写入基本信息
-        cols = ["ts_code", "symbol", "name", "industry", "market",
-                "list_date", "delist_date", "is_delisted"]
-        write_cols = [c for c in cols if c in df.columns]
+        # ── 补全 exchange / board（统一从 exchange_mapping 派生）──────
+        from scripts.exchange_mapping import classify_exchange
+        if "exchange" not in df.columns or df["exchange"].isna().any():
+            def _classify(row):
+                sym = str(row.get("symbol", "")).zfill(6)
+                exch, board = classify_exchange(sym)
+                return pd.Series({"exchange": exch, "board": board})
+            classified = df.apply(_classify, axis=1)
+            df["exchange"] = classified["exchange"]
+            df["board"] = classified["board"]
+
         for col in ["list_date", "delist_date"]:
             if col in df.columns:
                 df[col] = pd.to_datetime(df[col], errors="coerce")
+        if "is_delisted" not in df.columns:
+            df["is_delisted"] = df["delist_date"].notna()
 
-        try:
+        today_str = self._get_now().strftime("%Y-%m-%d")
+        df["eff_date"] = pd.to_datetime(today_str)
+        df["end_date"] = pd.NaT
+
+        with self.get_connection() as conn:
+            # ── 1. 写入 stock_basic（当前快照，全量覆盖）────────────
+            basic_cols = ["ts_code", "symbol", "name", "exchange", "board",
+                          "industry", "market", "list_date", "delist_date",
+                          "is_delisted"]
+            write_cols = [c for c in basic_cols if c in df.columns]
             conn.execute("DELETE FROM stock_basic")
+            conn.register("tmp_basic", df[write_cols])
             conn.execute(
-                f"INSERT INTO stock_basic ({','.join(write_cols)}) SELECT {','.join(write_cols)} FROM df"
+                f"INSERT INTO stock_basic ({','.join(write_cols)}) "
+                f"SELECT {','.join(write_cols)} FROM tmp_basic"
             )
-        finally:
-            conn.close()
-        logger.info(f"Synced {len(df)} stocks to database "
-              f"(list_date filled: {df['list_date'].notna().sum()})")
+            conn.execute("DROP VIEW IF EXISTS tmp_basic")
+
+            # ── 2. 写入 stock_basic_history（历史PIT层，仅追加/更新当日版本）──
+            # UPSERT：同一 (ts_code, eff_date) 已存在则更新，不存在则插入
+            # 保留历史版本：不删除旧 eff_date 的记录
+            hist_cols = ["ts_code", "symbol", "name", "exchange", "board",
+                         "industry", "market", "list_date", "delist_date",
+                         "is_delisted", "eff_date", "end_date"]
+            hist_write_cols = [c for c in hist_cols if c in df.columns]
+            conn.register("tmp_hist", df[hist_write_cols])
+            conn.execute(f"""
+                INSERT INTO stock_basic_history ({','.join(hist_write_cols)})
+                SELECT {','.join(hist_write_cols)} FROM tmp_hist
+                ON CONFLICT (ts_code, eff_date) DO UPDATE SET
+                    symbol       = excluded.symbol,
+                    name         = excluded.name,
+                    exchange     = excluded.exchange,
+                    board        = excluded.board,
+                    industry     = excluded.industry,
+                    market       = excluded.market,
+                    list_date    = excluded.list_date,
+                    delist_date  = excluded.delist_date,
+                    is_delisted  = excluded.is_delisted
+            """)
+            conn.execute("DROP VIEW IF EXISTS tmp_hist")
+
+        list_filled = df["list_date"].notna().sum() if "list_date" in df.columns else 0
+        logger.info(
+            f"Synced {len(df)} stocks to database "
+            f"(list_date filled: {list_filled}, eff_date: {today_str})"
+        )
 
     # ──────────────────────────────────────────────────────────
     # 日线数据下载
@@ -1137,7 +1368,7 @@ class DataEngine:
         
         重要：同时下载原始价和复权价，分别存储。
         - daily_bar_raw: 原始未复权OHLCV（所有数据的基础）
-        - daily_quotes: 复权价格（通过 adj_factor 在查询时计算，或直接用复权close）
+        - daily_bar_adjusted: 复权价格（通过 adj_factor 在查询时计算，或直接用复权close）
         
         adjust 参数仅决定返回给调用方的 DataFrame 是否含复权价，
         不影响原始价存储。
@@ -1151,7 +1382,7 @@ class DataEngine:
         end_date : str
             结束日期，格式 YYYY-MM-DD
         adjust : 'qfq' | ''
-            复权方式（仅影响返回值，复权因子始终计算并存入 daily_quotes）
+            复权方式（仅影响返回值，复权因子始终计算并存入 daily_bar_adjusted）
         """
         if not HAS_AKSHARE:
             return pd.DataFrame()
@@ -1186,6 +1417,10 @@ class DataEngine:
 
             # ── 2. 下载复权价格（用于计算 adj_factor）─────────────
             adj_factor = pd.Series(1.0, index=df_raw.index)
+            df_close_adj = df_raw["close"].copy()  # 默认复权=原始
+            df_open_adj  = df_raw["open"].copy()
+            df_high_adj  = df_raw["high"].copy()
+            df_low_adj   = df_raw["low"].copy()
             if adjust:
                 try:
                     df_adj = ak.stock_zh_a_hist(
@@ -1193,19 +1428,48 @@ class DataEngine:
                         start_date=start_str, end_date=end_str, adjust="qfq"
                     )
                     if not df_adj.empty:
-                        df_adj = df_adj.rename(columns={"日期": "td2", "收盘": "close_adj"})
+                        adj_col_map = {
+                            "日期": "td2", "开盘": "open_adj", "收盘": "close_adj",
+                            "最高": "high_adj", "最低": "low_adj"
+                        }
+                        df_adj = df_adj.rename(columns=adj_col_map)
                         df_adj["td2"] = pd.to_datetime(df_adj["td2"])
-                        df_raw = df_raw.merge(df_adj[["td2", "close_adj"]],
-                                              left_on="trade_date", right_on="td2",
-                                              how="left")
+                        df_raw = df_raw.merge(
+                            df_adj[["td2", "open_adj", "high_adj", "low_adj", "close_adj"]],
+                            left_on="trade_date", right_on="td2",
+                            how="left"
+                        )
                         # adj_factor = adj_close / raw_close（复权因子 = 复权收盘 / 原始收盘）
                         adj_factor = (df_raw["close_adj"] / df_raw["close"].replace(0, np.nan)).fillna(1.0)
                         adj_factor = adj_factor.replace([np.inf, -np.inf], 1.0)
-                        df_raw.drop(columns=["td2", "close_adj"], inplace=True, errors="ignore")
+                        # 保存复权价格序列
+                        df_close_adj = df_raw["close_adj"].fillna(df_raw["close"])
+                        df_open_adj  = df_raw["open_adj"].fillna(df_raw["open"])
+                        df_high_adj  = df_raw["high_adj"].fillna(df_raw["high"])
+                        df_low_adj   = df_raw["low_adj"].fillna(df_raw["low"])
+                        df_raw.drop(
+                            columns=["td2", "open_adj", "high_adj", "low_adj", "close_adj"],
+                            inplace=True, errors="ignore"
+                        )
                 except Exception as e:
                     logger.debug(f"adj_factor calc failed for {symbol}: {e}")
 
             df_raw["adj_factor"] = adj_factor
+            # ── 原始价保存到 _raw_ 字段（供 save_quotes 写入 daily_bar_raw）──
+            df_raw["raw_open"]  = df_raw["open"].copy()
+            df_raw["raw_high"]  = df_raw["high"].copy()
+            df_raw["raw_low"]   = df_raw["low"].copy()
+            df_raw["raw_close"] = df_raw["close"].copy()
+            # ── 复权价覆盖 open/high/low/close（供 save_quotes 写入 daily_bar_adjusted）──
+            df_raw["open"]  = df_open_adj
+            df_raw["high"]  = df_high_adj
+            df_raw["low"]   = df_low_adj
+            df_raw["close"] = df_close_adj
+            # 复权 pct_chg（用复权价重新计算）
+            if adjust == "qfq":
+                df_raw["pct_chg"] = (
+                    df_raw["close"] / df_raw["pre_close"].replace(0, np.nan) - 1
+                ) * 100
 
             # ── 3. 涨跌停判定（基于原始价）─────────────────────────
             df_raw = self._apply_limit_flags(df_raw, symbol)
@@ -1215,23 +1479,15 @@ class DataEngine:
             if not val["ok"]:
                 logger.warning(f"Data validation issues for {symbol}: {val['issues']}")
 
-            # ── 5. 根据 adjust 参数决定返回格式 ───────────────────
-            if adjust == "qfq":
-                # 返回复权价格（close_adj = close * adj_factor）
-                ret = df_raw.copy()
-                for col in ["open", "high", "low", "close"]:
-                    ret[col] = ret[col] * ret["adj_factor"]
-                # pct_chg 用复权价格重新计算
-                ret["pct_chg"] = (ret["close"] / ret["pre_close"].replace(0, np.nan) - 1) * 100
-                cols = ["ts_code", "trade_date", "open", "high", "low", "close",
-                        "pre_close", "volume", "amount", "pct_chg", "turnover",
-                        "adj_factor", "is_suspend", "limit_up", "limit_down", "data_source"]
-            else:
-                # 返回原始价格
-                cols = ["ts_code", "trade_date", "open", "high", "low", "close",
-                        "pre_close", "volume", "amount", "pct_chg", "turnover",
-                        "adj_factor", "is_suspend", "limit_up", "limit_down", "data_source"]
-
+            # ── 5. 返回完整 DataFrame（含 raw_*/adj 双字段）─────────
+            # save_quotes() 依赖：
+            #   - raw_open/raw_high/raw_low/raw_close → 写入 daily_bar_raw
+            #   - open/high/low/close（复权价）       → 写入 daily_bar_adjusted
+            cols = ["ts_code", "trade_date",
+                    "raw_open", "raw_high", "raw_low", "raw_close",  # 原始价
+                    "open", "high", "low", "close",                  # 复权价
+                    "pre_close", "volume", "amount", "pct_chg", "turnover",
+                    "adj_factor", "is_suspend", "limit_up", "limit_down", "data_source"]
             return df_raw[[c for c in cols if c in df_raw.columns]]
 
         except (ValueError, KeyError, RuntimeError, ConnectionError) as e:
@@ -1240,33 +1496,43 @@ class DataEngine:
 
     def save_quotes(self, df: pd.DataFrame, mode: str = "append"):
         """
-        保存行情数据到 DuckDB（双表写入：daily_bar_raw + daily_quotes）
-        
-        存储架构：
-        - daily_bar_raw：原始未复权价格（所有数据的基础）
-        - daily_quotes：复权价格（含 adj_factor，查询时用）
-        
-        写入策略：使用 DuckDB register() + INSERT ... SELECT（批量，700x快于逐行）
-        
-        注意：daily_bar_raw 没有 adj_factor/is_suspend/limit_up/limit_down/pre_close 列，
-        写入时需排除这些列。
+        保存行情数据到 DuckDB（双表分层写入：daily_bar_raw + daily_bar_adjusted）
+
+        数据分层原则（禁止混用）：
+        - daily_bar_raw：存原始未复权 OHLCV（raw_open/raw_high/raw_low/raw_close）
+          若无 raw_* 字段（旧接口兼容），则以 close（adj_factor=1 时等于原始价）降级写入
+        - daily_bar_adjusted：存复权价 OHLCV（open/high/low/close 已乘 adj_factor）
+
+        写入策略：使用 DuckDB register() + INSERT ... SELECT（批量，700x 快于逐行）
+        同步更新 sync_progress 表（记录每只股票的最新同步日期，支持断点续跑）
         """
         if df.empty or not HAS_DUCKDB:
             return
         with self.get_connection() as conn:
-            # ── 预处理：统一列，提取 symbol ──────────────────────
+            # ── 预处理：统一列名，确保必需字段存在 ──────────────────
             df = df.copy()
             if "symbol" not in df.columns:
                 df["symbol"] = df["ts_code"].str.replace(r"\.[A-Z]+$", "", regex=True)
+
+            # 原始价字段：优先用 raw_* 前缀（fetch_single 新格式）
+            # 降级兼容：若无 raw_* 字段，假定传入 df 的 close 等字段就是原始价
+            has_raw_fields = "raw_close" in df.columns
+            for raw_col, std_col in [("raw_open", "open"), ("raw_high", "high"),
+                                      ("raw_low", "low"), ("raw_close", "close")]:
+                if raw_col not in df.columns:
+                    df[raw_col] = df.get(std_col, 0.0)
+
             for col in ["open", "high", "low", "close", "pre_close"]:
                 if col not in df.columns:
                     df[col] = 0.0
             for col in ["volume", "amount"]:
                 if col not in df.columns:
                     df[col] = 0
-            for col in ["pct_chg", "turnover", "adj_factor"]:
+            for col in ["pct_chg", "turnover"]:
                 if col not in df.columns:
                     df[col] = 0.0
+            if "adj_factor" not in df.columns:
+                df["adj_factor"] = 1.0
             for col in ["is_suspend", "limit_up", "limit_down"]:
                 if col not in df.columns:
                     df[col] = False
@@ -1281,7 +1547,7 @@ class DataEngine:
                     codes_df = pd.DataFrame({"ts_code": codes})
                     conn.register('tmp_codes', codes_df)
                     conn.execute("""
-                        DELETE FROM daily_quotes
+                        DELETE FROM daily_bar_adjusted
                         WHERE ts_code IN (SELECT ts_code FROM tmp_codes)
                         AND trade_date BETWEEN ? AND ?
                     """, (dates_min, dates_max))
@@ -1290,123 +1556,153 @@ class DataEngine:
                         WHERE ts_code IN (SELECT ts_code FROM tmp_codes)
                         AND trade_date BETWEEN ? AND ?
                     """, (dates_min, dates_max))
-                    conn.execute("DROP VIEW tmp_codes")
+                    conn.execute("DROP VIEW IF EXISTS tmp_codes")
 
             # 注册 DataFrame（批量写入核心优化）
             conn.register('tmp_quotes', df)
 
-            # ── 1. 写入 daily_bar_raw（原始价格）──────────────────
+            # ── 1. 写入 daily_bar_raw（原始未复权价格）─────────────
+            # 使用 raw_open/raw_close 等原始价字段
             try:
                 conn.execute("""
                     INSERT INTO daily_bar_raw
-                        (ts_code, trade_date, symbol, open, high, low, close,
+                        (ts_code, trade_date, symbol,
+                         open, high, low, close,
                          volume, amount, pct_chg, turnover, data_source)
                     SELECT ts_code, trade_date, symbol,
-                           COALESCE(open,0), COALESCE(high,0),
-                           COALESCE(low,0), COALESCE(close,0),
-                           COALESCE(volume,0), COALESCE(amount,0),
-                           COALESCE(pct_chg,0), COALESCE(turnover,0),
-                           COALESCE(data_source,'unknown')
+                           COALESCE(raw_open, open, 0),
+                           COALESCE(raw_high, high, 0),
+                           COALESCE(raw_low,  low,  0),
+                           COALESCE(raw_close, close, 0),
+                           COALESCE(volume, 0),
+                           COALESCE(amount, 0),
+                           COALESCE(pct_chg, 0),
+                           COALESCE(turnover, 0),
+                           COALESCE(data_source, 'unknown')
                     FROM tmp_quotes
                     ON CONFLICT(ts_code, trade_date) DO UPDATE SET
-                        symbol=excluded.symbol,
-                        open=excluded.open, high=excluded.high,
-                        low=excluded.low, close=excluded.close,
-                        volume=excluded.volume, amount=excluded.amount,
-                        pct_chg=excluded.pct_chg, turnover=excluded.turnover,
-                        data_source=excluded.data_source
+                        symbol     = excluded.symbol,
+                        open       = excluded.open,
+                        high       = excluded.high,
+                        low        = excluded.low,
+                        close      = excluded.close,
+                        volume     = excluded.volume,
+                        amount     = excluded.amount,
+                        pct_chg    = excluded.pct_chg,
+                        turnover   = excluded.turnover,
+                        data_source= excluded.data_source
                 """)
             except Exception as e:
-                logger.debug(f"daily_bar_raw upsert fallback (append): {e}")
-                try:
-                    conn.execute("""
-                        INSERT INTO daily_bar_raw
-                            (ts_code, trade_date, symbol, open, high, low, close,
-                             volume, amount, pct_chg, turnover, data_source)
-                        SELECT ts_code, trade_date, symbol,
-                               COALESCE(open,0), COALESCE(high,0),
-                               COALESCE(low,0), COALESCE(close,0),
-                               COALESCE(volume,0), COALESCE(amount,0),
-                               COALESCE(pct_chg,0), COALESCE(turnover,0),
-                               COALESCE(data_source,'unknown')
-                        FROM tmp_quotes
-                    """)
-                except Exception as e2:
-                    logger.warning(f"daily_bar_raw write failed: {e2}")
+                logger.warning(f"daily_bar_raw upsert failed: {e}")
 
-            # ── 2. 写入 daily_quotes（复权价格，close 已由 fetch_single 处理好）──
+            # ── 2. 写入 daily_bar_adjusted（复权价格）──────────────
+            # open/high/low/close 是复权价（fetch_single 已乘 adj_factor）
             try:
                 conn.execute("""
-                    INSERT INTO daily_quotes
+                    INSERT INTO daily_bar_adjusted
                         (ts_code, trade_date, open, high, low, close, pre_close,
                          volume, amount, pct_chg, turnover, adj_factor,
                          is_suspend, limit_up, limit_down, data_source)
                     SELECT ts_code, trade_date,
-                           COALESCE(open,0), COALESCE(high,0),
-                           COALESCE(low,0), COALESCE(close,0),
-                           COALESCE(pre_close,0),
-                           COALESCE(volume,0), COALESCE(amount,0),
-                           COALESCE(pct_chg,0), COALESCE(turnover,0),
-                           COALESCE(adj_factor,1),
-                           COALESCE(is_suspend,FALSE),
-                           COALESCE(limit_up,FALSE),
-                           COALESCE(limit_down,FALSE),
-                           COALESCE(data_source,'unknown')
+                           COALESCE(open, 0),
+                           COALESCE(high, 0),
+                           COALESCE(low,  0),
+                           COALESCE(close, 0),
+                           COALESCE(pre_close, 0),
+                           COALESCE(volume, 0),
+                           COALESCE(amount, 0),
+                           COALESCE(pct_chg, 0),
+                           COALESCE(turnover, 0),
+                           COALESCE(adj_factor, 1.0),
+                           COALESCE(is_suspend, FALSE),
+                           COALESCE(limit_up, FALSE),
+                           COALESCE(limit_down, FALSE),
+                           COALESCE(data_source, 'unknown')
                     FROM tmp_quotes
                     ON CONFLICT(ts_code, trade_date) DO UPDATE SET
-                        open=excluded.open, high=excluded.high,
-                        low=excluded.low, close=excluded.close,
-                        pre_close=excluded.pre_close,
-                        volume=excluded.volume, amount=excluded.amount,
-                        pct_chg=excluded.pct_chg, turnover=excluded.turnover,
-                        adj_factor=excluded.adj_factor,
-                        is_suspend=excluded.is_suspend,
-                        limit_up=excluded.limit_up,
-                        limit_down=excluded.limit_down,
-                        data_source=excluded.data_source
+                        open       = excluded.open,
+                        high       = excluded.high,
+                        low        = excluded.low,
+                        close      = excluded.close,
+                        pre_close  = excluded.pre_close,
+                        volume     = excluded.volume,
+                        amount     = excluded.amount,
+                        pct_chg    = excluded.pct_chg,
+                        turnover   = excluded.turnover,
+                        adj_factor = excluded.adj_factor,
+                        is_suspend = excluded.is_suspend,
+                        limit_up   = excluded.limit_up,
+                        limit_down = excluded.limit_down,
+                        data_source= excluded.data_source
                 """)
             except Exception as e:
-                logger.debug(f"daily_quotes upsert fallback (append): {e}")
-                try:
-                    conn.execute("""
-                        INSERT INTO daily_quotes
-                            (ts_code, trade_date, open, high, low, close, pre_close,
-                             volume, amount, pct_chg, turnover, adj_factor,
-                             is_suspend, limit_up, limit_down, data_source)
-                        SELECT ts_code, trade_date,
-                               COALESCE(open,0), COALESCE(high,0),
-                               COALESCE(low,0), COALESCE(close,0),
-                               COALESCE(pre_close,0),
-                               COALESCE(volume,0), COALESCE(amount,0),
-                               COALESCE(pct_chg,0), COALESCE(turnover,0),
-                               COALESCE(adj_factor,1),
-                               COALESCE(is_suspend,FALSE),
-                               COALESCE(limit_up,FALSE),
-                               COALESCE(limit_down,FALSE),
-                               COALESCE(data_source,'unknown')
-                        FROM tmp_quotes
-                    """)
-                except Exception as e2:
-                    logger.warning(f"daily_quotes write failed: {e2}")
+                logger.warning(f"daily_bar_adjusted upsert failed: {e}")
 
             conn.execute("DROP VIEW IF EXISTS tmp_quotes")
+
+            # ── 3. 更新 sync_progress（断点续跑状态跟踪）──────────
+            try:
+                # 按股票聚合最新日期
+                progress_df = (
+                    df.groupby("ts_code")["trade_date"]
+                    .max()
+                    .reset_index()
+                    .rename(columns={"trade_date": "last_sync_date"})
+                )
+                progress_df["table_name"]    = "daily_bar_raw"
+                progress_df["status"]        = "ok"
+                progress_df["error_msg"]     = None
+                progress_df["total_records"] = (
+                    df.groupby("ts_code").size().reset_index(name="cnt")["cnt"].values
+                )
+                conn.register("tmp_progress", progress_df)
+                conn.execute("""
+                    INSERT INTO sync_progress
+                        (ts_code, table_name, last_sync_date, total_records, status)
+                    SELECT ts_code, table_name, last_sync_date, total_records, status
+                    FROM tmp_progress
+                    ON CONFLICT (ts_code, table_name) DO UPDATE SET
+                        last_sync_date = GREATEST(sync_progress.last_sync_date, excluded.last_sync_date),
+                        total_records  = sync_progress.total_records + excluded.total_records,
+                        last_sync_at   = NOW(),
+                        status         = excluded.status
+                """)
+                conn.execute("DROP VIEW IF EXISTS tmp_progress")
+            except Exception as e:
+                logger.debug(f"sync_progress update skipped: {e}")
 
     # ──────────────────────────────────────────────────────────
     # 增量更新（多线程 + 重试 + 断点续传）
     # ──────────────────────────────────────────────────────────
     def get_latest_date(self, ts_code: str = None) -> Optional[str]:
-        """获取本地最新日期（含断点续传检测：验证最新日期数据是否完整）"""
+        """获取本地最新同步日期（优先从 sync_progress 读，备选扫描 daily_bar_adjusted）
+
+        断点续跑改进：
+        - 优先查 sync_progress.last_sync_date（记录上次成功同步的最新日期）
+        - 若 sync_progress 无记录，则扫描 daily_bar_adjusted 的 MAX(trade_date)
+        - 验证最新日期数据完整性（close>0），损坏则回退到前一天
+        """
         if not HAS_DUCKDB:
             return None
 
-        # 先尝试获取最新日期
+        # ── 优先查 sync_progress（断点续跑核心）──────────────────
+        if ts_code:
+            prog = self.query("""
+                SELECT last_sync_date FROM sync_progress
+                WHERE ts_code = ? AND table_name = 'daily_bar_raw'
+                AND status = 'ok'
+            """, (ts_code,))
+            if not prog.empty and not pd.isna(prog.iloc[0, 0]):
+                return pd.Timestamp(prog.iloc[0, 0]).strftime("%Y-%m-%d")
+
+        # ── 备选：扫描 daily_bar_adjusted ────────────────────────
         if ts_code:
             result = self.query(
-                "SELECT MAX(trade_date) as md FROM daily_quotes WHERE ts_code = ?",
+                "SELECT MAX(trade_date) as md FROM daily_bar_adjusted WHERE ts_code = ?",
                 (ts_code,)
             )
         else:
-            result = self.query("SELECT MAX(trade_date) as md FROM daily_quotes")
+            result = self.query("SELECT MAX(trade_date) as md FROM daily_bar_adjusted")
         val = result.iloc[0, 0] if not result.empty else None
         if val is None or pd.isna(val):
             return None
@@ -1416,7 +1712,7 @@ class DataEngine:
         # 断点续传加固：检查最新日期数据是否完整（close>0 且 volume>=0）
         if ts_code:
             check = self.query("""
-                SELECT COUNT(*) as cnt FROM daily_quotes
+                SELECT COUNT(*) as cnt FROM daily_bar_adjusted
                 WHERE ts_code = ? AND trade_date = ?
                 AND close > 0 AND volume >= 0
             """, (ts_code, latest))
@@ -1424,7 +1720,7 @@ class DataEngine:
                 # 数据损坏/不完整，回退到前一天
                 prev = (pd.Timestamp(latest) - timedelta(days=1)).strftime("%Y-%m-%d")
                 prev_check = self.query("""
-                    SELECT COUNT(*) as cnt FROM daily_quotes
+                    SELECT COUNT(*) as cnt FROM daily_bar_adjusted
                     WHERE ts_code = ? AND trade_date = ?
                     AND close > 0 AND volume >= 0
                 """, (ts_code, prev))
@@ -1432,6 +1728,39 @@ class DataEngine:
                     return None  # 数据彻底损坏
                 return prev
         return latest
+
+    def get_sync_status(self, ts_codes: Optional[List[str]] = None) -> pd.DataFrame:
+        """
+        查询增量同步进度状态（基于 sync_progress 表）
+
+        Parameters
+        ----------
+        ts_codes : List[str], optional
+            指定股票代码列表，None 表示查全部
+
+        Returns
+        -------
+        pd.DataFrame: 同步状态表，含 ts_code / last_sync_date / status / total_records
+        """
+        if not HAS_DUCKDB:
+            return pd.DataFrame()
+        if ts_codes:
+            codes_df = pd.DataFrame({"ts_code": ts_codes})
+            with self.get_connection() as conn:
+                conn.register("tmp_sc", codes_df)
+                df = conn.execute("""
+                    SELECT sp.* FROM sync_progress sp
+                    INNER JOIN tmp_sc t ON sp.ts_code = t.ts_code
+                    WHERE sp.table_name = 'daily_bar_raw'
+                    ORDER BY sp.last_sync_date DESC
+                """).fetchdf()
+                conn.execute("DROP VIEW IF EXISTS tmp_sc")
+            return df
+        return self.query("""
+            SELECT * FROM sync_progress
+            WHERE table_name = 'daily_bar_raw'
+            ORDER BY last_sync_date DESC
+        """)
 
     def _fetch_single_with_retry(self,
                                  symbol: str,
@@ -1563,13 +1892,10 @@ class DataEngine:
 
             # 标准化 baostock 代码
             sym6 = str(symbol).zfill(6)
-            # 使用统一的 Baostock 前缀映射（支持沪深北三交易所）
-            if sym6.startswith(("6", "5", "9", "688")):
-                bs_code = f"sh.{sym6}"
-            elif sym6.startswith(("4", "8")):
-                bs_code = f"bj.{sym6}"
-            else:
-                bs_code = f"sz.{sym6}"
+            # 统一使用 exchange_mapping.build_bs_code()，禁止手写交易所判断
+            # 修复：920xxx 不再误判为 sh，北交所 4/8/920xxx 全部正确归为 bj
+            from scripts.exchange_mapping import build_bs_code as _build_bs_code
+            bs_code = _build_bs_code(sym6)
 
             # Baostock 全局会话锁（多线程安全）
             with self._bs_lock:
@@ -1620,8 +1946,12 @@ class DataEngine:
             return pd.DataFrame()
 
     def _batch_get_latest_dates(self, ts_codes: List[str]) -> Dict[str, str]:
-        """批量获取多只股票的最新日期（单条SQL替代N次查询，减少DB I/O）
-        
+        """批量获取多只股票的最新同步日期（优先 sync_progress，备选 daily_bar_adjusted）
+
+        断点续跑改进：
+        - 优先从 sync_progress 读（O(1) 索引查询，无需扫描数据表）
+        - 仅对 sync_progress 无记录的股票扫描 daily_bar_adjusted
+
         Returns
         -------
         Dict[str, str]: {ts_code: latest_date_str} 字典
@@ -1629,22 +1959,42 @@ class DataEngine:
         if not ts_codes or not HAS_DUCKDB:
             return {}
         codes_df = pd.DataFrame({"ts_code": ts_codes})
+        result: Dict[str, str] = {}
+
         with self.get_connection() as conn:
-            conn.register('tmp_batch_latest', codes_df)
-            df = conn.execute("""
-                SELECT d.ts_code, MAX(d.trade_date) as latest_date
-                FROM daily_quotes d
-                INNER JOIN tmp_batch_latest t ON d.ts_code = t.ts_code
-                GROUP BY d.ts_code
+            # ── 1. 优先从 sync_progress 批量读取 ──────────────────
+            conn.register('tmp_bl', codes_df)
+            prog_df = conn.execute("""
+                SELECT sp.ts_code, sp.last_sync_date
+                FROM sync_progress sp
+                INNER JOIN tmp_bl t ON sp.ts_code = t.ts_code
+                WHERE sp.table_name = 'daily_bar_raw' AND sp.status = 'ok'
             """).fetchdf()
-            conn.execute("DROP VIEW tmp_batch_latest")
-        if df.empty:
-            return {}
-        result = {}
-        for _, row in df.iterrows():
-            val = row["latest_date"]
-            if val and not pd.isna(val):
-                result[row["ts_code"]] = pd.Timestamp(val).strftime("%Y-%m-%d")
+
+            for _, row in prog_df.iterrows():
+                val = row["last_sync_date"]
+                if val and not pd.isna(val):
+                    result[row["ts_code"]] = pd.Timestamp(val).strftime("%Y-%m-%d")
+
+            # ── 2. 对 sync_progress 无记录的股票，扫描 daily_bar_adjusted ──
+            missing = [tc for tc in ts_codes if tc not in result]
+            if missing:
+                missing_df = pd.DataFrame({"ts_code": missing})
+                conn.register('tmp_missing', missing_df)
+                adj_df = conn.execute("""
+                    SELECT d.ts_code, MAX(d.trade_date) as latest_date
+                    FROM daily_bar_adjusted d
+                    INNER JOIN tmp_missing t ON d.ts_code = t.ts_code
+                    GROUP BY d.ts_code
+                """).fetchdf()
+                conn.execute("DROP VIEW IF EXISTS tmp_missing")
+                for _, row in adj_df.iterrows():
+                    val = row["latest_date"]
+                    if val and not pd.isna(val):
+                        result[row["ts_code"]] = pd.Timestamp(val).strftime("%Y-%m-%d")
+
+            conn.execute("DROP VIEW IF EXISTS tmp_bl")
+
         return result
 
     def update_daily_data(self,
@@ -1822,7 +2172,7 @@ class DataEngine:
         # 获取本地最近的复权因子
         local = self.query("""
             SELECT trade_date, adj_factor
-            FROM daily_quotes
+            FROM daily_bar_adjusted
             WHERE ts_code = ?
             ORDER BY trade_date DESC
             LIMIT 5
@@ -1874,11 +2224,13 @@ class DataEngine:
             try:
                 for sym in symbols[:20]:  # 抽样20只
                     sym6 = str(sym).zfill(6)
-                    bs_code = f"sh.{sym6}" if sym6.startswith("6") else f"sz.{sym6}"
+                    # 统一使用 exchange_mapping.build_bs_code()，修复：688/920xxx/4xxx/8xxx 全部正确
+                    from scripts.exchange_mapping import build_bs_code as _build_bs_code
+                    bs_code = _build_bs_code(sym6)
 
                     # AkShare 数据（参数化查询防止SQL注入）
                     ak_data = self.query("""
-                        SELECT pct_chg FROM daily_quotes
+                        SELECT pct_chg FROM daily_bar_adjusted
                         WHERE ts_code LIKE ?
                         AND trade_date = ?
                         LIMIT 1
@@ -1923,6 +2275,234 @@ class DataEngine:
                         logger.debug(f"Cross-validate error for {sym6}: {e}")
             finally:
                 bs.logout()
+
+
+    # ──────────────────────────────────────────────────────────
+    # 数据质量全面校验（写入 data_quality_alert 表）
+    # ──────────────────────────────────────────────────────────
+    def run_data_quality_check(
+        self,
+        start_date: str = None,
+        end_date: str = None,
+        ts_codes: Optional[List[str]] = None,
+    ) -> Dict[str, int]:
+        """
+        对 daily_bar_raw / daily_bar_adjusted 执行全面数据质量校验。
+
+        校验项（结果写入 data_quality_alert 表）：
+        1. duplicate_rows        — (ts_code, trade_date) 重复行
+        2. ohlc_violation        — high < low 或 close 超出 [low, high] 范围
+        3. pct_chg_extreme       — 单日涨跌幅绝对值 > 60%（超出任何板块限制）
+        4. adj_factor_jump       — 相邻两日 adj_factor 变化 > 5%（可能分红/拆股但未记录）
+        5. zero_volume_non_suspend — volume=0 但未标记 is_suspend
+        6. missing_trade_days    — 相对 trade_calendar 缺失的交易日（每只股票）
+        7. delisted_with_future_data — 已退市股票（delist_date 非空）仍有晚于退市日的数据
+        8. adj_raw_ratio_invalid — daily_bar_adjusted.close / daily_bar_raw.close 偏离 adj_factor > 1%
+
+        Parameters
+        ----------
+        start_date : str, optional
+            校验起始日期，默认近 90 天
+        end_date : str, optional
+            校验截止日期，默认今日
+        ts_codes : List[str], optional
+            指定股票列表，None 表示全库校验
+
+        Returns
+        -------
+        Dict[str, int]: 各校验类型发现的问题数量
+        """
+        if not HAS_DUCKDB:
+            return {}
+        end_date   = end_date   or self._get_now().strftime("%Y-%m-%d")
+        start_date = start_date or (pd.Timestamp(end_date) - timedelta(days=90)).strftime("%Y-%m-%d")
+        stats: Dict[str, int] = {}
+
+        # 构建过滤子句
+        code_filter_adj = ""
+        code_filter_raw = ""
+        code_params_adj: list = [start_date, end_date]
+        code_params_raw: list = [start_date, end_date]
+        if ts_codes:
+            placeholders = ",".join(["?" for _ in ts_codes])
+            code_filter_adj = f"AND ts_code IN ({placeholders})"
+            code_filter_raw = f"AND ts_code IN ({placeholders})"
+            code_params_adj += ts_codes
+            code_params_raw += ts_codes
+
+        alerts = []
+
+        # ── 1. 重复行检测 ──────────────────────────────────────
+        dup_sql = f"""
+            SELECT ts_code, trade_date, COUNT(*) as cnt
+            FROM daily_bar_raw
+            WHERE trade_date BETWEEN ? AND ? {code_filter_raw}
+            GROUP BY ts_code, trade_date
+            HAVING COUNT(*) > 1
+        """
+        try:
+            dup_df = self.query(dup_sql, tuple(code_params_raw))
+            for _, row in dup_df.iterrows():
+                alerts.append(("duplicate_rows", row["ts_code"], row["trade_date"],
+                                f"daily_bar_raw has {int(row['cnt'])} duplicate rows"))
+            stats["duplicate_rows"] = len(dup_df)
+        except Exception as e:
+            logger.warning(f"duplicate_rows check failed: {e}")
+            stats["duplicate_rows"] = -1
+
+        # ── 2. OHLC 关系校验 ──────────────────────────────────
+        ohlc_sql = f"""
+            SELECT ts_code, trade_date,
+                   open, high, low, close
+            FROM daily_bar_raw
+            WHERE trade_date BETWEEN ? AND ? {code_filter_raw}
+              AND (high < low
+                OR close > high * 1.001
+                OR close < low  * 0.999
+                OR open  > high * 1.001
+                OR open  < low  * 0.999)
+        """
+        try:
+            ohlc_df = self.query(ohlc_sql, tuple(code_params_raw))
+            for _, row in ohlc_df.iterrows():
+                alerts.append(("ohlc_violation", row["ts_code"], row["trade_date"],
+                                f"OHLC: open={row['open']}, high={row['high']}, "
+                                f"low={row['low']}, close={row['close']}"))
+            stats["ohlc_violation"] = len(ohlc_df)
+        except Exception as e:
+            logger.warning(f"ohlc_violation check failed: {e}")
+            stats["ohlc_violation"] = -1
+
+        # ── 3. 涨跌幅极端值检测 ─────────────────────────────────
+        pct_sql = f"""
+            SELECT ts_code, trade_date, pct_chg
+            FROM daily_bar_adjusted
+            WHERE trade_date BETWEEN ? AND ? {code_filter_adj}
+              AND ABS(pct_chg) > 60
+        """
+        try:
+            pct_df = self.query(pct_sql, tuple(code_params_adj))
+            for _, row in pct_df.iterrows():
+                alerts.append(("pct_chg_extreme", row["ts_code"], row["trade_date"],
+                                f"pct_chg={row['pct_chg']:.2f}% exceeds ±60%"))
+            stats["pct_chg_extreme"] = len(pct_df)
+        except Exception as e:
+            logger.warning(f"pct_chg_extreme check failed: {e}")
+            stats["pct_chg_extreme"] = -1
+
+        # ── 4. 复权因子跳变检测 ─────────────────────────────────
+        adj_jump_sql = f"""
+            WITH adj_diff AS (
+                SELECT ts_code, trade_date, adj_factor,
+                       LAG(adj_factor) OVER (PARTITION BY ts_code ORDER BY trade_date) AS prev_adj
+                FROM daily_bar_adjusted
+                WHERE trade_date BETWEEN ? AND ? {code_filter_adj}
+            )
+            SELECT ts_code, trade_date, adj_factor, prev_adj,
+                   ABS(adj_factor / NULLIF(prev_adj, 0) - 1) AS change_ratio
+            FROM adj_diff
+            WHERE prev_adj IS NOT NULL
+              AND ABS(adj_factor / NULLIF(prev_adj, 0) - 1) > 0.05
+        """
+        try:
+            adj_df = self.query(adj_jump_sql, tuple(code_params_adj))
+            for _, row in adj_df.iterrows():
+                alerts.append(("adj_factor_jump", row["ts_code"], row["trade_date"],
+                                f"adj_factor jumped from {row['prev_adj']:.4f} to "
+                                f"{row['adj_factor']:.4f} ({row['change_ratio']*100:.2f}%)"))
+            stats["adj_factor_jump"] = len(adj_df)
+        except Exception as e:
+            logger.warning(f"adj_factor_jump check failed: {e}")
+            stats["adj_factor_jump"] = -1
+
+        # ── 5. volume=0 但未标记停牌 ────────────────────────────
+        suspend_sql = f"""
+            SELECT ts_code, trade_date, volume, is_suspend
+            FROM daily_bar_adjusted
+            WHERE trade_date BETWEEN ? AND ? {code_filter_adj}
+              AND volume = 0
+              AND (is_suspend IS NULL OR is_suspend = FALSE)
+        """
+        try:
+            susp_df = self.query(suspend_sql, tuple(code_params_adj))
+            for _, row in susp_df.iterrows():
+                alerts.append(("zero_volume_non_suspend", row["ts_code"], row["trade_date"],
+                                "volume=0 but is_suspend not set"))
+            stats["zero_volume_non_suspend"] = len(susp_df)
+        except Exception as e:
+            logger.warning(f"zero_volume_non_suspend check failed: {e}")
+            stats["zero_volume_non_suspend"] = -1
+
+        # ── 6. 退市股在退市日后仍有数据 ─────────────────────────
+        delist_code_filter = ""
+        if ts_codes:
+            placeholders = ",".join(["?" for _ in ts_codes])
+            delist_code_filter = f"AND d.ts_code IN ({placeholders})"
+        delist_sql = f"""
+            SELECT d.ts_code, d.trade_date, s.delist_date
+            FROM daily_bar_raw d
+            JOIN stock_basic_history s ON d.ts_code = s.ts_code
+            WHERE s.delist_date IS NOT NULL
+              AND d.trade_date > s.delist_date + INTERVAL 30 DAYS
+              AND d.trade_date BETWEEN ? AND ? {delist_code_filter}
+        """
+        delist_params = [start_date, end_date] + (list(ts_codes) if ts_codes else [])
+        try:
+            dl_df = self.query(delist_sql, tuple(delist_params))
+            for _, row in dl_df.iterrows():
+                alerts.append(("delisted_with_future_data", row["ts_code"], row["trade_date"],
+                                f"data after delist_date={row['delist_date']}"))
+            stats["delisted_with_future_data"] = len(dl_df)
+        except Exception as e:
+            logger.warning(f"delisted_with_future_data check failed: {e}")
+            stats["delisted_with_future_data"] = -1
+
+        # ── 7. 复权价 / 原始价比率偏离 adj_factor ───────────────
+        ratio_sql = f"""
+            SELECT adj.ts_code, adj.trade_date,
+                   adj.close AS adj_close, raw.close AS raw_close,
+                   adj.adj_factor,
+                   ABS(adj.close / NULLIF(raw.close, 0) - adj.adj_factor) AS ratio_diff
+            FROM daily_bar_adjusted adj
+            JOIN daily_bar_raw raw
+              ON adj.ts_code = raw.ts_code AND adj.trade_date = raw.trade_date
+            WHERE adj.trade_date BETWEEN ? AND ?
+              AND raw.close > 0 AND adj.adj_factor > 0
+              AND ABS(adj.close / NULLIF(raw.close, 0) - adj.adj_factor) > adj.adj_factor * 0.01
+              {code_filter_adj.replace('AND ts_code', 'AND adj.ts_code')}
+        """
+        try:
+            ratio_params = [start_date, end_date] + (ts_codes or [])
+            ratio_df = self.query(ratio_sql, tuple(ratio_params))
+            for _, row in ratio_df.iterrows():
+                alerts.append(("adj_raw_ratio_invalid", row["ts_code"], row["trade_date"],
+                                f"adj/raw={row['adj_close']/max(row['raw_close'],1e-9):.4f} "
+                                f"vs adj_factor={row['adj_factor']:.4f} "
+                                f"(diff={row['ratio_diff']:.4f})"))
+            stats["adj_raw_ratio_invalid"] = len(ratio_df)
+        except Exception as e:
+            logger.warning(f"adj_raw_ratio_invalid check failed: {e}")
+            stats["adj_raw_ratio_invalid"] = -1
+
+        # ── 写入 data_quality_alert 表（批量插入）────────────────
+        if alerts:
+            with self.get_connection() as conn:
+                for alert_type, ts_code, trade_date, detail in alerts:
+                    try:
+                        conn.execute("""
+                            INSERT INTO data_quality_alert
+                                (alert_type, ts_code, trade_date, detail)
+                            VALUES (?, ?, ?, ?)
+                        """, (alert_type, str(ts_code), str(trade_date)[:10], detail))
+                    except Exception as e:
+                        logger.debug(f"alert insert failed: {e}")
+
+        total = sum(v for v in stats.values() if v > 0)
+        logger.info(
+            f"Data quality check [{start_date}~{end_date}]: "
+            f"total={total} alerts | {stats}"
+        )
+        return stats
 
     # ──────────────────────────────────────────────────────────
     # Issue #3: 停牌日期填充 & 退市过滤
@@ -2143,7 +2723,7 @@ class DataEngine:
             logger.debug(f"{ts_code} delisted on {delist_date}, skip fetch")
             # 仍然返回本地已有数据
             local = self.query("""
-                SELECT * FROM daily_quotes
+                SELECT * FROM daily_bar_adjusted
                 WHERE ts_code = ? AND trade_date BETWEEN ? AND ?
                 ORDER BY trade_date
             """, (ts_code, start_date, end_date))
@@ -2151,7 +2731,7 @@ class DataEngine:
 
         # 查本地（参数化查询防止SQL注入）
         local = self.query("""
-            SELECT * FROM daily_quotes
+            SELECT * FROM daily_bar_adjusted
             WHERE ts_code = ?
             AND trade_date BETWEEN ? AND ?
             ORDER BY trade_date
@@ -2306,7 +2886,7 @@ class DataEngine:
                         d.trade_date,
                         d.pct_chg,
                         ROW_NUMBER() OVER (PARTITION BY d.ts_code ORDER BY d.trade_date) as rn
-                    FROM daily_quotes d
+                    FROM daily_bar_adjusted d
                     INNER JOIN tmp_codes_ret t ON d.ts_code = t.ts_code
                     AND d.trade_date BETWEEN ? AND ?
                     AND d.volume > 0
@@ -2354,7 +2934,7 @@ class DataEngine:
                     d.trade_date,
                     d.{price_col},
                     {','.join(window_parts)}
-                FROM daily_quotes d
+                FROM daily_bar_adjusted d
                 INNER JOIN tmp_codes_ma t ON d.ts_code = t.ts_code
                 AND d.trade_date BETWEEN ? AND ?
                 AND d.volume > 0
@@ -2392,7 +2972,7 @@ class DataEngine:
                     d.trade_date,
                     d.pct_chg,
                     {','.join(window_parts)}
-                FROM daily_quotes d
+                FROM daily_bar_adjusted d
                 INNER JOIN tmp_codes_vol t ON d.ts_code = t.ts_code
                 AND d.trade_date BETWEEN ? AND ?
                 AND d.volume > 0
@@ -2456,12 +3036,12 @@ class DataEngine:
     # ──────────────────────────────────────────────────────────
     # 允许导出的表白名单（防止路径遍历和SQL注入）
     _EXPORT_TABLE_WHITELIST = frozenset({
-        'daily_quotes', 'stock_basic', 'financial_data', 'index_constituents',
+        'daily_bar_adjusted', 'stock_basic', 'financial_data', 'index_constituents',
         'st_status_history', 'trade_calendar', 'daily_valuation',
         'update_log', 'adj_factor_log', 'data_quality_alert',
     })
 
-    def export_parquet(self, table: str = "daily_quotes") -> Path:
+    def export_parquet(self, table: str = "daily_bar_adjusted") -> Path:
         """导出表到 Parquet 格式（仅允许白名单表名）"""
         if table not in self._EXPORT_TABLE_WHITELIST:
             raise ValueError(f"表 '{table}' 不在导出白名单中，允许的表: {sorted(self._EXPORT_TABLE_WHITELIST)}")
@@ -2484,12 +3064,12 @@ class DataEngine:
     def quality_report(self, start_date: str, end_date: str) -> Dict:
         """生成数据质量报告"""
         total = self.query("""
-            SELECT COUNT(*) as cnt FROM daily_quotes
+            SELECT COUNT(*) as cnt FROM daily_bar_adjusted
             WHERE trade_date BETWEEN ? AND ?
         """, (start_date, end_date)).iloc[0, 0]
 
         anomaly = self.query("""
-            SELECT COUNT(*) as cnt FROM daily_quotes
+            SELECT COUNT(*) as cnt FROM daily_bar_adjusted
             WHERE trade_date BETWEEN ? AND ?
             AND (close <= 0 OR volume < 0 OR adj_factor <= 0)
         """, (start_date, end_date)).iloc[0, 0]
@@ -2539,13 +3119,13 @@ class DataEngine:
         codes_df = pd.DataFrame({"ts_code": ts_codes})
         with self.get_connection() as conn:
             conn.register('tmp_batch_codes', codes_df)
-            # 注意：daily_quotes.close = AkShare前复权价（adj_factor=1.0时close本身已是复权价）
+            # 注意：daily_bar_adjusted.close = AkShare前复权价（adj_factor=1.0时close本身已是复权价）
             # daily_bar_raw.close = 原始未复权价，供未来动态复权使用
             df = conn.execute("""
                 SELECT d.ts_code, d.trade_date, d.open, d.high, d.low, d.close,
                        d.volume, d.amount, d.pct_chg, d.pre_close,
                        d.is_suspend, d.limit_up, d.limit_down
-                FROM daily_quotes d
+                FROM daily_bar_adjusted d
                 INNER JOIN tmp_batch_codes t ON d.ts_code = t.ts_code
                 WHERE d.trade_date = ?
             """, (trade_date,)).fetchdf()

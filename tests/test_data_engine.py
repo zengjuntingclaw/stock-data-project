@@ -329,7 +329,7 @@ class TestDataEngineInit(unittest.TestCase):
         engine = DataEngine(db_path=str(Path(self.tmpdir) / "schema.db"))
         tables = engine.query("SHOW TABLES")
         table_names = tables.iloc[:, 0].tolist()
-        for expected in ["daily_quotes", "stock_basic", "trade_calendar",
+        for expected in ["daily_bar_adjusted", "stock_basic", "trade_calendar",
                          "financial_data", "daily_valuation",
                          "index_constituents", "st_status_history"]:
             self.assertIn(expected, table_names)
@@ -414,7 +414,7 @@ class TestDataEngineSaveQuotes(unittest.TestCase):
         df = self._make_quotes()
         self.engine.save_quotes(df)
         result = self.engine.query(
-            "SELECT * FROM daily_quotes WHERE ts_code = '000001.SZ' ORDER BY trade_date"
+            "SELECT * FROM daily_bar_adjusted WHERE ts_code = '000001.SZ' ORDER BY trade_date"
         )
         self.assertEqual(len(result), 2)
         self.assertAlmostEqual(result.iloc[0]["close"], 10.2, places=2)
@@ -423,7 +423,7 @@ class TestDataEngineSaveQuotes(unittest.TestCase):
     def test_save_empty_df(self):
         """保存空 DataFrame 不报错"""
         self.engine.save_quotes(pd.DataFrame())
-        result = self.engine.query("SELECT COUNT(*) FROM daily_quotes")
+        result = self.engine.query("SELECT COUNT(*) FROM daily_bar_adjusted")
         self.assertEqual(result.iloc[0, 0], 0)
 
     def test_upsert_behavior(self):
@@ -431,7 +431,7 @@ class TestDataEngineSaveQuotes(unittest.TestCase):
         df = self._make_quotes()
         self.engine.save_quotes(df)
         self.engine.save_quotes(df)  # 重复写入
-        result = self.engine.query("SELECT COUNT(*) FROM daily_quotes WHERE ts_code = '000001.SZ'")
+        result = self.engine.query("SELECT COUNT(*) FROM daily_bar_adjusted WHERE ts_code = '000001.SZ'")
         self.assertEqual(result.iloc[0, 0], 2)  # 仍然只有2条
 
 
@@ -715,7 +715,7 @@ class TestIntegration(unittest.TestCase):
 
         # 2. 查询验证
         all_data = self.engine.query(
-            "SELECT * FROM daily_quotes ORDER BY ts_code, trade_date"
+            "SELECT * FROM daily_bar_adjusted ORDER BY ts_code, trade_date"
         )
         self.assertEqual(len(all_data), 3 * 60)
 

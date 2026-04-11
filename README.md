@@ -2,7 +2,7 @@
 
 # A股多因子回测框架
 
-**准实盘级量化回测系统 v3.1**
+**准实盘级量化回测系统 v3.2**
 
 [![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://www.python.org/)
 [![DuckDB](https://img.shields.io/badge/DuckDB-0.9+-orange.svg)](https://duckdb.org/)
@@ -50,7 +50,8 @@
 ### 📊 生产级工程
 - **多线程数据下载** — AkShare + Baostock 双源自动切换，指数退避重试
 - **DuckDB 列式存储** — 千万级行数据查询 <1s
-- **数据质量监控** — 多源交叉验证、复权因子监测、异常数据自动标记
+- **数据质量监控** — 8 类数据校验（OHLC 违规/价格异常/成交量归零/复权因子跳变/成分股滞后/停牌日交易/退市后异常数据/上市前历史），问题数据自动写入 `data_quality_alert` 表
+- **9 层数据分层架构** — 原始层、复权层、主表层、因子层，严格分离数据口径，历史回溯零污染
 - **检查点恢复** — 回测状态序列化，崩溃后可从上次进度继续
 - **交易日历** — 内置 2018-2027 年 A 股节假日数据
 
@@ -82,6 +83,7 @@ stock_data_project/
 │   ├── conftest.py                # pytest 配置
 │   ├── test_core.py               # 核心功能测试
 │   ├── test_data_engine.py        # 数据引擎测试 (61 用例)
+│   ├── test_refactor_v2.py        # v3.x 重构测试 (33 用例)
 │   └── test_production.py         # 生产级测试
 │
 ├── docs/                          # 文档
@@ -91,6 +93,7 @@ stock_data_project/
 │   ├── CODE_REVIEW.md             # 代码审查报告
 │   ├── VULNERABILITY_REPORT.md    # 未来函数漏洞分析
 │   ├── OPTIMIZATION_REPORT_V2.md  # 优化分析报告
+│   ├── REFACTOR_REPORT_V2.md      # v3.x 数据架构重构报告
 │   └── v2.0_refactor_plan.md      # v2.0 重构计划
 │
 ├── data/                          # 数据存储 (git ignored)
@@ -223,6 +226,10 @@ limit = detect_limit('688001')      # → 0.20 (科创板 20%)
 | UPSERT | 重复数据自动覆盖，保证幂等 |
 | 复权因子监测 | 变化 >5% 自动记录日志 |
 | 断点续传 | 检测最新数据完整性，损坏自动回退 |
+| **9 层数据分层** | 原始层 / 复权层 / 主表层 / 因子层，历史回溯零污染 |
+| **PIT 历史查询** | `get_stock_list()` / `get_index_components()` 支持历史时点快照 |
+| **增量同步** | `sync_progress` 表记录断点，`incremental_update()` 可随时中断续跑 |
+| **8 类质量校验** | OHLC 违规 / 价格异常 / 成交量归零 / 复权因子跳变 / 成分股滞后 / 停牌日交易 / 退市后数据 / 上市前历史，问题写入 `data_quality_alert` 表 |
 
 ### 2. ExecutionEngineV3 — 执行引擎
 
@@ -530,6 +537,33 @@ Parquet  (导出) ←── 快速加载、长期归档、跨平台共享
 | Parquet | 0.8s | 1.2s | 45MB |
 | DuckDB | 0.3s | 0.5s | 50MB |
 
+### 9 层数据分层架构
+
+v3.x 重构确立严格的数据分层，各层职责清晰，杜绝历史回溯污染：
+
+| 层级 | 表名 | 说明 |
+|------|------|------|
+| L1 | `daily_bar_raw` | 原始数据层：下载即入库，不做修改，保证可复现 |
+| L2 | `daily_bar_adjusted` | 复权调整层：统一前复权因子，消除历史价格失真 |
+| L3 | `stock_basic_history` | 股票主表层：`(ts_code, list_date, delist_date)` 复合 PK，支持 PIT 查询 |
+| L4 | `security_master` | 证券主表层：含交易所映射 (688/30/4/8/920)、全量历史证券（含退市） |
+| L5 | `index_components_history` | 指数成分历史：`in_date`/`out_date` 区间，精确历史成分股 |
+| L6 | `sync_progress` | 同步进度层：各数据类型的最新同步位置，断点续跑 |
+| L7 | `data_quality_alert` | 质量告警层：8 类数据异常记录，可审计追溯 |
+| L8 | `financial_data` | 因子层：财务数据，`ann_date` 作为 PIT 对齐依据 |
+| L9 | `daily_bar_derived` | 衍生指标层：预处理因子、收益率、波动率等 |
+
+**PIT 查询示例**（查询 2022-06-30 时的沪深 300 成分股）：
+
+```python
+engine = DataEngine()
+# 获取历史上某一天有效的股票列表
+stocks = engine.get_stock_list(date='2022-06-30')
+
+# 获取历史上某一天某指数的成分股
+members = engine.get_index_components('000300.SH', date='2022-06-30')
+```
+
 ---
 
 ## 测试
@@ -542,6 +576,9 @@ python run_tests.py
 python run_tests.py test_core
 python run_tests.py test_data_engine
 python run_tests.py test_production
+
+# 运行 v3.x 重构测试（使用系统 Python，带 pandas/duckdb）
+python -m unittest discover -s tests -p test_refactor_v2.py
 ```
 
 ### 测试覆盖
@@ -550,6 +587,7 @@ python run_tests.py test_production
 |------|---------|------|
 | data_classes.py | ✅ 完整 | Order, Trade, Position, CostConfig |
 | data_engine.py | ✅ 良好 | 61 用例，含数据验证 |
+| **data_engine.py v3.x** | ✅ 完整 | 33 用例：PIT 历史表 / 原始复权分离 / 增量同步 / 8 类质量校验 / UPSERT / 断点续跑 |
 | trading_rules.py | ✅ 良好 | 涨跌停、交易日历 |
 | execution_engine_v3.py | ⚠️ 中等 | T+1 流程、风控逻辑 |
 | survivorship_bias.py | ⚠️ 中等 | ST 状态、退市处理 |
@@ -567,6 +605,7 @@ python run_tests.py test_production
 | [CODE_REVIEW](docs/CODE_REVIEW.md) | 代码自检报告（10 个问题修复） |
 | [VULNERABILITY_REPORT](docs/VULNERABILITY_REPORT.md) | 未来函数高危漏洞分析 |
 | [OPTIMIZATION_REPORT_V2](docs/OPTIMIZATION_REPORT_V2.md) | P0-P3 优化分析报告 |
+| [REFACTOR_REPORT_V2](docs/REFACTOR_REPORT_V2.md) | v3.x 数据架构重构报告 |
 | [v2.0_refactor_plan](docs/v2.0_refactor_plan.md) | v2.0 工业级重构计划 |
 
 ---
@@ -588,6 +627,15 @@ python run_tests.py test_production
 ---
 
 ## 版本历史
+
+### v3.2 (2026-04-11)
+- **数据架构重构**：重构 `security_master` / `stock_basic_history` 为真正的历史主表（含上市/退市日期）
+- **日线数据分层**：拆分为 `daily_bar_raw`（原始前复权）和 `daily_bar_adjusted`（复权因子标准化），历史回溯零污染
+- **指数成分股历史**：从快照表改为 `in_date`/`out_date` 区间表，支持 PIT 历史时点查询
+- **8 类数据质量校验**：OHLC 违规 / 价格异常 / 成交量归零 / 复权因子跳变 / 成分股滞后 / 停牌日交易 / 退市后异常数据 / 上市前历史，异常写入 `data_quality_alert` 表
+- **增量同步与断点续跑**：`sync_progress` 表记录各数据类型的最新同步位置，`incremental_update()` 可随时中断后续跑
+- **DuckDB Bug 修复**：`CURRENT_TIMESTAMP` → `NOW()`、`INTEGER PRIMARY KEY` + SEQUENCE 自增、`delist_sql` JOIN 列名歧义
+- **测试补齐**：`test_refactor_v2.py` 33 用例覆盖所有重构模块
 
 ### v3.1 (2026-04-08)
 - 修复 5 个 P0 运行时 Bug（位运算死循环、NameError、TypeError、持仓丢失）

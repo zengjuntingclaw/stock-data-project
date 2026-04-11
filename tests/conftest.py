@@ -1,9 +1,7 @@
-"""
-conftest.py - pytest/unittest 路径配置
-
-确保项目 scripts/ 目录优先级高于全局 scripts/ 目录
-（防止 C:\Users\zengj\.qclaw\workspace\scripts 干扰导入）
-"""
+# conftest.py - pytest/unittest 路径配置
+#
+# 确保项目 scripts/ 目录优先级高于全局 scripts/ 目录
+# （防止 workspace/scripts 目录干扰导入）
 import sys
 import os
 
