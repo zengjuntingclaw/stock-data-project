@@ -550,18 +550,19 @@ class DataEngine:
     # ──────────────────────────────────────────────────────────
     # 幸存者偏差处理
     # ──────────────────────────────────────────────────────────
-    def get_all_stocks(self, include_delisted: bool = True) -> pd.DataFrame:
+    def _fetch_remote_stocks(self, include_delisted: bool = True) -> pd.DataFrame:
         """
-        [废弃] 请使用 get_active_stocks(trade_date) 获取历史股票池。
+        从远程 API（AkShare）获取股票列表（内部同步用）。
 
-        此方法仍可使用，但主流程应调用 get_active_stocks() 以支持 PIT 查询。
-        get_all_stocks() 仅用于外部同步股票列表，不再参与回测主链路。
+        仅用于同步操作（sync_stock_list / save_snapshot）的远程数据获取。
+        不依赖 AkShare 时返回空 DataFrame，由调用方决定降级策略。
 
-        获取全量股票列表（含退市股）
-        解决幸存者偏差的关键入口。
+        Returns
+        -------
+        pd.DataFrame: 包含 symbol/name/industry 等字段的股票列表
         """
         if not HAS_AKSHARE:
-            return self._get_local_stocks()
+            return pd.DataFrame()
 
         stocks = []
 
@@ -574,11 +575,11 @@ class DataEngine:
             current["list_date"] = pd.NaT
             current["delist_date"] = pd.NaT
             stocks.append(current)
-            logger.info(f"Current stocks: {len(current)}")
+            logger.info(f"Current stocks from remote: {len(current)}")
         except (ValueError, KeyError, RuntimeError) as e:
             logger.warning(f"Failed to fetch current stocks: {e}")
 
-        # 2. 退市股票（关键：解决幸存者偏差）
+        # 2. 退市股票（解决幸存者偏差）
         if include_delisted:
             try:
                 delisted = ak.stock_zh_a_delist(symbol="退市")
@@ -590,21 +591,40 @@ class DataEngine:
                     dl["total_mv"] = np.nan
                     dl["circ_mv"] = np.nan
                     stocks.append(dl)
-                    logger.info(f"Delisted stocks: {len(dl)}")
+                    logger.info(f"Delisted stocks from remote: {len(dl)}")
             except (ValueError, KeyError, RuntimeError) as e:
                 logger.warning(f"Failed to fetch delisted stocks: {e}")
 
         if not stocks:
-            return self._get_local_stocks()
+            return pd.DataFrame()
 
         df = pd.concat(stocks, ignore_index=True)
         df = df.drop_duplicates(subset=["symbol"], keep="first")
-
-        # 构造 ts_code
+        df["symbol"] = df["symbol"].astype(str).str.zfill(6)
         df["ts_code"] = df["symbol"].apply(build_ts_code)
-
         df["market"] = df["symbol"].apply(detect_board)
         return df
+
+    def get_all_stocks(self, include_delisted: bool = True) -> pd.DataFrame:
+        """
+        [废弃] 请使用 get_active_stocks(trade_date) 获取历史股票池。
+
+        此方法仅用于外部同步股票列表，不再参与回测主链路。
+        主流程应调用 get_active_stocks() 以支持 PIT 查询。
+
+        获取全量股票列表（含退市股）。优先从远程 API 获取，
+        失败时直接抛出 RuntimeError（旧表 stock_basic 已废弃，不支持静默回退）。
+        """
+        remote_df = self._fetch_remote_stocks(include_delisted)
+        if not remote_df.empty:
+            return remote_df
+
+        # 远程获取失败 → 明确报错，不静默回退
+        raise RuntimeError(
+            "无法从 AkShare 获取股票列表，且 stock_basic_history 表为空。"
+            "请先调用 sync_stock_list() 同步数据。"
+            "旧表 stock_basic 已废弃，不支持回退。"
+        )
 
     def save_stock_basic_snapshot(self, snapshot_date: Optional[str] = None) -> int:
         """
@@ -626,8 +646,8 @@ class DataEngine:
         if snapshot_date is None:
             snapshot_date = self._get_now().strftime("%Y-%m-%d")
 
-        # 获取当前股票列表（含退市）
-        df = self.get_all_stocks(include_delisted=True)
+        # 从远程 API 获取股票列表（直接调用，不走 get_all_stocks 回退逻辑）
+        df = self._fetch_remote_stocks(include_delisted=True)
         if df.empty:
             logger.warning(f"No stocks to snapshot for {snapshot_date}")
             return 0
@@ -1382,9 +1402,12 @@ class DataEngine:
         4. stock_basic_history 使用 UPSERT（ON CONFLICT DO UPDATE）防止重复记录
         5. eff_date = 今日，标记本次同步时间点
         """
-        df = self.get_all_stocks(include_delisted)
+        df = self._fetch_remote_stocks(include_delisted)
         if df.empty:
-            return
+            raise RuntimeError(
+                "无法从 AkShare 获取股票列表（网络可能不可用）。"
+                "请检查网络连接后重试。"
+            )
 
         # ── Baostock 补充 list_date / delist_date（线程安全）────────
         if HAS_BAOSTOCK:

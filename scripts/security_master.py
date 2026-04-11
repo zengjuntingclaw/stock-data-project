@@ -613,22 +613,20 @@ def create_security_master_from_engine(engine, start_year: int = 2010, end_year:
     """
     master = HistoricalSecurityMaster()
     
-    # 从DataEngine获取所有股票（含退市）
+    # 从 DataEngine 获取当前交易日可交易股票池（PIT 查询，不含未来函数）
+    today = datetime.now().strftime("%Y-%m-%d")
     try:
-        df = engine.get_all_stocks(include_delisted=True)
-        if not df.empty:
-            # 标准化列名
-            df = df.rename(columns={
-                'ts_code': 'symbol',
-                'name': 'name',
-                'list_date': 'list_date',
-                'delist_date': 'delist_date',
-            })
-            # 提取symbol（去掉后缀）
-            df['symbol'] = df['symbol'].str.split('.').str[0]
-            
+        ts_codes = engine.get_active_stocks(today)
+        if ts_codes:
+            # 构造 DataFrame 用于 add_stock_from_df
+            # get_active_stocks 返回 list[str]，需转 DataFrame 并补充字段
+            df = pd.DataFrame({"symbol": ts_codes})
+            # 补全 ts_code（用于后续处理）
+            df["ts_code"] = df["symbol"]
+            # 去掉后缀得到纯数字代码
+            df["symbol"] = df["symbol"].str.split(".").str[0]
             count = master.add_stock_from_df(df)
-            logger.info(f"Created security master with {count} stocks from DataEngine")
+            logger.info(f"Created security master with {count} stocks from DataEngine.get_active_stocks('{today}')")
     except Exception as e:
         logger.error(f"Failed to create security master from engine: {e}")
     
