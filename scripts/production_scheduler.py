@@ -486,50 +486,56 @@ if HAS_AIRFLOW:
 if HAS_PREFECT:
     
     @prefect_task(name="sync-stock-list", retries=2)
-    def prefetch_stock_list():
+    def prefetch_stock_list(trade_date: str = None):
         """Prefect: 同步股票列表"""
-        from scripts.multi_source_manager import get_source_manager
+        from scripts.pipeline_data_engine import PipelineDataEngine
         
-        mgr = get_source_manager()
-        result = mgr.fetch_stock_list()
+        engine = PipelineDataEngine()
+        td = trade_date or date.today().isoformat()
         
-        if not result.success:
-            raise RuntimeError(f"获取股票列表失败: {result.error}")
-        
-        return result.data["ts_code"].dropna().unique().tolist()
+        try:
+            stocks_df = engine.get_active_stocks(td)
+            engine.close()
+            return stocks_df["ts_code"].dropna().unique().tolist()
+        except RuntimeError as e:
+            engine.close()
+            raise RuntimeError(f"获取股票列表失败: {e}")
     
     @prefect_task(name="sync-daily-data", retries=2)
     def prefetch_daily_data(ts_codes: List[str], start_date: str, end_date: str):
-        """Prefect: 同步日线数据"""
-        from scripts.data_engine import DataEngine
-        from scripts.advanced_checkpoint import SyncCoordinator
-        from scripts.alert_manager import AlertManager
+        """Prefect: 同步日线数据（统一使用 PipelineDataEngine）"""
+        from scripts.pipeline_data_engine import PipelineDataEngine
+        from scripts.production_scheduler import AlertManager
         
-        de = DataEngine()
-        coordinator = SyncCoordinator(de)
+        engine = PipelineDataEngine(db_path="data/stock_data.duckdb")
         alert_mgr = AlertManager()
         
         results = []
         for ts_code in ts_codes:
             try:
-                ok, msg, count = coordinator.sync_with_checkpoint(
-                    ts_code, start_date, end_date
-                )
-                results.append({"ts_code": ts_code, "success": ok, "count": count})
+                result = engine.sync_stock(ts_code, start_date, end_date)
+                results.append({
+                    "ts_code": ts_code,
+                    "success": result.get("success", False),
+                    "count": result.get("records", 0)
+                })
                 
-                if not ok:
-                    alert_mgr.send_sync_failure(ts_code, msg)
+                if not result.get("success"):
+                    alert_mgr.send_sync_failure(ts_code, result.get("error", "unknown"))
             except Exception as e:
                 logger.error(f"[Prefect] {ts_code} 同步失败: {e}")
                 alert_mgr.send_sync_failure(ts_code, str(e))
+                results.append({"ts_code": ts_code, "success": False, "error": str(e)})
         
+        engine.close()
         return results
     
     @flow(name="stock-data-sync", log_prints=True)
     def stock_data_sync_flow(
         start_date: str = None,
         end_date: str = None,
-        ts_codes: List[str] = None
+        ts_codes: List[str] = None,
+        trade_date: str = None
     ):
         """
         Prefect: 股票数据同步流程
@@ -549,19 +555,20 @@ if HAS_PREFECT:
         
         end_date = end_date or dt.now().date().isoformat()
         start_date = start_date or (dt.strptime(end_date, "%Y-%m-%d") - timedelta(days=30)).strftime("%Y-%m-%d")
+        trade_date = trade_date or end_date
         
         logger.info(f"开始股票数据同步: {start_date} ~ {end_date}")
         
         # 获取股票列表
         if ts_codes is None:
-            ts_codes = prefetch_stock_list()
+            ts_codes = prefetch_stock_list(trade_date)
         
         logger.info(f"待同步股票数: {len(ts_codes)}")
         
         # 同步日线数据
         results = prefetch_daily_data(ts_codes, start_date, end_date)
         
-        success_count = sum(1 for r in results if r["success"])
+        success_count = sum(1 for r in results if r.get("success"))
         logger.info(f"同步完成: 成功 {success_count}/{len(results)}")
         
         return {

@@ -24,10 +24,21 @@ from scripts.backtest_engine_v3 import ProductionBacktestEngine, BacktestConfig
 # 绩效分析
 from scripts.performance import EnhancedPerformanceAnalyzer, BrinsonAttribution
 
-# 数据引擎（主入口）
+# 数据引擎（主入口 v6 - 统一管道）
 from scripts.data_engine import DataEngine, detect_board, detect_limit, build_ts_code
+from scripts.pipeline_data_engine import (
+    PipelineDataEngine,
+    EnhancedDataEngine,
+    ProductionDataEngine,
+    RuntimeController,
+    DataRouter,
+    QualityEngine,
+    StorageManager,
+    BacktestValidator,
+    create_pipeline_engine,
+)
 
-# 数据存储层
+# 数据存储层（保留作为底层存储）
 from scripts.data_store import DataStore, ConnectionPool
 from scripts.data_fetcher import DataFetcher, DataSource, AkShareSource, BaostockSource
 
@@ -53,6 +64,16 @@ __all__ = [
     "EnhancedPerformanceAnalyzer", "BrinsonAttribution",
     # 数据引擎
     "DataEngine", "detect_board", "detect_limit", "build_ts_code",
+    # 统一数据管道 (v6 - 推荐入口)
+    "PipelineDataEngine",
+    "EnhancedDataEngine",
+    "ProductionDataEngine",
+    "RuntimeController",
+    "DataRouter",
+    "QualityEngine",
+    "StorageManager",
+    "BacktestValidator",
+    "create_pipeline_engine",
     # 数据存储层
     "DataStore", "ConnectionPool",
     "DataFetcher", "DataSource", "AkShareSource", "BaostockSource",

@@ -32,9 +32,7 @@ from loguru import logger
 # 业务逻辑导入
 # =============================================================================
 
-from scripts.data_fetcher import DataFetcher
-from scripts.data_validator import EnhancedValidator
-from scripts.data_store import DataStore, ParquetStorage
+from scripts.pipeline_data_engine import PipelineDataEngine
 
 
 # =============================================================================
@@ -79,22 +77,16 @@ def _daily_download_task(**context):
 
     logger.info(f"[Scheduler] 开始下载任务，执行日期: {execution_date}")
 
-    fetcher = DataFetcher(primary="tushare")
-    store = DataStore(db_path="data/stock_data.duckdb")
-    validator = EnhancedValidator()
+    engine = PipelineDataEngine(db_path="data/stock_data.duckdb")
 
     # 1. 获取股票列表
-    result = fetcher.fetch_stock_list()
-    if not result.success:
-        logger.error(f"[Scheduler] 获取股票列表失败: {result.error}")
-        raise RuntimeError(f"获取股票列表失败: {result.error}")
+    try:
+        stocks_df = engine.get_active_stocks(execution_date)
+        ts_codes = stocks_df["ts_code"].dropna().unique().tolist()
+    except RuntimeError:
+        logger.error("[Scheduler] 获取股票列表失败")
+        raise RuntimeError("获取股票列表失败")
 
-    df_stocks = result.data
-    ts_codes = (
-        df_stocks["ts_code"].dropna().unique().tolist()
-        if "ts_code" in df_stocks.columns
-        else []
-    )
     logger.info(f"[Scheduler] 共 {len(ts_codes)} 只股票待下载")
 
     # 2. 下载近30天数据（增量）
@@ -104,32 +96,22 @@ def _daily_download_task(**context):
     success, failed = 0, []
     for ts_code in ts_codes[:100]:  # 先处理100只，完整跑批可去掉 [:100]
         try:
-            r = fetcher.fetch_daily(ts_code, start, end)
-            if not r.success:
+            # 使用 PipelineDataEngine 批量同步
+            result = engine.sync_stock(ts_code, start, end)
+            if result.get("success"):
+                # 验证数据质量
+                val_result = engine.validate_and_repair(ts_code, start, end)
+                if not val_result["validation"]["ok"]:
+                    logger.warning(f"[Scheduler] {ts_code} 质量告警: {val_result['validation']['issues']}")
+                success += 1
+            else:
                 failed.append(ts_code)
-                continue
-
-            df = r.data
-            if df is None or df.empty:
-                continue
-
-            # 校验
-            vresult = validator.validate(df, ts_code=ts_code)
-            if not vresult["ok"]:
-                validator.log_validation_report(vresult, ts_code)
-
-            df_fixed = validator.validate_and_fix(df)
-
-            # 写入 DuckDB（raw）
-            store.execute(
-                "INSERT INTO daily_bar_raw (trade_date, ts_code, open, high, low, close, volume, amount) "
-                "SELECT trade_date, ts_code, open, high, low, close, volume, amount FROM df_fixed",
-            )
-            success += 1
 
         except Exception as e:
             logger.warning(f"[Scheduler] {ts_code} 下载失败: {e}")
             failed.append(ts_code)
+
+    engine.close()
 
     logger.info(
         f"[Scheduler] 下载完成，成功 {success}，失败 {len(failed)}"
