@@ -1,14 +1,15 @@
 """
 DataFetcher - 数据获取抽象层
 ==============================
-职责：多数据源获取（AkShare/Baostock）、重试机制、数据标准化
+职责：多数据源获取（TuShare/AkShare/Baostock）、指数退避重试、数据标准化
 """
 from __future__ import annotations
 
+import os
 import time
 import random
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional, List, Dict, Callable, Type
 
@@ -203,91 +204,220 @@ class BaostockSource(DataSource):
         return df
 
 
+def _fetch_with_retry(
+    fetch_fn: Callable,
+    *args,
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+    max_delay: float = 30.0,
+    jitter: bool = True,
+    **kwargs,
+) -> FetchResult:
+    """
+    通用指数退避重试函数
+
+    策略：delay = min(base_delay * 2^attempt + random_jitter, max_delay)
+    - 第 1 次重试：~1~3s
+    - 第 2 次重试：~2~5s
+    - 第 3 次重试：~4~8s
+    - 超过 max_delay 则封顶
+    """
+    last_error = ""
+
+    for attempt in range(max_retries):
+        try:
+            result = fetch_fn(*args, **kwargs)
+            if result.success:
+                return result
+            last_error = result.error or "unknown error"
+        except Exception as e:
+            last_error = str(e)
+
+        if attempt < max_retries - 1:
+            delay = min(base_delay * (2**attempt), max_delay)
+            if jitter:
+                delay += random.uniform(0, delay * 0.5)
+            logger.warning(
+                f"[DataFetcher] attempt {attempt + 1}/{max_retries} failed: "
+                f"{last_error}, retrying in {delay:.1f}s..."
+            )
+            time.sleep(delay)
+
+    logger.error(f"[DataFetcher] All {max_retries} attempts failed: {last_error}")
+    return FetchResult(False, error=last_error)
+
+
 class DataFetcher:
     """
     数据获取协调器
-    
-    职责：
-    1. 多数据源管理
-    2. 自动故障转移
-    3. 重试机制
-    4. 请求限流
+
+    数据源优先级（默认）：TuShare Pro > AkShare > Baostock
+    支持指数退避重试 + 多源故障转移。
     """
-    
+
     def __init__(
         self,
-        primary: str = "akshare",
-        fallback: Optional[str] = "baostock",
+        primary: str = "tushare",
+        middle: str = "akshare",
+        fallback: str = "baostock",
         max_retries: int = 3,
-        delay: float = 0.2
+        base_delay: float = 1.0,
+        max_delay: float = 30.0,
     ):
-        self.sources: Dict[str, DataSource] = {}
+        """
+        Args:
+            primary:   主数据源（默认 TuShare Pro）
+            middle:    中间数据源（AkShare）
+            fallback:  兜底数据源（Baostock）
+            max_retries:   单源最大重试次数
+            base_delay:    初始重试延迟（秒）
+            max_delay:     最大重试延迟（秒）
+        """
+        self.sources: Dict[str, Optional[DataSource]] = {}
         self.primary = primary
+        self.middle = middle
         self.fallback = fallback
         self.max_retries = max_retries
-        self.delay = delay
-        
-        # 注册数据源
-        self._register_source("akshare", AkShareSource)
-        self._register_source("baostock", BaostockSource)
-    
-    def _register_source(self, name: str, cls: Type[DataSource]) -> None:
-        """注册数据源（延迟初始化）"""
-        self.sources[name] = None  # 延迟初始化
-    
-    def _get_source(self, name: str) -> DataSource:
-        """获取数据源实例（懒加载）"""
-        if self.sources[name] is None:
-            if name == "akshare":
-                self.sources[name] = AkShareSource()
-            elif name == "baostock":
-                self.sources[name] = BaostockSource()
+        self.base_delay = base_delay
+        self.max_delay = max_delay
+
+        # 注册数据源（延迟初始化）
+        self._lazy_registry = {
+            "tushare": self._init_tushare,
+            "akshare": self._init_akshare,
+            "baostock": self._init_baostock,
+        }
+        for name in self._lazy_registry:
+            self.sources[name] = None
+
+    def _init_tushare(self) -> DataSource:
+        """TuShare 需要 token，优先读环境变量"""
+        from scripts.tushare_source import TuShareSource
+
+        token = os.environ.get("TUSHARE_TOKEN", "")
+        if not token:
+            logger.warning(
+                "[DataFetcher] TUSHARE_TOKEN 未设置，TuShare 源不可用，"
+                "将降级到 AkShare"
+            )
+            return None
+        return TuShareSource(token=token)
+
+    def _init_akshare(self) -> DataSource:
+        return AkShareSource()
+
+    def _init_baostock(self) -> DataSource:
+        return BaostockSource()
+
+    def _get_source(self, name: str) -> Optional[DataSource]:
+        """懒加载获取数据源实例（失败返回 None，不抛异常）"""
+        if name not in self._lazy_registry:
+            return None
+        if self.sources.get(name) is None:
+            try:
+                self.sources[name] = self._lazy_registry[name]()
+            except Exception as e:
+                logger.warning(f"[DataFetcher] 数据源 {name} 初始化失败: {e}")
+                self.sources[name] = None
         return self.sources[name]
-    
+
     def fetch_daily(
         self,
         symbol: str,
         start: str,
         end: str,
-        source: Optional[str] = None
+        source: Optional[str] = None,
     ) -> FetchResult:
         """
-        获取日线数据（带重试和故障转移）
-        
-        Args:
-            symbol: 股票代码
-            start: 开始日期 YYYY-MM-DD
-            end: 结束日期 YYYY-MM-DD
-            source: 指定数据源，None则使用主备策略
+        获取日线数据（带指数退避重试 + 多源故障转移）
+
+        策略链：TuShare → AkShare → Baostock
+        每个数据源独立重试，全部失败才报错。
         """
-        sources_to_try = [source] if source else [self.primary, self.fallback]
-        sources_to_try = [s for s in sources_to_try if s]
-        
-        for src_name in sources_to_try:
-            for attempt in range(self.max_retries):
-                try:
-                    src = self._get_source(src_name)
-                    result = src.fetch_daily(symbol, start, end)
-                    
-                    if result.success:
-                        return result
-                    
-                    # 失败则重试
-                    if attempt < self.max_retries - 1:
-                        time.sleep(self.delay * (attempt + 1))
-                        
-                except Exception as e:
-                    logger.warning(f"{src_name} attempt {attempt+1} failed: {e}")
-                    if attempt < self.max_retries - 1:
-                        time.sleep(self.delay * (attempt + 1))
-        
-        return FetchResult(False, error="All sources failed")
-    
-    def fetch_stock_list(self, source: Optional[str] = None) -> FetchResult:
-        """获取股票列表"""
-        src_name = source or self.primary
-        try:
+        if source:
+            # 指定数据源：直接用
+            src = self._get_source(source)
+            if src is None:
+                return FetchResult(False, error=f"数据源 {source} 不可用", source=source)
+            return _fetch_with_retry(
+                src.fetch_daily, symbol, start, end,
+                max_retries=self.max_retries,
+                base_delay=self.base_delay,
+                max_delay=self.max_delay,
+            )
+
+        # 多源故障转移
+        for src_name in [self.primary, self.middle, self.fallback]:
             src = self._get_source(src_name)
-            return src.fetch_stock_list()
-        except Exception as e:
-            return FetchResult(False, error=str(e))
+            if src is None:
+                continue
+            result = _fetch_with_retry(
+                src.fetch_daily, symbol, start, end,
+                max_retries=self.max_retries,
+                base_delay=self.base_delay,
+                max_delay=self.max_delay,
+            )
+            if result.success:
+                return result
+            logger.warning(
+                f"[DataFetcher] {src_name} 全部重试失败，尝试下一个数据源"
+            )
+
+        return FetchResult(False, error="所有数据源均失败")
+
+    def fetch_daily_adjusted(
+        self,
+        symbol: str,
+        start: str,
+        end: str,
+        adjust: str = "qfq",
+    ) -> FetchResult:
+        """
+        获取复权日线数据（仅 TuShare 支持，返回失败则降级到普通日线）
+        """
+        src = self._get_source("tushare")
+        if src is None:
+            return FetchResult(False, error="TuShare 不可用", source="tushare")
+        if not hasattr(src, "fetch_daily_adjusted"):
+            return FetchResult(False, error="该数据源不支持复权数据", source="tushare")
+        return _fetch_with_retry(
+            src.fetch_daily_adjusted, symbol, start, end, adjust,
+            max_retries=self.max_retries,
+            base_delay=self.base_delay,
+            max_delay=self.max_delay,
+        )
+
+    def fetch_stock_list(self, source: Optional[str] = None) -> FetchResult:
+        """获取股票列表（优先用 TuShare，失败则降级）"""
+        if source:
+            src = self._get_source(source)
+            if src is None:
+                return FetchResult(False, error=f"数据源 {source} 不可用", source=source)
+            try:
+                return src.fetch_stock_list()
+            except Exception as e:
+                return FetchResult(False, error=str(e), source=source)
+
+        for src_name in [self.primary, self.middle, self.fallback]:
+            src = self._get_source(src_name)
+            if src is None:
+                continue
+            try:
+                result = src.fetch_stock_list()
+                if result.success:
+                    return result
+            except Exception as e:
+                logger.warning(f"[DataFetcher] {src_name} fetch_stock_list 失败: {e}")
+        return FetchResult(False, error="所有数据源获取股票列表失败")
+
+    def fetch_trade_cal(self, start: str, end: str) -> FetchResult:
+        """获取交易日历（仅 TuShare 支持）"""
+        src = self._get_source("tushare")
+        if src is None or not hasattr(src, "fetch_trade_cal"):
+            return FetchResult(False, error="TuShare 不可用", source="tushare")
+        return _fetch_with_retry(
+            src.fetch_trade_cal, start, end,
+            max_retries=self.max_retries,
+            base_delay=self.base_delay,
+            max_delay=self.max_delay,
+        )
