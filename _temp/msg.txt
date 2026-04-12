@@ -1,9 +1,0 @@
-feat: schema v5 data warehouse refactoring
-
-- PIT stock universe (get_active_stocks)
-- Index constituents history table
-- raw/adjusted dual-layer price separation
-- 8 qfq/hfq fields
-- DROP stock_basic + env config
-- 10 data quality checks
-- UPSERT resumable sync

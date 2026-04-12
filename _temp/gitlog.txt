@@ -1,3 +1,0 @@
-241680b refactor: fetch_financial_data改用get_active_stocks/补全10项数据质量检查/对齐schema_v2.1
-928448c docs: 更新 MEMORY.md - 记录 schema v5.0 收口完成
-121933a refactor: 收口最后残留旧口径 - update_daily_data改用get_active_stocks/DEFAULT_START_DATE环境变量优先

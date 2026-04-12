@@ -1,6 +1,0 @@
-exit: 0
-stdout_len: 0
-stderr_len: 109
-stderr:
-warning: in the working copy of '_temp/stderr.txt', LF will be replaced by CRLF the next time Git touches it
-

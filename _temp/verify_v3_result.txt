@@ -1,1 +1,0 @@
-[PASS] 1. DEFAULT_START_DATE env var | got=2020-01-01

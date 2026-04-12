@@ -1,6 +1,0 @@
-{
-  "request_id": "cefa46e1-6cc1-497b-8c81-512f3c721d53",
-  "code": 40203,
-  "data": null,
-  "msg": "抱歉，您每天最多访问该接口10次，权限的具体详情访问：https://tushare.pro/document/1?doc_id=108。"
-}

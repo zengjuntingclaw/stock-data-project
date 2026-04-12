@@ -1,4 +1,0 @@
-Traceback (most recent call last):
-  File "c:\Users\zengj\.qclaw\workspace\stock_data_project\_temp\verify_isolated.py", line 14, in <module>
-    print("【验证1】DEFAULT_START_DATE env 配置: PASS \u2705")
-UnicodeEncodeError: 'gbk' codec can't encode character '\u2705' in position 37: illegal multibyte sequence

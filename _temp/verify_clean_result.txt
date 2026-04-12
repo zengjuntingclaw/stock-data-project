@@ -1,3 +1,0 @@
-[PASS] 1. DEFAULT_START_DATE env var | got=2020-01-01
-[PASS] 2. DROP old stock_basic table | stock_basic exists=False
-[PASS] 3. daily_bar_adjusted qfq/hfq 8 fields | missing=[]
