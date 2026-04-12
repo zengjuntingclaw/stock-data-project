@@ -76,12 +76,14 @@ class TestBuildTsCodeCoverage(unittest.TestCase):
         self.assertEqual(build_ts_code('920103'), '920103.BJ')
 
     def test_leading_zero_sh(self):
-        """前导零沪市：'1' → '000001.SH'"""
-        self.assertEqual(build_ts_code('1'), '000001.SH')
+        """前导零后 6 位：'1' → '000001'，0 开头 → SZ（深市主板）"""
+        self.assertEqual(build_ts_code('1'), '000001.SZ')
 
     def test_leading_zero_sz(self):
-        """前导零深市：'8' → '000008.SZ'"""
-        self.assertEqual(build_ts_code('8'), '000008.SZ')
+        """6位完整代码 '000008'（前导零 + 末位8）→ 深市主板 SZ
+        注意：_is_bj_code 对 6 位输入走正则精确路径，'000008' 不匹配
+        4xxxxx/8xxxxx/920xxx，因此正确返回 SZ 而非 BJ。"""
+        self.assertEqual(build_ts_code('000008'), '000008.SZ')
 
     def test_leading_zero_bj_old(self):
         """前导零北交所老股：'430001' → '430001.BJ'"""
@@ -182,27 +184,26 @@ class TestGetActiveStocks(unittest.TestCase):
         from scripts.data_engine import DataEngine
         self.db_path = tempfile.mktemp(suffix='.duckdb')
         self.engine = DataEngine(db_path=self.db_path)
-        conn = duckdb.connect(self.db_path)
-        # 初始化 schema
-        self.engine._init_schema()
-        conn.close()
 
     def tearDown(self):
         if os.path.exists(self.db_path):
             os.remove(self.db_path)
 
-    def _seed_stocks(self, conn):
-        """写入测试股票数据"""
-        cur = conn.cursor()
-        # 3只股票：上市/退市/未来上市
+    def _seed_stocks(self):
+        """写入测试股票数据（通过 engine.execute 避免多连接冲突）
+
+        eff_date 必须 <= 各测试查询日期，否则 PIT 查询（eff_date <= trade_date）
+        会过滤掉所有记录。这里将 eff_date 设为与 list_date 相同，模拟上市当天
+        即建立历史快照的场景。
+        """
         test_data = [
             # ts_code, symbol, name, exchange, list_date, delist_date, is_delisted, eff_date
-            ('000001.SZ', '000001', '平安银行', 'SZ', '1991-04-03', None, False, '2024-01-01'),
-            ('600000.SH', '600000', '浦发银行', 'SH', '1999-11-10', None, False, '2024-01-01'),
-            ('000002.SZ', '000002', '万科A', 'SZ', '1991-01-29', '2024-06-28', True, '2024-01-01'),
+            ('000001.SZ', '000001', '平安银行', 'SZ', '1991-04-03', None, False, '1991-04-03'),
+            ('600000.SH', '600000', '浦发银行', 'SH', '1999-11-10', None, False, '1999-11-10'),
+            ('000002.SZ', '000002', '万科A', 'SZ', '1991-01-29', '2024-06-28', True, '1991-01-29'),
         ]
         for row in test_data:
-            cur.execute("""
+            self.engine.execute("""
                 INSERT INTO stock_basic_history
                 (ts_code, symbol, name, exchange, list_date, delist_date, is_delisted, eff_date)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -210,48 +211,32 @@ class TestGetActiveStocks(unittest.TestCase):
 
     def test_active_before_1990(self):
         """1990年：所有股票都未上市，返回空"""
-        conn = duckdb.connect(self.db_path)
-        try:
-            self._seed_stocks(conn)
-            result = self.engine.get_active_stocks('1990-01-01')
-            self.assertEqual(result, [])
-        finally:
-            conn.close()
+        self._seed_stocks()
+        result = self.engine.get_active_stocks('1990-01-01')
+        self.assertEqual(result, [])
 
     def test_active_in_2000(self):
         """2000年：3只股票均已上市（万科退市日2024年）"""
-        conn = duckdb.connect(self.db_path)
-        try:
-            self._seed_stocks(conn)
-            result = self.engine.get_active_stocks('2000-01-01')
-            self.assertEqual(set(result), {'000001.SZ', '600000.SH', '000002.SZ'})
-        finally:
-            conn.close()
+        self._seed_stocks()
+        result = self.engine.get_active_stocks('2000-01-01')
+        self.assertEqual(set(result), {'000001.SZ', '600000.SH', '000002.SZ'})
 
     def test_active_after_wanke_delist(self):
         """2024-07-01：万科已退市（2024-06-28），不在可交易池"""
-        conn = duckdb.connect(self.db_path)
-        try:
-            self._seed_stocks(conn)
-            result = self.engine.get_active_stocks('2024-07-01')
-            self.assertNotIn('000002.SZ', result,
-                "退市股票不应出现在可交易池")
-            self.assertEqual(set(result), {'000001.SZ', '600000.SH'})
-        finally:
-            conn.close()
+        self._seed_stocks()
+        result = self.engine.get_active_stocks('2024-07-01')
+        self.assertNotIn('000002.SZ', result,
+            "退市股票不应出现在可交易池")
+        self.assertEqual(set(result), {'000001.SZ', '600000.SH'})
 
     def test_returns_list_of_strings(self):
         """返回值必须是 List[str]（ts_code格式）"""
-        conn = duckdb.connect(self.db_path)
-        try:
-            self._seed_stocks(conn)
-            result = self.engine.get_active_stocks('2020-01-01')
-            self.assertIsInstance(result, list)
-            for item in result:
-                self.assertIsInstance(item, str)
-                self.assertIn('.', item)  # ts_code 格式
-        finally:
-            conn.close()
+        self._seed_stocks()
+        result = self.engine.get_active_stocks('2020-01-01')
+        self.assertIsInstance(result, list)
+        for item in result:
+            self.assertIsInstance(item, str)
+            self.assertIn('.', item)  # ts_code 格式
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -265,19 +250,15 @@ class TestIndexConstituentsOutDate(unittest.TestCase):
         from scripts.data_engine import DataEngine
         self.db_path = tempfile.mktemp(suffix='.duckdb')
         self.engine = DataEngine(db_path=self.db_path)
-        conn = duckdb.connect(self.db_path)
-        self.engine._init_schema()
-        conn.close()
 
     def tearDown(self):
         if os.path.exists(self.db_path):
             os.remove(self.db_path)
 
-    def _seed_constituents(self, conn, date, stocks):
-        """手动写入成分股快照"""
-        cur = conn.cursor()
+    def _seed_constituents(self, date, stocks):
+        """手动写入成分股快照（通过 engine.execute 避免多连接冲突）"""
         for s in stocks:
-            cur.execute("""
+            self.engine.execute("""
                 INSERT INTO index_constituents_history
                 (index_code, ts_code, in_date, out_date, source)
                 VALUES (?, ?, ?, NULL, 'test')
@@ -285,14 +266,9 @@ class TestIndexConstituentsOutDate(unittest.TestCase):
 
     def _get_all_ich(self):
         """读取全表"""
-        conn = duckdb.connect(self.db_path)
-        try:
-            df = conn.execute(
-                "SELECT * FROM index_constituents_history ORDER BY ts_code"
-            ).fetchdf()
-            return df
-        finally:
-            conn.close()
+        return self.engine.query(
+            "SELECT * FROM index_constituents_history ORDER BY ts_code"
+        )
 
     def test_no_delete_on_resync(self):
         """验证：重新同步时绝对不能 DELETE 全表"""
@@ -331,28 +307,22 @@ class TestIndexConstituentsOutDate(unittest.TestCase):
 
     def test_get_universe_pit_query(self):
         """验证：get_universe_at_date 支持 PIT 查询（in_date/out_date）"""
-        conn = duckdb.connect(self.db_path)
-        try:
-            cur = conn.cursor()
-            # 写入：000001 在 2023-01-01 加入，2024-06-01 退出
-            cur.execute("""
-                INSERT INTO index_constituents_history
-                (index_code, ts_code, in_date, out_date, source)
-                VALUES ('000300.SH', '000001.SZ', '2023-01-01', '2024-06-01', 'test')
-            """)
-            conn.commit()
+        # 写入：000001 在 2023-01-01 加入，2024-06-01 退出
+        self.engine.execute("""
+            INSERT INTO index_constituents_history
+            (index_code, ts_code, in_date, out_date, source)
+            VALUES ('000300.SH', '000001.SZ', '2023-01-01', '2024-06-01', 'test')
+        """)
 
-            # 查询 2023-06-01：000001 应在指数内
-            df_2023 = self.engine.get_universe_at_date('000300.SH', '2023-06-01')
-            self.assertIn('000001.SZ', df_2023,
-                "2023年000001在指数内时应被返回")
+        # 查询 2023-06-01：000001 应在指数内
+        df_2023 = self.engine.get_universe_at_date('000300.SH', '2023-06-01')
+        self.assertIn('000001.SZ', df_2023,
+            "2023年000001在指数内时应被返回")
 
-            # 查询 2024-07-01：000001 已退出，不应返回
-            df_2024 = self.engine.get_universe_at_date('000300.SH', '2024-07-01')
-            self.assertNotIn('000001.SZ', df_2024,
-                "退出后000001不应再被返回")
-        finally:
-            conn.close()
+        # 查询 2024-07-01：000001 已退出，不应返回
+        df_2024 = self.engine.get_universe_at_date('000300.SH', '2024-07-01')
+        self.assertNotIn('000001.SZ', df_2024,
+            "退出后000001不应再被返回")
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -366,9 +336,6 @@ class TestDailyBarDualLayer(unittest.TestCase):
         from scripts.data_engine import DataEngine
         self.db_path = tempfile.mktemp(suffix='.duckdb')
         self.engine = DataEngine(db_path=self.db_path)
-        conn = duckdb.connect(self.db_path)
-        self.engine._init_schema()
-        conn.close()
 
     def tearDown(self):
         if os.path.exists(self.db_path):
@@ -377,114 +344,93 @@ class TestDailyBarDualLayer(unittest.TestCase):
     def test_raw_and_adjusted_both_written(self):
         """验证：save_quotes 同时写入 raw 和 adjusted 两表"""
         import pandas as pd
-        conn = duckdb.connect(self.db_path)
-        try:
-            # 构造含 raw_*/adj_* 双字段的测试数据
-            raw_open, adj_open = 10.0, 12.0   # 复权因子 1.2
-            raw_close, adj_close = 11.0, 13.2
+        # 构造含 raw_*/adj_* 双字段的测试数据
+        raw_open, adj_open = 10.0, 12.0   # 复权因子 1.2
+        raw_close, adj_close = 11.0, 13.2
 
-            test_df = pd.DataFrame([{
-                'ts_code': '000001.SZ',
-                'trade_date': pd.Timestamp('2024-01-02'),
-                'raw_open': raw_open, 'raw_high': 11.5, 'raw_low': 9.8, 'raw_close': raw_close,
-                'open': adj_open, 'high': 13.8, 'low': 11.76, 'close': adj_close,
-                'pre_close': 9.9, 'volume': 1000000, 'amount': 11000000,
-                'pct_chg': 10.0, 'turnover': 1.5,
-                'adj_factor': 1.2,
-                'is_suspend': False, 'limit_up': False, 'limit_down': False,
-                'data_source': 'test',
-            }])
+        test_df = pd.DataFrame([{
+            'ts_code': '000001.SZ',
+            'trade_date': pd.Timestamp('2024-01-02'),
+            'raw_open': raw_open, 'raw_high': 11.5, 'raw_low': 9.8, 'raw_close': raw_close,
+            'open': adj_open, 'high': 13.8, 'low': 11.76, 'close': adj_close,
+            'pre_close': 9.9, 'volume': 1000000, 'amount': 11000000,
+            'pct_chg': 10.0, 'turnover': 1.5,
+            'adj_factor': 1.2,
+            'is_suspend': False, 'limit_up': False, 'limit_down': False,
+            'data_source': 'test',
+        }])
 
-            self.engine.save_quotes(test_df)
+        self.engine.save_quotes(test_df)
 
-            # 读取 raw 表：close 应为原始价
-            raw = conn.execute(
-                "SELECT * FROM daily_bar_raw WHERE ts_code='000001.SZ'"
-            ).fetchdf()
-            self.assertEqual(len(raw), 1, "raw 表应有1条记录")
-            self.assertAlmostEqual(raw.iloc[0]['close'], raw_close, places=4,
-                msg="raw 表 close 应为原始价")
+        # 读取 raw 表：close 应为原始价
+        raw = self.engine.query("SELECT * FROM daily_bar_raw WHERE ts_code='000001.SZ'")
+        self.assertEqual(len(raw), 1, "raw 表应有1条记录")
+        self.assertAlmostEqual(raw.iloc[0]['close'], raw_close, places=4,
+            msg="raw 表 close 应为原始价")
 
-            # 读取 adjusted 表：close 应为复权价
-            adj = conn.execute(
-                "SELECT * FROM daily_bar_adjusted WHERE ts_code='000001.SZ'"
-            ).fetchdf()
-            self.assertEqual(len(adj), 1, "adjusted 表应有1条记录")
-            self.assertAlmostEqual(adj.iloc[0]['close'], adj_close, places=4,
-                msg="adjusted 表 close 应为复权价")
+        # 读取 adjusted 表：close 应为复权价
+        adj = self.engine.query("SELECT * FROM daily_bar_adjusted WHERE ts_code='000001.SZ'")
+        self.assertEqual(len(adj), 1, "adjusted 表应有1条记录")
+        self.assertAlmostEqual(adj.iloc[0]['close'], adj_close, places=4,
+            msg="adjusted 表 close 应为复权价")
 
-            # raw close ≠ adjusted close（验证分离）
-            self.assertNotAlmostEqual(
-                raw.iloc[0]['close'], adj.iloc[0]['close'], places=3,
-                msg="raw 和 adjusted 的 close 应不同（否则没有真正分离）"
-            )
-
-        finally:
-            conn.close()
+        # raw close ≠ adjusted close（验证分离）
+        self.assertNotAlmostEqual(
+            raw.iloc[0]['close'], adj.iloc[0]['close'], places=3,
+            msg="raw 和 adjusted 的 close 应不同（否则没有真正分离）"
+        )
 
     def test_adj_factor_preserved(self):
-        """验证：adj_factor 保留在两表中"""
+        """验证：adj_factor 保留在 adjusted 表中；raw 表 adj_factor = 1.0（原始价）"""
         import pandas as pd
-        conn = duckdb.connect(self.db_path)
-        try:
-            test_df = pd.DataFrame([{
-                'ts_code': '000001.SZ',
-                'trade_date': pd.Timestamp('2024-01-03'),
-                'raw_open': 10.0, 'raw_high': 11.0, 'raw_low': 9.5, 'raw_close': 10.5,
-                'open': 12.0, 'high': 13.2, 'low': 11.4, 'close': 12.6,
-                'pre_close': 9.9, 'volume': 1000000, 'amount': 12000000,
-                'pct_chg': 9.5, 'turnover': 1.4,
-                'adj_factor': 1.2,
-                'is_suspend': False, 'limit_up': False, 'limit_down': False,
-                'data_source': 'test',
-            }])
+        test_df = pd.DataFrame([{
+            'ts_code': '000001.SZ',
+            'trade_date': pd.Timestamp('2024-01-03'),
+            'raw_open': 10.0, 'raw_high': 11.0, 'raw_low': 9.5, 'raw_close': 10.5,
+            'open': 12.0, 'high': 13.2, 'low': 11.4, 'close': 12.6,
+            'pre_close': 9.9, 'volume': 1000000, 'amount': 12000000,
+            'pct_chg': 9.5, 'turnover': 1.4,
+            'adj_factor': 1.2,
+            'is_suspend': False, 'limit_up': False, 'limit_down': False,
+            'data_source': 'test',
+        }])
 
-            self.engine.save_quotes(test_df)
+        self.engine.save_quotes(test_df)
 
-            raw = conn.execute(
-                "SELECT adj_factor FROM daily_bar_raw WHERE ts_code='000001.SZ'"
-            ).fetchdf()
-            adj = conn.execute(
-                "SELECT adj_factor FROM daily_bar_adjusted WHERE ts_code='000001.SZ'"
-            ).fetchdf()
+        raw = self.engine.query("SELECT adj_factor FROM daily_bar_raw WHERE ts_code='000001.SZ'")
+        adj = self.engine.query("SELECT adj_factor FROM daily_bar_adjusted WHERE ts_code='000001.SZ'")
 
-            self.assertEqual(raw.iloc[0]['adj_factor'], 1.2)
-            self.assertEqual(adj.iloc[0]['adj_factor'], 1.2)
-        finally:
-            conn.close()
+        # raw 表存原始价，adj_factor = 1.0（raw层不做复权）
+        self.assertAlmostEqual(raw.iloc[0]['adj_factor'], 1.0, places=4,
+            msg="raw 表 adj_factor 应为 1.0（不复权）")
+        # adjusted 表保留真实复权因子
+        self.assertAlmostEqual(adj.iloc[0]['adj_factor'], 1.2, places=4,
+            msg="adjusted 表 adj_factor 应为 1.2")
 
     def test_upsert_idempotent(self):
         """验证：重复写入同一数据（UPSERT）不产生重复行"""
         import pandas as pd
-        conn = duckdb.connect(self.db_path)
-        try:
-            test_df = pd.DataFrame([{
-                'ts_code': '000001.SZ',
-                'trade_date': pd.Timestamp('2024-01-04'),
-                'raw_open': 10.0, 'raw_high': 11.0, 'raw_low': 9.5, 'raw_close': 10.5,
-                'open': 12.0, 'high': 13.2, 'low': 11.4, 'close': 12.6,
-                'pre_close': 9.9, 'volume': 1000000, 'amount': 12000000,
-                'pct_chg': 9.5, 'turnover': 1.4,
-                'adj_factor': 1.2,
-                'is_suspend': False, 'limit_up': False, 'limit_down': False,
-                'data_source': 'test',
-            }])
+        test_df = pd.DataFrame([{
+            'ts_code': '000001.SZ',
+            'trade_date': pd.Timestamp('2024-01-04'),
+            'raw_open': 10.0, 'raw_high': 11.0, 'raw_low': 9.5, 'raw_close': 10.5,
+            'open': 12.0, 'high': 13.2, 'low': 11.4, 'close': 12.6,
+            'pre_close': 9.9, 'volume': 1000000, 'amount': 12000000,
+            'pct_chg': 9.5, 'turnover': 1.4,
+            'adj_factor': 1.2,
+            'is_suspend': False, 'limit_up': False, 'limit_down': False,
+            'data_source': 'test',
+        }])
 
-            # 写入两次
-            self.engine.save_quotes(test_df)
-            self.engine.save_quotes(test_df)
+        # 写入两次
+        self.engine.save_quotes(test_df)
+        self.engine.save_quotes(test_df)
 
-            raw = conn.execute(
-                "SELECT COUNT(*) as cnt FROM daily_bar_raw WHERE ts_code='000001.SZ'"
-            ).fetchdf()
-            adj = conn.execute(
-                "SELECT COUNT(*) as cnt FROM daily_bar_adjusted WHERE ts_code='000001.SZ'"
-            ).fetchdf()
+        raw = self.engine.query("SELECT COUNT(*) as cnt FROM daily_bar_raw WHERE ts_code='000001.SZ'")
+        adj = self.engine.query("SELECT COUNT(*) as cnt FROM daily_bar_adjusted WHERE ts_code='000001.SZ'")
 
-            self.assertEqual(raw.iloc[0]['cnt'], 1, "raw 表不应有重复行")
-            self.assertEqual(adj.iloc[0]['cnt'], 1, "adjusted 表不应有重复行")
-        finally:
-            conn.close()
+        self.assertEqual(raw.iloc[0]['cnt'], 1, "raw 表不应有重复行")
+        self.assertEqual(adj.iloc[0]['cnt'], 1, "adjusted 表不应有重复行")
 
 
 if __name__ == '__main__':

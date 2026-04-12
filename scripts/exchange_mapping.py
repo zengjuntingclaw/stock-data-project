@@ -41,32 +41,36 @@ def _strip_leading_zeros(s: str) -> str:
 def _is_bj_code(symbol: str) -> bool:
     """
     判断是否为北交所代码
-    
-    ⚠️ 核心修复（V7-final）：传入原始 symbol，保留前导零信息
+
+    ⚠️ 核心修复（V8）：区分"完整6位代码"与"短代码"两种输入情形。
+
     规则：
-    - 去掉前导零后取前4个字符
-    - ≥4位：用前4位精确判断（920xxx / 4xxxx / 8xxxx）
-    - <4位：用首位非零字符判断（4/8 → BJ，其余 → SZ）
+    1. 若输入已是 6 位（含前导零的完整代码），直接用正则精确匹配：
+       - 4xxxxx / 8xxxxx / 920xxx → BJ
+       - 其他（如 000008）→ 非 BJ
+    2. 若输入不足 6 位（短代码），strip 前导零后用首位判断：
+       - 首位 4 / 8 → BJ（短代码 '4'/'8' 视为北交所系列）
+       - 其他 → 非 BJ
+    这样 '000008'（深市 A 股，6 位）和 '8'（北交所短代码）得到正确区分。
     """
-    # 取前4个非零字符（避免zfill填充后判断错误）
-    stripped = str(symbol).lstrip('0')[:4]
-    
+    s = str(symbol)
+
+    # —— 路径 1：完整 6 位代码（含前导零），直接精确匹配 ——
+    if len(s) == 6:
+        return bool(RE_BJ_OLD.match(s) or RE_BJ_NEW.match(s) or RE_BJ_2024.match(s))
+
+    # —— 路径 2：非 6 位（短代码或超长串），strip 前导零后判断 ——
+    stripped = s.lstrip('0')[:4]
+
     if len(stripped) < 4:
-        # 不足4位：用首位非零字符判断
-        # 4/8 → 北交所（短输入的4/8几乎肯定是北交所代码）
-        # 9 → 沪市（920xxx段需要至少4位，不可能在9xxx段）
-        # 其他 → 深市
-        return stripped in ('4', '8')
-    
-    # ≥4位：精确判断
-    # 920xxx-929xxx（前4位 920x 或 921x...929x）
+        # 不足 4 位：用首位非零字符判断
+        # 4/8 首位 → 北交所；9 首位 → 沪市；其他 → 深市
+        return stripped[:1] in ('4', '8')
+
+    # ≥ 4 位（如 "4300", "8300", "9200"）
     if stripped[:2] == '92':
         return True
-    # 4xxxxx（首位4）
-    if stripped[0] == '4':
-        return True
-    # 8xxxxx（首位8）
-    if stripped[0] == '8':
+    if stripped[0] in ('4', '8'):
         return True
     return False
 

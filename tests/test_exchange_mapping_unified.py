@@ -86,7 +86,7 @@ class TestBuildTsCodeUnified(unittest.TestCase):
             ('430001', 'BJ', '430001.BJ'),
             ('830001', 'BJ', '830001.BJ'),
             ('920001', 'BJ', '920001.BJ'),  # 关键测试
-            ('000008', 'BJ', '000008.BJ'),  # 8开头短码
+            ('000008', 'SZ', '000008.SZ'),  # 首位0末位8 → 深市主板（非北交所）
         ]
         for symbol, exp_exchange, expected_ts_code in cases:
             exchange, _ = classify_exchange(symbol)
