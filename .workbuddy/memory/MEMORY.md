@@ -48,6 +48,29 @@ All date parameters use `YYYY-MM-DD` format (e.g., `'2024-01-01'`)
 - `corporate_actions`: 0 records (needs population)
 - `index_constituents_history`: Data from 2020-01-01 only
 
+## Architecture Consolidation (2026-04-12)
+
+### Commit: 1ca4c32
+```
+fix: 修复合并bug + 补全兼容层 + 重写测试
+```
+
+### P0 Bug Fixes
+- `production_data_system.py`: `_get_now()` 递归 → `datetime.now()`
+- `data_qa_pipeline.py`: 补全 `from typing import Any`
+- `pipeline_data_engine.py`: `sync_stock` date vs str 比较修复
+
+### Compatible Layer Completions
+- `request_throttler.py`: 补全 `RequestThrottler` facade（含 acquire/register_source/get_source_status）
+- `enhanced_data_engine.py`: 补全 `DownloadRecord.to_dict()`
+- `pipeline_data_engine.py`: `__all__` 补全 `RateLimitConfig`
+
+### Test Results: 356/356 ✅
+
+### Main Entrypoint
+唯一入口：`from scripts.pipeline_data_engine import PipelineDataEngine`
+向后兼容别名：`EnhancedDataEngine = ProductionDataEngine = PipelineDataEngine`
+
 ## Technical Notes
 - PowerShell output may be wrapped in CLIXML format - read files directly for clean output
 - Unit tests: 33 tests, all passing
