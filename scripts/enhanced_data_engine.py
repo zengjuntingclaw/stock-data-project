@@ -33,6 +33,17 @@ class DownloadRecord:
         self.error = error
         self.timestamp = datetime.now()
 
+    def to_dict(self) -> Dict:
+        return {
+            "ts_code": self.ts_code,
+            "start": self.start,
+            "end": self.end,
+            "record_count": self.record_count,
+            "success": self.success,
+            "error": self.error,
+            "timestamp": self.timestamp.isoformat() if self.timestamp else None,
+        }
+
 class EnhancedDownloader:
     """向后兼容的增强下载器"""
     def __init__(self, engine=None):

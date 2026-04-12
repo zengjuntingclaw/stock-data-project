@@ -1238,7 +1238,7 @@ class PipelineDataEngine:
 
         # 检查断点
         checkpoint = self.storage.get_checkpoint(ts_code, table)
-        if checkpoint and checkpoint >= end:
+        if checkpoint and str(checkpoint) >= str(end):
             return {"success": True, "message": "already_synced", "ts_code": ts_code}
 
         # 获取数据
@@ -1413,6 +1413,7 @@ __all__ = [
     "EnhancedDataEngine",
     "ProductionDataEngine",
     "RuntimeController",
+    "RateLimitConfig",
     "DataRouter",
     "QualityEngine",
     "StorageManager",

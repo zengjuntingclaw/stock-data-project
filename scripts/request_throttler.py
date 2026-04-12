@@ -18,4 +18,23 @@ warnings.warn(
 from scripts.pipeline_data_engine import RuntimeController, RateLimitConfig
 from scripts.pipeline_data_engine import _TokenBucket as TokenBucketThrottler
 
-__all__ = ["RuntimeController", "RateLimitConfig", "TokenBucketThrottler"]
+
+class RequestThrottler:
+    """
+    [向后兼容] 统一限速器门面，内部委托 RuntimeController。
+    新代码请直接使用 RuntimeController。
+    """
+    def __init__(self):
+        self._runtime = RuntimeController()
+
+    def register_source(self, source: str, config: RateLimitConfig):
+        self._runtime.register_source(source, config)
+
+    def acquire(self, source: str = "akshare"):
+        return self._runtime.acquire(source)
+
+    def get_source_status(self, source: str):
+        return self._runtime.get_source_status(source)
+
+
+__all__ = ["RuntimeController", "RateLimitConfig", "TokenBucketThrottler", "RequestThrottler"]
