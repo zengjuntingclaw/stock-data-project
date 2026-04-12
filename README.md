@@ -2,7 +2,7 @@
 
 # A股多因子回测框架
 
-**准实盘级量化回测系统 v3.3 (Schema v2.3)**
+**准实盘级量化回测系统 v4.0 (Schema v4.0)**
 
 [![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://www.python.org/)
 [![DuckDB](https://img.shields.io/badge/DuckDB-0.9+-orange.svg)](https://duckdb.org/)

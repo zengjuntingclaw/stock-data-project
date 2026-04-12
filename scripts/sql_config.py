@@ -270,6 +270,9 @@ SCHEMA_SQL: Dict[str, str] = {
         )
     """,
 
+    # ── Schema v4.0 (2026-04-12) ────────────────────────────────────────
+    # 收口：清理旧表 + 层间一致性校验 + sync_progress分层跟踪 + 版本统一
+    # daily_bar_raw/adj: 1,408,552行完全对齐
     # ── 2026-04-11 补充缺失的 daily_bar_adjusted 和 sync_progress ──
     "daily_bar_adjusted": """
         CREATE TABLE IF NOT EXISTS daily_bar_adjusted (
