@@ -66,9 +66,13 @@ stock_data_project/
 ├── requirements.txt               # Python 依赖
 │
 ├── scripts/                       # 核心模块
-│   ├── __init__.py                # 模块导出 (v3.0)
-│   ├── data_engine.py             # 数据引擎 — 多线程下载、DuckDB 存储、数据验证
+│   ├── __init__.py                # 模块导出 (v3.3)
+│   ├── pipeline_data_engine.py    # ⭐ 唯一主入口 v6 - 统一数据管道
+│   ├── data_engine.py             # 数据引擎 — DuckDB 操作层（被 pipeline_data_engine 使用）
 │   ├── data_validator.py          # 数据验证器 — 多源交叉验证
+│   ├── data_fetcher.py            # 多数据源获取层（TuShare/AkShare/Baostock）
+│   ├── data_store.py              # 数据存储 — DuckDB 连接池管理
+│   ├── checkpoint_manager.py       # 回测状态管理 — 断点续跑序列化
 │   ├── data_classes.py            # 数据类 — Order, Trade, Position, PerformanceMetrics
 │   ├── execution_engine_v3.py     # 执行引擎 — T+1 交易模拟、涨跌停、ADV 限制
 │   ├── backtest_engine_v3.py      # 回测引擎 — 分层回测、检查点恢复
@@ -78,6 +82,12 @@ stock_data_project/
 │   ├── performance.py             # 绩效分析 — 夏普、IR、Brinson 归因
 │   ├── sentinel_audit.py          # 代码审查工具
 │   └── stock_history_schema.sql   # 数据库 Schema
+
+⚠️ 废弃模块（仅向后兼容，v4.0 将移除）：enhanced_data_engine.py,
+   request_throttler.py, backtest_validator.py, multi_source_manager.py,
+   backoff_controller.py, advanced_checkpoint.py, auto_repair.py,
+   parquet_optimizer.py, production_data_system.py
+   → 全部重定向到 pipeline_data_engine
 │
 ├── tests/                         # 测试
 │   ├── conftest.py                # pytest 配置
@@ -114,35 +124,20 @@ stock_data_project/
 │                 main_v2_production.py                        │
 ├─────────────────────────────────────────────────────────────┤
 │                                                             │
-│  ┌──────────────┐  ┌──────────────────┐  ┌────────────────┐ │
-│  │  DataEngine   │  │ ExecutionEngineV3│  │ BacktestEngine │ │
-│  │              │  │    v3            │  │     V3         │ │
-│  │ +多线程下载   │  │                  │  │                │ │
-│  │ +DuckDB存储  │  │ +T+1开盘价成交   │  │ +分层回测      │ │
-│  │ +数据验证    │  │ +涨跌停顺延      │  │ +检查点恢复    │ │
-│  │ +幸存者偏差  │  │ +ADV流动性限制   │  │ +未来函数治理  │ │
-│  │ +增量更新    │  │ +100股取整       │  │ +分段分析      │ │
-│  └──────┬───────┘  │ +印花税时间感知  │  └───────┬────────┘ │
-│         │          └────────┬─────────┘          │          │
-│         │                   │                    │          │
-│  ┌──────┴──────┐   ┌───────┴────────┐  ┌───────┴────────┐ │
-│  │DataValidator │   │TradingRules    │  │  Performance   │ │
-│  │             │   │                │  │  Analyzer      │ │
-│  │ +多源交叉    │   │ +涨跌停板      │  │                │ │
-│  │   验证      │   │ +板块识别      │  │ +夏普/IR/Alpha  │ │
-│  └─────────────┘   │ +交易日历      │  │ +Brinson归因   │ │
-│                    └────────────────┘  └────────────────┘ │
-│                                                             │
-│  ┌──────────────┐  ┌──────────────────┐                    │
-│  │PITDataAligner│  │ SurvivorshipBias │                    │
-│  │             │  │    Handler       │                    │
-│  │ +时点数据    │  │                  │                    │
-│  │   对齐      │  │ +退市股票处理    │                    │
-│  └─────────────┘  │ +ST状态过滤     │                    │
-│                    └────────────────┘                    │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │        ⭐ PipelineDataEngine (唯一主入口 v6)           │  │
+│  │                                                      │  │
+│  │  engine(统一API) │ router(多源熔断) │ ingest(增量同步) │  │
+│  │  quality(校验修复) │ storage(DuckDB+Parquet)         │  │
+│  │  runtime(限速│并发│缓存) │ backtest(回测验证)        │  │
+│  └──────────────────────────────────────────────────────┘  │
+│         │                    │                    │          │
+│  ┌──────┴──────┐   ┌────────┴────────┐  ┌───────┴───────┐ │
+│  │ExecutionEng │   │ BacktestEngine  │  │  Performance  │ │
+│  │   ineV3     │   │     V3          │  │   Analyzer    │ │
+│  │ +T+1/涨跌停  │   │ +分层回测       │  │ +夏普/IR/Brinson│ │
+│  └─────────────┘   └────────────────┘  └───────────────┘ │
 └─────────────────────────────────────────────────────────────┘
-                           │
-                    DuckDB + Parquet
 ```
 
 ---
@@ -197,12 +192,11 @@ python run_tests.py test_production
 统一数据管理入口，负责数据获取、存储和验证。
 
 ```python
-from scripts.data_engine import DataEngine
+from scripts.pipeline_data_engine import PipelineDataEngine
 
-engine = DataEngine()
+engine = PipelineDataEngine()
 
-# 增量更新全市场数据（多线程，自动重试）
-engine.incremental_update(max_workers=12)
+# 统一入口：7层架构（engine/router/ingest/quality/storage/runtime/backtest）
 
 # 获取原始行情（未复权）
 df_raw = engine.get_daily_raw("600519.SH", "2024-01-01", "2024-06-30")
@@ -630,6 +624,12 @@ python -m unittest discover -s tests -p test_refactor_v2.py
 ---
 
 ## 版本历史
+
+### v3.4 (2026-04-12 晚)
+- **单入口收口**：`scripts/pipeline_data_engine.py` 确立为唯一主入口
+- **兼容性 stub 全面改造**：9 个旧模块（enhanced_data_engine / request_throttler / backtest_validator / multi_source_manager / backoff_controller / advanced_checkpoint / auto_repair / parquet_optimizer / production_data_system）全部改为 deprecation stub，重定向到 pipeline_data_engine
+- **P0 Bug 全部修复**：`production_data_system._get_now()` 递归 bug、`data_qa_pipeline.Any` 导入缺失、`pipeline_data_engine.sync_stock` date vs str 比较错误
+- **scheduler 收口**：`scheduler.py` 和 `production_scheduler.py` 全部指向 PipelineDataEngine
 
 ### v3.3 (2026-04-12)
 - **Schema v2.3**：新增 4 项层间一致性校验（raw/adjusted 行数、PK 完整性、qfq_close 关系、adj_factor 合法性），校验项从 10 项扩充至 14 项
