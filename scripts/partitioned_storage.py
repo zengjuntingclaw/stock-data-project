@@ -20,7 +20,7 @@ from loguru import logger
 
 def _get_now():
     """获取当前时间（支持单测 mock）。"""
-    return _get_now()
+    return datetime.now()
 
 
 class DataTier(Enum):
