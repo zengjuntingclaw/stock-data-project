@@ -240,7 +240,6 @@ class TestDataLayerComplete(unittest.TestCase):
         required = [
             'daily_bar_raw',
             'daily_bar_adjusted',
-            'stock_basic',
             'stock_basic_history',
             'index_constituents_history',
             'st_status_history',

@@ -329,9 +329,9 @@ class TestDataEngineInit(unittest.TestCase):
         engine = DataEngine(db_path=str(Path(self.tmpdir) / "schema.db"))
         tables = engine.query("SHOW TABLES")
         table_names = tables.iloc[:, 0].tolist()
-        for expected in ["daily_bar_adjusted", "stock_basic", "trade_calendar",
+        for expected in ["daily_bar_adjusted", "stock_basic_history", "trade_calendar",
                          "financial_data", "daily_valuation",
-                         "index_constituents", "st_status_history"]:
+                         "index_constituents_history", "st_status_history"]:
             self.assertIn(expected, table_names)
 
 
@@ -359,21 +359,21 @@ class TestDataEngineQuery(unittest.TestCase):
     def test_execute_insert_and_query(self):
         """execute 写入 + query 读取"""
         self.engine.execute(
-            "INSERT INTO stock_basic (ts_code, symbol, name) VALUES (?, ?, ?)",
-            ("000001.SZ", "000001", "平安银行")
+            "INSERT INTO stock_basic_history (ts_code, symbol, name, exchange, eff_date) VALUES (?, ?, ?, ?, ?)",
+            ("000001.SZ", "000001", "平安银行", "SZ", "2024-01-01")
         )
-        df = self.engine.query("SELECT * FROM stock_basic WHERE ts_code = '000001.SZ'")
+        df = self.engine.query("SELECT * FROM stock_basic_history WHERE ts_code = '000001.SZ'")
         self.assertEqual(len(df), 1)
         self.assertEqual(df.iloc[0]["name"], "平安银行")
 
     def test_query_with_params(self):
         """参数化查询（防SQL注入）"""
         self.engine.execute(
-            "INSERT INTO stock_basic (ts_code, symbol, name) VALUES (?, ?, ?)",
-            ("600000.SH", "600000", "浦发银行")
+            "INSERT INTO stock_basic_history (ts_code, symbol, name, exchange, eff_date) VALUES (?, ?, ?, ?, ?)",
+            ("600000.SH", "600000", "浦发银行", "SH", "2024-01-01")
         )
         df = self.engine.query(
-            "SELECT * FROM stock_basic WHERE symbol = ?", ("600000",)
+            "SELECT * FROM stock_basic_history WHERE symbol = ?", ("600000",)
         )
         self.assertEqual(len(df), 1)
 
