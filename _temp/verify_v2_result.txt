@@ -1,0 +1,36 @@
+=======================================================
+Schema v2.2 Runtime Verification
+=======================================================
+
+[Test 1] DEFAULT_START_DATE env var
+[PASS] STOCK_START_DATE=2020-01-01 | got=2020-01-01
+
+[Test 2] DROP old stock_basic
+[PASS] stock_basic removed | tables=['_test_t', 'adj_factor_log', 'corporate_actions', 'daily_bar_adjusted', 'daily_bar_raw', 'daily_quotes', 'daily_quotes_backup_20260410', 'daily_valuation', 'data_quality_alert', 'financial_data', 'index_constituents', 'index_constituents_history', 'st_status_history', 'stock_basic_history', 'sync_progress', 'trade_calendar', 'update_log']
+
+[Test 3] daily_bar_adjusted qfq/hfq 8 fields
+[PASS] 8 qfq/hfq fields exist | missing=[]
+
+[Test 4] get_active_stocks PIT query
+[FAIL] PIT query exception | Connection Error: Can't open a connection to same database file with a different configuration than existing connections
+
+[Test 5] get_index_constituents historical
+[FAIL] Constituents exception | Connection Error: Can't open a connection to same database file with a different configuration than existing connections
+
+[Test 6] raw vs adjusted price separation
+[FAIL] raw data | Connection Error: Can't open a connection to same database file with a different
+[FAIL] adj data | Connection Error: Can't open a connection to same database file with a different
+[FAIL] qfq_close | Connection Error: Can't open a connection to same database file with a different
+[FAIL] adj_factor | Connection Error: Can't open a connection to same database file with a different
+[FAIL] column diff | Connection Error: Can't open a connection to same database file with a different
+
+[Test 7] SurvivorshipBiasHandler pipeline
+[FAIL] SBH exception | argument should be a str or an os.PathLike object where __fspath__ returns a str
+
+[Test 8] sync_progress resumable UPSERT
+[PASS] sync_progress has key fields | fields=['ts_code', 'table_name', 'last_sync_date', 'last_sync_at', 'total_records', 'status', 'error_msg']
+
+[Test 9] data quality checks
+[PASS] >=2 quality check methods | methods=['_check_adj_factor_change', 'quality_report', 'run_data_quality_check']
+
+[Test 10] get_all_stocks no silent fallback

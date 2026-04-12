@@ -1,0 +1,3 @@
+Delisted stocks to query: 327
+  Progress: 50/327
+  Progress: 100/327

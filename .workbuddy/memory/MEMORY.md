@@ -26,8 +26,20 @@ feat: 数据口径标准化重构 - PIT支持、原始/复权价格分离
 ### Key Methods
 - `get_active_stocks(trade_date: str)` - PIT stock universe query
 - `get_index_constituents(index_code: str, trade_date: str)` - Historical index constituents
-- `get_daily_raw(ts_code, start, end)` - Original prices
-- `get_daily_adjusted(ts_code, start, end)` - Adjusted prices
+- `get_daily_raw(ts_code, start, end)` - Original prices (18 fields)
+- `get_daily_adjusted(ts_code, start, end)` - Adjusted prices (25 fields)
+
+### Schema v2.2 (2026-04-11 evening verification)
+Schema v2.2 已完全在 master 分支，所有 9 项核心修复已确认：
+- `DEFAULT_START_DATE = os.environ.get("STOCK_START_DATE", "2018-01-01")` ✅
+- `DROP TABLE IF EXISTS stock_basic` in `__init_schema__` ✅
+- `daily_bar_adjusted` 含 8 个 qfq/hfq 字段 ✅
+- `get_all_stocks()` 强制 RuntimeError，无静默回退 ✅
+- 10 项数据质量检查方法 ✅
+- `sync_progress` 支持 UPSERT 断点续传 ✅
+- SurvivorshipBiasHandler pipeline 连接正确 ✅
+
+**15/15 运行时验证全部通过** (commit 780d501)
 
 ### Date Format
 All date parameters use `YYYY-MM-DD` format (e.g., `'2024-01-01'`)

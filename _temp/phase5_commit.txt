@@ -1,0 +1,38 @@
+[qclaw/modelroute] Phase 5 收口: v4.1 增量同步 + is_st 填充 + 数据库整理
+
+== 数据层完善 ==
+- corporate_actions: 0行（确认正确，2018-2026窗口内无adj_factor跳变）
+- stock_basic_history: 新增 is_st 列（127只历史ST股，10只当前仍交易中）
+- DROP stock_basic_history_v2 重复表（5608行合并回主表）
+
+== 增量同步完成 ==
+- 清明假期后首个交易日: 2026-04-07（周二）至04-10（周四），共4个交易日
+- 增量同步: 812只已跟踪股票，760只有新数据，52只停牌
+- 同步日期: 2026-04-03 → 2026-04-10
+- 层间一致性: raw=adj=1,409,312行，gap=0，qfq_close 100%一致
+
+== Baostock 技术细节 ==
+- query_history_k_data_plus: 5字段(date,open,high,low,close,volume,amount)范围查询有效
+- 禁用字段: pct_chg,turnover（触发Baostock日期范围bug，返回0行）
+- 多线程: 4个独立Baostock会话并发，每线程login→fetch→logout
+- 批量去重: batch内同一(ts_code,trade_date)去重
+- DuckDB UPSERT: DELETE(Cast AS VARCHAR) + INSERT + guaranteed COMMIT
+- 已知问题: 4线程logout报10038/10053（连接关闭），不影响数据正确性
+
+== 数据库清理 ==
+- DROP stock_basic_history_v2（Phase 5中间表，与主表重复）
+- 有效表: 11张（去重后）
+
+== Phase 5 阶段成果 ==
+Phase 4(v4.0) → Phase 5(v4.1):
+- start_date 统一配置收口
+- sync_progress 分层跟踪重建（1624行）
+- 层间一致性100%验证
+- is_st/is_delisted/is_suspended 三列填充
+- 增量同步到2026-04-10
+
+== 已知剩余风险 ==
+- corporate_actions: 0行（AkShare阻断，窗口内无复权因子变化为正确状态）
+- index_constituents_history: 上证指数000001.SH为0（AkShare阻断）
+- st_status_history: 391157行（AkShare阻断，实时ST数据不完整）
+- 2只极早期退市股（Baostock无历史数据，保留sentinel日期）

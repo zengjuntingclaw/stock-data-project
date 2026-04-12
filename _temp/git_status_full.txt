@@ -1,0 +1,33 @@
+On branch master
+Your branch is up to date with 'origin/master'.
+
+Changes to be committed:
+  (use "git restore --staged <file>..." to unstage)
+	new file:   _temp/all_git.txt
+	new file:   _temp/bat_result.txt
+	new file:   _temp/d1.txt
+	new file:   _temp/git_all.py
+	new file:   _temp/git_all2.py
+	new file:   _temp/git_hooks.py
+	new file:   _temp/git_quick.py
+	new file:   _temp/git_shell.py
+	new file:   _temp/git_shell_script.bat
+	new file:   _temp/git_stderr.py
+	new file:   _temp/gitdiag.py
+	new file:   _temp/gitdiag2.py
+	new file:   _temp/q1.txt
+	new file:   _temp/q2.txt
+	new file:   _temp/q3.txt
+	new file:   _temp/run_bat.py
+	new file:   _temp/s1.txt
+	new file:   _temp/stderr.txt
+	new file:   _temp/v4_1.txt
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	_temp/diag2_1.txt
+	_temp/diag2_2.txt
+	_temp/git_diag2_out.txt
+	_temp/git_diagnose2.py
+	_temp/git_diagnose_scripts.py
+

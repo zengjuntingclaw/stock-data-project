@@ -1,0 +1,30 @@
+refactor: v3.3 Schema收口 - 统一配置/分层progress/层间校验/文档对齐
+
+Task 1 - 统一配置入口:
+- 新增 data/config.toml 配置文件（Python configparser，无新依赖）
+- 新增 _load_config() / _resolve_start_date() 辅助函数
+- 优先级: 构造函数 > STOCK_START_DATE环境变量 > config.toml > 硬编码
+- __init__ 日志明确输出最终生效值
+
+Task 2 - sync_progress 分层跟踪:
+- save_quotes() 同步写入 daily_bar_raw 和 daily_bar_adjusted 各自独立进度
+- 排障时可精确判断是 raw 层还是 adjusted 层出问题
+
+Task 3 - 层间一致性校验（10项->14项）:
+- raw_adj_row_count_mismatch: raw/adjusted 行数不一致
+- raw_adj_pk_missing: 同一 (ts_code, trade_date) 在某层缺失
+- qfq_close_mismatch: qfq_close != raw_close x adj_factor（容差0.1%）
+- adj_factor_invalid: adj_factor 缺失/<=0/>100
+
+Task 4 - 文档版本对齐:
+- README: v3.2->v3.3，Schema v2.3
+- 清理旧口径表引用（security_master/daily_bar_derived/index_components_history）
+- 修正 API 示例方法名（get_stock_list->get_active_stocks等）
+- 九层表与实际 Schema v2.3 完全对齐
+
+Task 5 - 指数历史标准化:
+- 新增 _normalize_index_code() 静态方法
+- sync_index_constituents / get_index_constituents / get_universe_at_date 统一使用
+- 支持 .XSHG/.XSHE/.SH/.SZ/纯数字 全格式标准化
+
+Schema v2.3: stock_history_schema.sql 版本头同步更新

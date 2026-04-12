@@ -1,0 +1,5 @@
+[data]
+# 数据仓库起始日期
+# 优先级: DataEngine(start_date=...) > STOCK_START_DATE env > 本配置 > 硬编码 "2018-01-01"
+# 示例: start_date = 2020-01-01
+# start_date = 2018-01-01
