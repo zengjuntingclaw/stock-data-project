@@ -60,3 +60,13 @@ desktop.ini
 *.ckpt
 *.checkpoint
 .cache/
+
+# Temp files (never commit)
+_temp/
+_temp_*.py
+
+# Script backup/version files (editor artifacts)
+scripts/*.py.new
+scripts/*.py.v[0-9]*
+scripts/*.py.bak
+scripts/*.py.orig
