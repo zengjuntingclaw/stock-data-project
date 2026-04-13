@@ -191,6 +191,9 @@ class BacktestState:
     
     # 成交历史
     trade_history: List[TradeState]
+
+    # 订单计数器（用于恢复 order_id 不冲突）
+    order_counter: int = 0
     
     # 每日记录
     daily_records: List[Dict]
@@ -219,6 +222,7 @@ class BacktestState:
             'pending_orders': [o.to_dict() for o in self.pending_orders],
             'trade_history': [t.to_dict() for t in self.trade_history],
             'daily_records': self.daily_records,
+            'order_counter': self.order_counter,
         }
     
     @classmethod
@@ -233,6 +237,7 @@ class BacktestState:
             pending_orders=[OrderState.from_dict(o) for o in data.get('pending_orders', [])],
             trade_history=[TradeState.from_dict(t) for t in data.get('trade_history', [])],
             daily_records=data.get('daily_records', []),
+            order_counter=data.get('order_counter', 0),
         )
 
 
@@ -418,9 +423,10 @@ def extract_state_from_engine(engine, current_date: datetime) -> BacktestState:
         current_date=current_date.isoformat(),
         cash=cash,
         positions=positions,
-        pending_orders=[],  # 由调用方填充
-        trade_history=[],   # 由调用方填充
+        pending_orders=[],  # 由调用方填充（见 backtest_engine_v3._save_checkpoint）
+        trade_history=[],   # 由调用方填充（见 backtest_engine_v3._save_checkpoint）
         daily_records=[],
+        order_counter=engine.order_counter,  # 恢复订单计数器，防止 order_id 冲突
     )
 
 
@@ -462,6 +468,9 @@ def restore_engine_from_state(engine, state: BacktestState) -> None:
             available_shares=pos_state.available_shares,
             avg_cost=pos_state.avg_cost,
         )
+
+    # 恢复订单计数器（防止恢复后 order_id 与历史成交冲突）
+    engine.order_counter = state.order_counter
 
 
 # ============================================================================
@@ -505,8 +514,9 @@ if __name__ == "__main__":
                 {'date': '2024-01-10', 'nav': 1000000},
                 {'date': '2024-01-11', 'nav': 1005000},
             ],
+            order_counter=42,
         )
-        print(f"   Created: {len(state.positions)} positions, {len(state.pending_orders)} orders")
+        print(f"   Created: {len(state.positions)} positions, {len(state.pending_orders)} orders, order_counter={state.order_counter}")
         print("   [OK] Pass")
         
         # 测试2: 序列化/反序列化

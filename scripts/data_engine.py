@@ -290,7 +290,7 @@ class DataEngine:
                 is_delisted   BOOLEAN DEFAULT FALSE,
                 delist_reason VARCHAR,
                 board         VARCHAR,        -- main/chinext/kcb/bse（由 classify_exchange() 派生）
-                is_suspended  BOOLEAN DEFAULT FALSE,  -- 当日是否停牌
+                is_suspend    BOOLEAN DEFAULT FALSE,  -- 当日是否停牌（统一字段名，与 field_specs 一致）
                 eff_date      DATE NOT NULL,  -- 本版本记录生效日期（同步当日）
                 end_date      DATE,           -- 本版本失效日期（下一次快照前一天），NULL=当前最新
                 created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,

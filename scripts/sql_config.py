@@ -10,74 +10,18 @@ from typing import Dict
 # ─────────────────────────────────────────────────────────────
 
 SCHEMA_SQL: Dict[str, str] = {
-    # ── 新口径表（PIT支持）────────────────────────────
-    "stock_basic_history": """
-        CREATE TABLE IF NOT EXISTS stock_basic_history (
-            ts_code TEXT NOT NULL,
-            symbol TEXT NOT NULL,
-            name TEXT,
-            exchange TEXT,
-            board TEXT,
-            industry TEXT,
-            market TEXT,
-            list_date DATE,
-            delist_date DATE,
-            is_delisted BOOLEAN DEFAULT FALSE,
-            eff_date DATE NOT NULL,
-            end_date DATE,
-            PRIMARY KEY (ts_code, eff_date)
-        )
-    """,
+    # ================================================================
+    # Schema v4.0 收口版（2026-04-13）
+    # 重复 key 清理完成：daily_bar_raw / stock_basic_history /
+    #   daily_bar_adjusted / index_constituents_history
+    #   各有 2 个定义，已删除第 1 个旧版，保留最终版本。
+    # 字段规范：daily_bar_raw 含 symbol；daily_bar_adjusted 含
+    #   is_suspend/limit_up/limit_down；stock_basic_history 含 board。
+    # ================================================================
 
-    "daily_bar_raw": """
-        CREATE TABLE IF NOT EXISTS daily_bar_raw (
-            ts_code TEXT NOT NULL,
-            trade_date DATE NOT NULL,
-            open DOUBLE,
-            high DOUBLE,
-            low DOUBLE,
-            close DOUBLE,
-            pre_close DOUBLE,
-            volume BIGINT,
-            amount DOUBLE,
-            pct_chg DOUBLE,
-            turnover DOUBLE,
-            PRIMARY KEY (ts_code, trade_date)
-        )
-    """,
+    # ── 核心表（v4.0 最终版）─────────────────────────────────────────
 
-    "daily_bar_adjusted": """
-        CREATE TABLE IF NOT EXISTS daily_bar_adjusted (
-            ts_code TEXT NOT NULL,
-            trade_date DATE NOT NULL,
-            open DOUBLE,
-            high DOUBLE,
-            low DOUBLE,
-            close DOUBLE,
-            pre_close DOUBLE,
-            volume BIGINT,
-            amount DOUBLE,
-            pct_chg DOUBLE,
-            turnover DOUBLE,
-            adj_factor DOUBLE DEFAULT 1.0,
-            qfq_open DOUBLE,
-            qfq_high DOUBLE,
-            qfq_low DOUBLE,
-            qfq_close DOUBLE,
-            PRIMARY KEY (ts_code, trade_date)
-        )
-    """,
-
-    "index_constituents_history": """
-        CREATE TABLE IF NOT EXISTS index_constituents_history (
-            index_code TEXT NOT NULL,
-            ts_code TEXT NOT NULL,
-            in_date DATE NOT NULL,
-            out_date DATE,
-            PRIMARY KEY (index_code, ts_code, in_date)
-        )
-    """,
-
+    # ── 旧表（已废弃，保留用于兼容）────────────────────
     # ── 旧表（已废弃，保留用于兼容）────────────────────
     "stock_basic": """
         CREATE TABLE IF NOT EXISTS stock_basic (

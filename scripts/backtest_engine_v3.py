@@ -489,7 +489,21 @@ class ProductionBacktestEngine:
                 pending_orders=[
                     o.to_order() for o in state.pending_orders
                 ],
-                trade_history=[],  # Trade历史从state.trade_history恢复（如果需要）
+                trade_history=[
+                    Trade(
+                        order_id=t.order_id,
+                        symbol=t.symbol,
+                        side=OrderSide[t.side],
+                        shares=t.shares,
+                        price=t.price,
+                        date=datetime.fromisoformat(t.date)
+                              if isinstance(t.date, str) else t.date,
+                        commission=t.commission,
+                        stamp_tax=t.stamp_tax,
+                        slippage=t.slippage,
+                    )
+                    for t in state.trade_history
+                ],
                 daily_values=state.daily_records,
             )
             self.daily_records = state.daily_records
