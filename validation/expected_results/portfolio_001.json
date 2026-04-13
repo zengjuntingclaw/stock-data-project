@@ -1,0 +1,98 @@
+{
+  "portfolio_id": "portfolio_001",
+  "description": "价值投资组合（高ROE低PB）- 验证回测引擎基础逻辑",
+  "version": "v1.0",
+  "created_at": "2026-04-13",
+  
+  "constituents": [
+    {
+      "symbol": "000001.SZ",
+      "name": "平安银行",
+      "entry_date": "2024-01-02",
+      "shares": 1000,
+      "entry_price": 10.50,
+      "notes": "银行股代表"
+    },
+    {
+      "symbol": "600000.SH",
+      "name": "浦发银行",
+      "entry_date": "2024-01-02",
+      "shares": 1200,
+      "entry_price": 8.20,
+      "notes": "低PB代表"
+    },
+    {
+      "symbol": "600519.SH",
+      "name": "贵州茅台",
+      "entry_date": "2024-01-02",
+      "shares": 100,
+      "entry_price": 1725.00,
+      "notes": "高ROE代表"
+    }
+  ],
+  
+  "initial_cash": 50000.00,
+  "commission_rate": 0.0003,
+  "slippage_rate": 0.001,
+  
+  "expected_metrics": {
+    "total_return": {
+      "min": -0.05,
+      "max": 0.15,
+      "description": "2024全年收益率（考虑分红）"
+    },
+    "max_drawdown": {
+      "min": -0.20,
+      "max": -0.02,
+      "description": "最大回撤范围"
+    },
+    "sharpe_ratio": {
+      "min": 0.5,
+      "max": 2.0,
+      "description": "夏普比率范围"
+    },
+    "win_rate": {
+      "min": 0.40,
+      "max": 0.70,
+      "description": "胜率范围（按持仓股票）"
+    }
+  },
+  
+  "validation_checks": [
+    {
+      "check": "no_survivorship_bias",
+      "expected": true,
+      "description": "不应出现幸存者偏差（退市股票应正确处理）"
+    },
+    {
+      "check": "no_future_function",
+      "expected": true,
+      "description": "不应出现未来函数（如用当日收盘价买入）"
+    },
+    {
+      "check": "trade_on_suspend",
+      "expected": false,
+      "description": "停牌日不应成交"
+    },
+    {
+      "check": "limit_order_respect",
+      "expected": true,
+      "description": "涨跌停价格应正确处理"
+    },
+    {
+      "check": "t_plus_1_rule",
+      "expected": true,
+      "description": "T+1规则应正确执行（当日买入次日可卖）"
+    }
+  ],
+  
+  "backtest_config": {
+    "start_date": "2024-01-02",
+    "end_date": "2024-12-31",
+    "frequency": "daily",
+    "benchmark": "000300.SH",
+    "adjust_method": "qfq"
+  },
+  
+  "notes": "此组合用于验证回测引擎基础逻辑，选股基于护城河理论。"
+}
