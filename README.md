@@ -65,36 +65,53 @@ stock_data_project/
 ├── run_tests.py                   # 测试运行脚本
 ├── requirements.txt               # Python 依赖
 │
-├── scripts/                       # 核心模块
-│   ├── __init__.py                # 模块导出 (v3.3)
-│   ├── pipeline_data_engine.py    # ⭐ 唯一主入口 v6 - 统一数据管道
-│   ├── data_engine.py             # 数据引擎 — DuckDB 操作层（被 pipeline_data_engine 使用）
-│   ├── data_validator.py          # 数据验证器 — 多源交叉验证
-│   ├── data_fetcher.py            # 多数据源获取层（TuShare/AkShare/Baostock）
+├── scripts/                       # 核心模块 (28 个 .py)
+│   ├── __init__.py                # 模块导出
+│   ├── pipeline_data_engine.py    # ⭐ 唯一主入口 - 统一数据管道
+│   ├── data_engine.py             # 数据引擎 — DuckDB 操作层
 │   ├── data_store.py              # 数据存储 — DuckDB 连接池管理
-│   ├── checkpoint_manager.py       # 回测状态管理 — 断点续跑序列化
-│   ├── data_classes.py            # 数据类 — Order, Trade, Position, PerformanceMetrics
-│   ├── execution_engine_v3.py     # 执行引擎 — T+1 交易模拟、涨跌停、ADV 限制
+│   ├── data_fetcher.py            # 多数据源获取层（AkShare / Baostock）
+│   ├── data_validator.py          # 数据验证器 — 多源交叉验证
+│   ├── data_qa_pipeline.py        # 数据质量管道 — 14 类校验
+│   ├── execution_engine_v3.py     # 执行引擎 — T+1 交易、涨跌停、ADV 限制
 │   ├── backtest_engine_v3.py      # 回测引擎 — 分层回测、检查点恢复
+│   ├── checkpoint_manager.py       # 回测状态管理 — 断点续跑序列化
 │   ├── trading_rules.py           # 交易规则 — 涨跌停板、板块识别、交易日历
-│   ├── survivorship_bias.py       # 幸存者偏差处理
-│   ├── pit_aligner.py             # PIT 数据对齐
+│   ├── survivorship_bias.py       # 幸存者偏差处理 — 含退市股全量池
+│   ├── pit_aligner.py             # PIT 数据对齐 — 财务数据 ann_date
 │   ├── performance.py             # 绩效分析 — 夏普、IR、Brinson 归因
-│   ├── sentinel_audit.py          # 代码审查工具
-│   └── stock_history_schema.sql   # 数据库 Schema
-
-⚠️ 废弃模块（仅向后兼容，v4.0 将移除）：enhanced_data_engine.py,
-   request_throttler.py, backtest_validator.py, multi_source_manager.py,
-   backoff_controller.py, advanced_checkpoint.py, auto_repair.py,
-   parquet_optimizer.py, production_data_system.py
-   → 全部重定向到 pipeline_data_engine
+│   ├── partitioned_storage.py      # 分区存储 — DuckDB + Parquet 双存储
+│   ├── versioned_storage.py        # 版本化存储 — PIT 有效at/as_of
+│   ├── data_classes.py            # 数据类 — Order, Trade, Position, Metrics
+│   ├── exchange_mapping.py         # 交易所映射 — SZ/SH/BJ 统一编码
+│   ├── field_specs.py            # 字段规格 — 8 类字段定义
+│   ├── security_master.py         # 证券主数据 — 上市/退市日期
+│   ├── sentinel_audit.py          # 代码审查工具 — 质量审计
+│   ├── sql_config.py             # SQL 配置 — 6 张核心表 schema
+│   ├── scheduler.py              # 调度器 — 数据同步任务编排
+│   ├── production_scheduler.py    # 生产调度器
+│   ├── request_cache.py           # 请求缓存 — 离线回放模式
+│   ├── request_logger.py          # 请求日志
+│   ├── third_party_sources.py     # 第三方数据源配置
+│   ├── time_series_gaps.py       # 时间序列缺口检测
+│   └── data_consistency_checker.py # 数据一致性检查器
 │
-├── tests/                         # 测试
-│   ├── conftest.py                # pytest 配置
+├── tests/                         # 测试 (15 个测试文件)
+│   ├── conftest.py                # pytest 配置 + mock
 │   ├── test_core.py               # 核心功能测试
-│   ├── test_data_engine.py        # 数据引擎测试 (61 用例)
-│   ├── test_refactor_v2.py        # v3.x 重构测试 (33 用例)
-│   └── test_production.py         # 生产级测试
+│   ├── test_data_engine.py        # 数据引擎测试
+│   ├── test_data_caliber_v3.py   # v3 数据口径测试
+│   ├── test_refactor_v2.py        # v3.x 重构测试
+│   ├── test_data_integration_final.py  # 数据集成测试
+│   ├── test_deep_optimization.py  # 深度优化测试
+│   ├── test_execution_engine_v3.py # 执行引擎测试
+│   ├── test_exchange_mapping_unified.py # 交易所映射测试
+│   ├── test_pit_queries.py        # PIT 查询测试
+│   ├── test_production.py         # 生产级测试
+│   ├── test_stock_basic_history.py # 股票主表历史测试
+│   ├── test_time_mock.py          # 时间 mock 测试
+│   ├── test_unified_fields.py     # 统一字段测试
+│   └── test_data_quality_integration.py # 数据质量集成测试
 │
 ├── docs/                          # 文档
 │   ├── PROJECT_OVERVIEW.md        # 项目概述
@@ -624,6 +641,12 @@ python -m unittest discover -s tests -p test_refactor_v2.py
 ---
 
 ## 版本历史
+
+### v4.1 (2026-04-14)
+- **项目整理**：按 README v4.0 规划，删除 13 个废弃模块（enhanced_data_engine / request_throttler / backtest_validator / multi_source_manager / backoff_controller / advanced_checkpoint / auto_repair / parquet_optimizer / production_data_system / baostock_enhanced / tushare_source / minute_engine / data_production_validation），同步删除引用废弃模块的测试文件（test_enhanced_data_engine.py / test_robust_data_pipeline.py）
+- **Bug 修复**：`checkpoint_manager.py` `BacktestState` dataclass 参数顺序错误修复（非默认字段 `daily_records` 排在默认值 `order_counter` 之后）
+- **临时文件清理**：_temp/ 347 个开发临时文件清空、logs/ 清空
+- **README 更新**：scripts/ 从 41 个缩减至 28 个，测试文件从 17 个缩减至 15 个，目录结构与代码库完全对齐
 
 ### v3.4 (2026-04-12 晚)
 - **单入口收口**：`scripts/pipeline_data_engine.py` 确立为唯一主入口

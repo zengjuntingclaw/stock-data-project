@@ -191,12 +191,12 @@ class BacktestState:
     
     # 成交历史
     trade_history: List[TradeState]
-
-    # 订单计数器（用于恢复 order_id 不冲突）
-    order_counter: int = 0
     
     # 每日记录
     daily_records: List[Dict]
+    
+    # 订单计数器（用于恢复 order_id 不冲突）
+    order_counter: int = 0
     
     # 元数据
     version: str = "3.0"               # 状态格式版本
