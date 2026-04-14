@@ -1383,22 +1383,43 @@ class DataEngine:
         except Exception as e:
             logger.debug(f"Baostock financial fetch failed for {symbol}: {e}")
 
-        # 估值快照（用 AkShare）
+        # 估值快照（用 Baostock K 线 PE/PB，已验证可用）
+        # Bug Fix (2026-04-14): 原 AkShare stock_a_indicator_lg 早已不可用，
+        # 替换为 Baostock query_history_k_data_plus 自带 pe/pb 列
         try:
-            df_val = ak.stock_a_indicator_lg(secu=symbol)
-            if not df_val.empty and "代码" in df_val.columns:
-                df_val = df_val.rename(columns={"代码": "symbol"})
-                for _, row in df_val.iterrows():
-                    records.append(self._ak_indicator_row(row, symbol))
+            from scripts.exchange_mapping import build_bs_code as _build_bs_code
+            bs_code_val = _build_bs_code(sym6)
+            end_date = self._get_now().strftime("%Y-%m-%d")
+            start_date = self._get_now().replace(year=self._get_now().year - 1).strftime("%Y-%m-%d")
+            rs = bs.query_history_k_data_plus(
+                bs_code_val,
+                "date,totalMv,turnover,pe,pb",
+                start_date=start_date,
+                end_date=end_date,
+                frequency="d",
+                adjustflag="3",  # 不复权，保持 raw
+            )
+            if rs and rs.error_code == "0":
+                while rs.next():
+                    row = dict(zip(rs.fields, rs.get_row_data()))
+                    records.append(self._bs_kline_valuation_row(row, sym6))
+            time.sleep(0.1)
         except Exception as e:
-            logger.debug(f"AkShare indicator fetch failed for {symbol}: {e}")
+            logger.debug(f"Baostock K-line PE/PB fetch failed for {symbol}: {e}")
 
         if not records:
             return pd.DataFrame()
         return pd.DataFrame(records)
 
     def _bs_profit_row(self, row: Dict, symbol: str) -> Dict:
-        """Baostock 利润表行标准化"""
+        """
+        Baostock 利润表行标准化。
+
+        Bug Fix (2026-04-14):
+        - ROA: Baostock 利润表无 ROA 字段，留空（0.0），由 daily_valuation 表提供
+        - EPS: Baostock 提供 epsTTM（非 basic_eps）
+        - gross_margin: 对应 gpMargin 字段
+        """
         sym6 = str(symbol).zfill(6)
         ann = row.get("profit_statements_pub_date", "")
         end = row.get("profit_statements_report_date", "")
@@ -1408,13 +1429,13 @@ class DataEngine:
             "end_date": pd.to_datetime(end, errors="coerce") if end else pd.NaT,
             "report_type": "年报",
             "revenue": float(row.get("total_operating_revenue", 0) or 0),
-            "net_profit": float(row.get("parent_net_profit", 0) or 0),
+            "net_profit": float(row.get("parent_netprofit", 0) or 0),
             "total_assets": float(row.get("total_assets", 0) or 0),
             "total_equity": float(row.get("total_shareholder_equity", 0) or 0),
-            "roe": float(row.get("avg_roe", 0) or 0),
-            "roa": float(row.get("roe", 0) or 0),
-            "eps": float(row.get("basic_eps", 0) or 0),
-            "gross_margin": float(row.get("gross_profit_margin", 0) or 0),  # 与DDL字段名对齐
+            "roe": float(row.get("roeAvg", 0) or 0),
+            "roa": 0.0,                                        # 修复：Baostock 利润表无 ROA 字段，留空
+            "eps": float(row.get("epsTTM", 0) or 0),
+            "gross_margin": float(row.get("gpMargin", 0) or 0),
             "data_source": "baostock",
         }
 
@@ -1439,22 +1460,58 @@ class DataEngine:
             "data_source": "akshare",
         }
 
+    def _bs_kline_valuation_row(self, row: Dict, symbol: str) -> Dict:
+        """
+        Baostock K 线自带 PE/PB 估值行 → 存入 financial_data。
+
+        Bug Fix (2026-04-14): 原 _ak_indicator_row 调用的 AkShare stock_a_indicator_lg
+        早已不可用（akshare 1.18.50 无此接口），导致 pe_ttm/pb 永远为空。
+        替换为 Baostock query_history_k_data_plus 的 pe/pb 列（已验证可用）。
+        totalMv = 总市值（万元），转为亿元：/ 10000
+        """
+        sym6 = str(symbol).zfill(6)
+        return {
+            "ts_code": build_ts_code(sym6),
+            "ann_date": pd.to_datetime(row.get("date", ""), errors="coerce") or pd.NaT,
+            "end_date": pd.NaT,
+            "report_type": "估值",
+            "revenue": 0.0,
+            "net_profit": 0.0,
+            "total_assets": 0.0,
+            "total_equity": 0.0,
+            "roe": 0.0,
+            "roa": 0.0,
+            "eps": 0.0,
+            "gross_margin": 0.0,
+            "pe_ttm": float(row.get("pe", "") or 0) or 0.0,
+            "pb": float(row.get("pb", "") or 0) or 0.0,
+            "data_source": "baostock_kline",
+        }
+
     def _save_financial_data(self, df: pd.DataFrame):
-        """保存财务数据到数据库"""
+        """
+        保存财务数据到数据库。
+
+        Bug Fix (2026-04-14):
+        - INSERT OR REPLACE 补全了 pe_ttm、pb、roic、debt_ratio 列，
+          此前只写了 12 列，导致这些字段即使在 _ak_indicator_row 中有值也写不进去
+        """
         if df.empty or not HAS_DUCKDB:
             return
         with self.get_connection() as conn:
-            # 财务数据用 REPLACE（可重复更新）
             try:
                 conn.execute("""
                     INSERT OR REPLACE INTO financial_data
                     (ts_code, ann_date, end_date, report_type, revenue,
                      net_profit, total_assets, total_equity, roe, roa,
-                     eps, gross_margin, data_source)
+                     eps, gross_margin, pe_ttm, pb, roic, debt_ratio, data_source)
                     SELECT
                         ts_code, ann_date, end_date, report_type,
                         revenue, net_profit, total_assets, total_equity,
-                        roe, roa, eps, gross_margin, data_source
+                        roe, roa, eps, gross_margin,
+                        COALESCE(pe_ttm, 0.0), COALESCE(pb, 0.0),
+                        COALESCE(roic, 0.0), COALESCE(debt_ratio, 0.0),
+                        data_source
                     FROM df
                 """)
             except Exception as e:
@@ -1463,7 +1520,8 @@ class DataEngine:
                 cols = [c for c in df.columns if c in
                         ["ts_code", "ann_date", "end_date", "report_type",
                          "revenue", "net_profit", "roe", "roa", "eps",
-                         "total_assets", "total_equity", "gross_margin", "data_source"]]
+                         "total_assets", "total_equity", "gross_margin",
+                         "pe_ttm", "pb", "roic", "debt_ratio", "data_source"]]
                 if cols:
                     col_str = ','.join(cols)
                     conn.execute(f"INSERT OR IGNORE INTO financial_data ({col_str}) SELECT {col_str} FROM df")
