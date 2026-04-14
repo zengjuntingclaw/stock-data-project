@@ -4,7 +4,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.stdout.reconfigure(encoding='utf-8')
 sys.stderr.reconfigure(encoding='utf-8')
 
-DB = 'data/stock_data.duckdb'
+DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data', 'stock_data.duckdb')
 
 class TestPITQueries(unittest.TestCase):
     @classmethod

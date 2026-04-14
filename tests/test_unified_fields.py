@@ -760,7 +760,7 @@ class TestSurvivorshipBiasTSCode(unittest.TestCase):
         # 直接验证 survivorship_bias.py 中的逻辑已修复
         # 读取源码检查 L138 不再包含错误的三元表达式
         import re
-        content = open('scripts/survivorship_bias.py', encoding='utf-8').read()
+        content = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'scripts', 'survivorship_bias.py'), encoding='utf-8').read()
         
         # 确认没有错误的 .SH/.SZ fallback 逻辑
         bad_pattern = r"\.SH.*if.*startswith\(['\"]6['\"]\).*\.SZ"
