@@ -71,6 +71,22 @@ fix: 修复合并bug + 补全兼容层 + 重写测试
 唯一入口：`from scripts.pipeline_data_engine import PipelineDataEngine`
 向后兼容别名：`EnhancedDataEngine = ProductionDataEngine = PipelineDataEngine`
 
+### Commit: 5b8e11d
+```
+refactor: production_data_system改为deprecation stub + README单入口收口
+```
+
+### P1 收口完成
+- `production_data_system.py`：彻底改为 deprecation stub（移除了380行旧类），保留 `_get_now()` + `ProductionDataSystem` 别名
+- `checkpoint_manager.py`：确认为活跃模块，被 `backtest_engine_v3.py` 实际使用
+- 废弃 stub 完整清单（共 10 个）：enhanced_data_engine / request_throttler / backtest_validator / multi_source_manager / backoff_controller / advanced_checkpoint / auto_repair / parquet_optimizer / production_data_system / request_cache
+
+### README 架构文档更新
+- 目录结构：`pipeline_data_engine.py` ⭐ 唯一主入口，9 个废弃 stub 显式列出
+- 架构图：7 层架构（engine/router/ingest/quality/storage/runtime/backtest）
+- 核心模块章节：PipelineDataEngine 推荐入口，DataEngine 降为底层操作层
+- 版本历史：v3.4 (2026-04-12 晚) 收口记录
+
 ## Technical Notes
 - PowerShell output may be wrapped in CLIXML format - read files directly for clean output
 - Unit tests: 33 tests, all passing
