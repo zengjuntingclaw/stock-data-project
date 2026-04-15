@@ -1387,7 +1387,7 @@ class DataEngine:
         # Bug Fix (2026-04-14): 原 AkShare stock_a_indicator_lg 早已不可用，
         # 替换为 Baostock query_history_k_data_plus 自带 pe/pb 列
         try:
-            from scripts.exchange_mapping import build_bs_code as _build_bs_code
+            from exchange_mapping import build_bs_code as _build_bs_code
             bs_code_val = _build_bs_code(sym6)
             end_date = self._get_now().strftime("%Y-%m-%d")
             start_date = self._get_now().replace(year=self._get_now().year - 1).strftime("%Y-%m-%d")
@@ -2293,73 +2293,130 @@ class DataEngine:
             logger.debug(f"AkShare fetch failed for {symbol}: {e}")
             return pd.DataFrame()
 
+
     def _fetch_baostock(self,
                         symbol: str,
                         start_date: str,
                         end_date: str,
                         adjust: Literal["qfq", ""] = "qfq") -> pd.DataFrame:
-        """Baostock 抓取（备援用，线程安全：使用锁保护全局会话）"""
+        """
+        Baostock 抓取核心，支持 raw+qfq 双获取计算 adj_factor。
+
+        方案：同时获取 adjustflag='1'(未复权) 和 adjustflag='2'(前复权)，
+        用公式 adj_factor = qfq_close / raw_close 计算真正的复权因子。
+        这样确保 qfq_close = raw_close * adj_factor 恒成立。
+        """
         if not HAS_BAOSTOCK:
             return pd.DataFrame()
         try:
-            adjflag_map = {"qfq": "2", "": "3"}
-            adjflag = adjflag_map.get(adjust, "2")
-
-            # 标准化 baostock 代码
             sym6 = str(symbol).zfill(6)
-            # 统一使用 exchange_mapping.build_bs_code()，禁止手写交易所判断
-            # 修复：920xxx 不再误判为 sh，北交所 4/8/920xxx 全部正确归为 bj
-            from scripts.exchange_mapping import build_bs_code as _build_bs_code
+            from exchange_mapping import build_bs_code as _build_bs_code
             bs_code = _build_bs_code(sym6)
 
-            # Baostock 全局会话锁（多线程安全）
             with self._bs_lock:
                 bs.login()
                 try:
-                    rs = bs.query_history_k_data_plus(
-                        bs_code,
-                        "date,open,high,low,close,volume,amount,adjustflag",
+                    # 同时获取未复权和前复权两份数据
+                    fields = "date,open,high,low,close,volume,amount"
+
+                    rs_raw = bs.query_history_k_data_plus(
+                        bs_code, fields,
                         start_date=start_date.replace("-", ""),
                         end_date=end_date.replace("-", ""),
-                        frequency="d",
-                        adjustflag=adjflag
+                        frequency="d", adjustflag="1"
+                    )
+                    rs_qfq = bs.query_history_k_data_plus(
+                        bs_code, fields,
+                        start_date=start_date.replace("-", ""),
+                        end_date=end_date.replace("-", ""),
+                        frequency="d", adjustflag="2"
                     )
                 finally:
                     bs.logout()
-            if rs is None or rs.error_code != "0":
+
+            def _parse(rs):
+                if rs is None or rs.error_code != "0":
+                    return pd.DataFrame()
+                data = []
+                while rs.next():
+                    data.append(rs.get_row_data())
+                df = pd.DataFrame(data, columns=["trade_date", "open", "high", "low", "close", "volume", "amount"])
+                for col in ["open", "high", "low", "close", "volume", "amount"]:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+                df["trade_date"] = pd.to_datetime(df["trade_date"])
+                return df
+
+            df_raw = _parse(rs_raw)
+            df_qfq = _parse(rs_qfq)
+
+            if df_raw.empty:
                 return pd.DataFrame()
 
-            data = []
-            while rs.next():
-                data.append(rs.get_row_data())
-            if not data:
-                return pd.DataFrame()
+            # 合并两份数据，用 trade_date 作为 key
+            if not df_qfq.empty:
+                df_qfq = df_qfq.rename(columns={
+                    "open": "qfq_open", "high": "qfq_high",
+                    "low": "qfq_low", "close": "qfq_close"
+                })
+                df_raw = df_raw.merge(df_qfq[["trade_date", "qfq_open", "qfq_high", "qfq_low", "qfq_close"]],
+                                      on="trade_date", how="left")
+                # adj_factor = 前复权收盘价 / 未复权收盘价
+                df_raw["adj_factor"] = (
+                    df_raw["qfq_close"] / df_raw["close"].replace(0, np.nan)
+                ).fillna(1.0).replace([np.inf, -np.inf], 1.0)
+            else:
+                # 备援：没有前复权数据，adj_factor=1.0
+                df_raw["qfq_close"] = df_raw["close"]
+                df_raw["qfq_open"] = df_raw["open"]
+                df_raw["qfq_high"] = df_raw["high"]
+                df_raw["qfq_low"] = df_raw["low"]
+                df_raw["adj_factor"] = 1.0
 
-            df = pd.DataFrame(data, columns=rs.fields)
-            df.columns = ["trade_date", "open", "high", "low", "close", "volume", "amount", "adj_flag"]
-            for col in ["open", "high", "low", "close", "volume", "amount"]:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-            df["trade_date"] = pd.to_datetime(df["trade_date"])
-            df["ts_code"] = build_ts_code(sym6)
-            df["pre_close"] = df["close"].shift(1)
-            df["pct_chg"] = df["close"].pct_change().fillna(0) * 100
-            df["amount"] = df["amount"].astype(float)
-            df["is_suspend"] = df["volume"] == 0
-            
+            # 基础字段
+            df_raw["ts_code"] = build_ts_code(sym6)
+            df_raw["pre_close"] = df_raw["qfq_close"].shift(1)
+            df_raw["pct_chg"] = (
+                df_raw["qfq_close"] / df_raw["pre_close"].replace(0, np.nan) - 1
+            ).fillna(0) * 100
+            df_raw["is_suspend"] = df_raw["volume"] == 0
+            df_raw["data_source"] = "baostock"
+            df_raw["turnover"] = 0.0
+
             # 涨跌停判定
-            df = self._apply_limit_flags(df, symbol)
-            df["data_source"] = "baostock"
-            df["adj_factor"] = 1.0
-            df["turnover"] = 0.0
+            df_raw = self._apply_limit_flags(df_raw, symbol)
 
-            cols = ["ts_code", "trade_date", "open", "high", "low", "close",
-                    "pre_close", "volume", "amount", "pct_chg", "turnover",
-                    "adj_factor", "is_suspend", "limit_up", "limit_down", "data_source"]
-            return df[[c for c in cols if c in df.columns]]
+            # 按 save_quotes 的双层字段格式组织：
+            # raw_* -> 存入 daily_bar_raw（原始未复权价格）
+            # qfq_* -> 存入 daily_bar_adjusted（前复权价格）
+            result = pd.DataFrame({
+                "ts_code":     df_raw["ts_code"],
+                "trade_date":  df_raw["trade_date"],
+                # raw 层（原始未复权）
+                "raw_open":    df_raw["open"],
+                "raw_high":    df_raw["high"],
+                "raw_low":     df_raw["low"],
+                "raw_close":   df_raw["close"],
+                # adjusted 层（前复权）
+                "open":        df_raw["qfq_open"],
+                "high":        df_raw["qfq_high"],
+                "low":         df_raw["qfq_low"],
+                "close":       df_raw["qfq_close"],
+                "pre_close":   df_raw["pre_close"],
+                "volume":      df_raw["volume"],
+                "amount":      df_raw["amount"].astype(float),
+                "pct_chg":     df_raw["pct_chg"],
+                "turnover":    df_raw["turnover"],
+                "adj_factor":  df_raw["adj_factor"],
+                "is_suspend":  df_raw["is_suspend"],
+                "limit_up":    df_raw["limit_up"],
+                "limit_down":  df_raw["limit_down"],
+                "data_source": df_raw["data_source"],
+            })
+            return result
+
         except Exception as e:
             logger.debug(f"Baostock fetch failed for {symbol}: {e}")
             return pd.DataFrame()
-
     def _batch_get_latest_dates(self, ts_codes: List[str]) -> Dict[str, str]:
         """批量获取多只股票的最新同步日期（优先 sync_progress，备选 daily_bar_adjusted）
 
@@ -2647,7 +2704,7 @@ class DataEngine:
                 for sym in symbols[:20]:  # 抽样20只
                     sym6 = str(sym).zfill(6)
                     # 统一使用 exchange_mapping.build_bs_code()，修复：688/920xxx/4xxx/8xxx 全部正确
-                    from scripts.exchange_mapping import build_bs_code as _build_bs_code
+                    from exchange_mapping import build_bs_code as _build_bs_code
                     bs_code = _build_bs_code(sym6)
 
                     # AkShare 数据（参数化查询防止SQL注入）
