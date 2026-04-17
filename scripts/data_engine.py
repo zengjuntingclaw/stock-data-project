@@ -257,304 +257,386 @@ class DataEngine:
     # 数据库初始化
     # ──────────────────────────────────────────────────────────
     def _init_schema(self):
-        """初始化表结构（幂等：同类路径只执行一次）"""
+        """初始化 v5 表结构（幂等：同类路径只执行一次）
+
+        v5 Schema（10张表）：
+          核心8表: stock_basic / trading_calendar / market_daily /
+                   corporate_action / financial_statement / financial_factor /
+                   share_structure / company_status
+          辅助2表: index_membership / valuation_daily
+          工具表:  sync_progress / data_quality_alert
+        """
         db_key = str(self.db_path.resolve())
         if db_key in DataEngine._schema_initialized:
             logger.debug(f"Schema already initialized for {db_key}")
             return
-        
+
         conn = duckdb.connect(str(self.db_path))
         cur = conn.cursor()
 
-        # ── 清理旧口径残留表 ────────────────────────────────────────
-        # stock_basic（旧表，已废弃，由 stock_basic_history 替代）
-        # 使用 DROP TABLE IF EXISTS 幂等删除，确保旧 DB 升级后不再残留
-        cur.execute("DROP TABLE IF EXISTS stock_basic")
-        logger.debug("旧表 stock_basic 已清理（若存在）")
+        # ── 清理旧口径残留表（v4 及之前）──────────────────────────────
+        old_tables = [
+            'stock_basic_history', 'daily_bar_raw', 'daily_bar_adjusted',
+            'financial_data', 'daily_valuation', 'corporate_actions',
+            'index_constituents_history', 'st_status_history',
+            'adj_factor_log', 'update_log',
+        ]
+        for tbl in old_tables:
+            cur.execute(f"DROP TABLE IF EXISTS {tbl}")
+        logger.debug(f"旧口径残留表已清理: {old_tables}")
 
-        # ── 证券主表历史版本（时点版本，解决历史universe完整性问题）
-        # 设计：每只股票可有多条版本记录（ts_code + eff_date 联合主键）
-        # PIT查询逻辑: WHERE list_date <= date AND (delist_date > date OR delist_date IS NULL)
-        # eff_date = 本条记录的生效日期（通常=同步当日或 list_date）
+        # ── 1. stock_basic 证券主表 ─────────────────────────────────
+        # 记录每只股票的基础信息（上市/退市/行业/交易所等）
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS stock_basic_history (
-                ts_code       VARCHAR  NOT NULL,
-                symbol        VARCHAR  NOT NULL,
-                name          VARCHAR,
-                exchange      VARCHAR,        -- SH / SZ / BJ（由 classify_exchange() 派生）
-                area          VARCHAR,
-                industry      VARCHAR,
-                market        VARCHAR,
-                list_date     DATE,           -- 上市日期（关键：PIT过滤用）
-                delist_date   DATE,           -- 退市日期（关键：PIT过滤用）
-                is_delisted   BOOLEAN DEFAULT FALSE,
-                delist_reason VARCHAR,
-                board         VARCHAR,        -- main/chinext/kcb/bse（由 classify_exchange() 派生）
-                is_suspend    BOOLEAN DEFAULT FALSE,  -- 当日是否停牌（统一字段名，与 field_specs 一致）
-                eff_date      DATE NOT NULL,  -- 本版本记录生效日期（同步当日）
-                end_date      DATE,           -- 本版本失效日期（下一次快照前一天），NULL=当前最新
-                created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (ts_code, eff_date)  -- 联合主键：同一股票可有多个版本
+            CREATE TABLE IF NOT EXISTS stock_basic (
+                ticker           VARCHAR  PRIMARY KEY,
+                name             VARCHAR,
+                full_name        VARCHAR,
+                exchange         VARCHAR,          -- SH / SZ / BJ
+                market           VARCHAR,          -- A / HK / US
+                industry_level1  VARCHAR,          -- 申万一级行业（30个）
+                industry_level2  VARCHAR,
+                industry_level3  VARCHAR,
+                listed_date      DATE,
+                delisted_date    DATE,
+                list_status      VARCHAR,          -- listed / delisted / suspended
+                is_financial     BOOLEAN DEFAULT FALSE,  -- 金融股（毛利率/负债率不适用）
+                currency         VARCHAR DEFAULT 'CNY',
+                country          VARCHAR DEFAULT 'CN',
+                created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # 关键索引：支持 PIT 查询（list_date / delist_date 过滤）和按交易所过滤
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_stock_hist_list_date
-            ON stock_basic_history(list_date)
-        """)
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_stock_hist_delist_date
-            ON stock_basic_history(delist_date)
-        """)
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_stock_hist_exchange
-            ON stock_basic_history(exchange)
-        """)
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_stock_hist_eff_date
-            ON stock_basic_history(eff_date)
-        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_sb_exchange ON stock_basic(exchange)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_sb_industry1 ON stock_basic(industry_level1)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_sb_status ON stock_basic(list_status)")
 
-        # ── 增量同步进度表（断点续跑核心）────────────────────────────
-        # 记录每只股票的最后成功同步位置，防止中断后重复下载或数据缺失
+        # ── 2. trading_calendar 交易日历 ───────────────────────────
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS sync_progress (
-                ts_code        VARCHAR NOT NULL,   -- 股票代码
-                table_name     VARCHAR NOT NULL,   -- 目标表（daily_bar_raw / daily_bar_adjusted）
-                last_sync_date DATE,               -- 最后成功同步的交易日
-                last_sync_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,  -- 最后同步时间戳
-                total_records  INTEGER DEFAULT 0,  -- 累计同步记录数
-                status         VARCHAR DEFAULT 'ok', -- ok / failed / in_progress
-                error_msg      VARCHAR,            -- 最后一次错误信息
-                PRIMARY KEY (ts_code, table_name)
+            CREATE TABLE IF NOT EXISTS trading_calendar (
+                cal_date       DATE PRIMARY KEY,
+                is_open        BOOLEAN,          -- TRUE=交易日
+                pretrade_date  DATE              -- 最近前一个交易日
             )
         """)
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_sync_progress_date
-            ON sync_progress(last_sync_date)
-        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_tc_is_open ON trading_calendar(is_open)")
 
-        # 指数成分股历史区间表（解决幸存者偏差）
-        # 每次同步只 INSERT 不 DELETE，支持按任意交易日回放当时成分
-        # 关键：in_date=out_date=NULL 表示尚未加入；out_date非空表示已退出
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS index_constituents_history (
-                index_code   VARCHAR,      -- 指数代码如 '000300.SH'
-                ts_code      VARCHAR,      -- 成分股代码
-                in_date      DATE,         -- 纳入日期（NULL=未来/未知）
-                out_date     DATE,         -- 剔除日期（NULL=仍在指数内）
-                source       VARCHAR,       -- 数据来源：csindex/sse/szse
-                created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (index_code, ts_code, in_date)
-            )
-        """)
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_ich_index
-            ON index_constituents_history(index_code)
-        """)
-
-        # ST状态历史表（时间序列特征）
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS st_status_history (
-                ts_code      VARCHAR,
-                trade_date   DATE,
-                is_st        BOOLEAN,     -- 当日是否ST
-                is_new_st    BOOLEAN,     -- 当日是否新加入ST
-                PRIMARY KEY (ts_code, trade_date)
-            )
-        """)
-
-        # ── 原始价日线表（基础层）──────────────────────────────────
+        # ── 3. market_daily 日行情（原始价层）─────────────────────────
+        # 存储 raw_close + adj_factor，qfq 由 market_daily.adj_factor × raw_close 实时计算
         # adj_factor=1.0 表示不复权原始价；>1.0 表示有复权调整
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS daily_bar_raw (
-                ts_code       VARCHAR,
-                trade_date    DATE,
-                symbol        VARCHAR,
-                open          DOUBLE,
-                high          DOUBLE,
-                low           DOUBLE,
-                close         DOUBLE,           -- 原始未复权收盘价（不复权数据源直接存储）
-                volume        BIGINT,
-                amount        DOUBLE,
-                pct_chg       DOUBLE,
-                turnover      DOUBLE,
-                adj_factor    DOUBLE DEFAULT 1.0,  -- 复权因子（>1.0=有复权，1.0=原始价）
-                pre_close     DOUBLE,             -- 前收盘（由前一日收盘计算）
-                is_suspend    BOOLEAN DEFAULT FALSE,
-                limit_up      BOOLEAN DEFAULT FALSE,
-                limit_down    BOOLEAN DEFAULT FALSE,
-                data_source   VARCHAR DEFAULT 'akshare',
-                PRIMARY KEY (ts_code, trade_date)
+            CREATE TABLE IF NOT EXISTS market_daily (
+                ticker           VARCHAR,
+                trade_date       DATE,
+                open             DOUBLE,
+                high             DOUBLE,
+                low              DOUBLE,
+                close            DOUBLE,           -- 原始未复权收盘价
+                pre_close        DOUBLE,           -- 前收盘
+                volume           BIGINT,
+                amount           DOUBLE,
+                turnover_rate    DOUBLE,           -- Baostock turn 字段（%）
+                total_market_cap DOUBLE,           -- 总市值（万元）
+                float_market_cap DOUBLE,           -- 流通市值（万元）
+                adj_factor       DOUBLE DEFAULT 1.0,  -- 复权因子：qfq_close = close × adj_factor
+                suspended_flag   BOOLEAN DEFAULT FALSE,
+                limit_up_flag   BOOLEAN DEFAULT FALSE,
+                limit_down_flag BOOLEAN DEFAULT FALSE,
+                is_new_stock    BOOLEAN DEFAULT FALSE,  -- 上市首日（无涨跌停）
+                created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (ticker, trade_date)
             )
         """)
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_bar_raw_code ON daily_bar_raw(ts_code)
-        """)
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_bar_raw_date ON daily_bar_raw(trade_date)
-        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_md_ticker ON market_daily(ticker)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_md_date ON market_daily(trade_date)")
 
-        # ── 复权价日线表（派生层）──────────────────────────────────
-        # 由 daily_bar_raw 乘 adj_factor 派生，close = raw_close × adj_factor
-        # 注意：此表的 close/high/low/open 字段均为复权价
-        # 字段说明：
-        #   open/high/low/close   — 复权价（= qfq_xxx，由 raw × adj_factor 计算）
-        #   qfq_open/high/low/close — 前复权价（相对于当前时刻向前复权）
-        #   hfq_open/high/low/close — 后复权价（相对于发行价向后复权）
+        # ── 4. corporate_action 分红送股事件 ─────────────────────────
+        # 来源：Baostock 分红送股数据
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS daily_bar_adjusted (
-                ts_code       VARCHAR,
-                trade_date    DATE,
-                open          DOUBLE,             -- 复权开盘价（=qfq_open）
-                high          DOUBLE,             -- 复权最高价（=qfq_high）
-                low           DOUBLE,              -- 复权最低价（=qfq_low）
-                close         DOUBLE,             -- 复权收盘价（=qfq_close）
-                pre_close     DOUBLE,
-                volume        BIGINT,
-                amount        DOUBLE,
-                pct_chg       DOUBLE,
-                turnover      DOUBLE,
-                adj_factor    DOUBLE DEFAULT 1.0,  -- 复权因子（参考值）
-                qfq_open      DOUBLE,              -- 前复权开盘价
-                qfq_high      DOUBLE,              -- 前复权最高价
-                qfq_low       DOUBLE,              -- 前复权最低价
-                qfq_close     DOUBLE,              -- 前复权收盘价
-                hfq_open      DOUBLE,              -- 后复权开盘价
-                hfq_high      DOUBLE,              -- 后复权最高价
-                hfq_low       DOUBLE,              -- 后复权最低价
-                hfq_close     DOUBLE,              -- 后复权收盘价
-                is_suspend    BOOLEAN DEFAULT FALSE,
-                limit_up      BOOLEAN DEFAULT FALSE,
-                limit_down    BOOLEAN DEFAULT FALSE,
-                data_source   VARCHAR DEFAULT 'akshare',
-                PRIMARY KEY (ts_code, trade_date)
+            CREATE TABLE IF NOT EXISTS corporate_action (
+                ticker            VARCHAR,
+                action_date        DATE,            -- 除权除息生效日
+                announcement_date  DATE,            -- 公告日期（PIT约束：T日公告T日可见）
+                report_period_end  DATE,            -- 报告期
+                action_type        VARCHAR,         -- dividend/split/rights_issue/bonus
+                dividend_per_share DOUBLE,           -- 每股分红（元）
+                split_ratio        DOUBLE,           -- 拆股比例（如10送10=2.0）
+                bonus_ratio        DOUBLE,           -- 送股比例（如10送5=0.5）
+                rights_ratio       DOUBLE,           -- 配股比例
+                rights_price       DOUBLE,           -- 配股价格
+                prev_adj_factor    DOUBLE,           -- 调整前复权因子
+                curr_adj_factor    DOUBLE,           -- 调整后复权因子
+                detail             VARCHAR,         -- 事件描述
+                created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (ticker, action_date)
             )
         """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_ca_ticker ON corporate_action(ticker)")
 
-        # 除权除息事件表（用于生成 corporate_actions）
-        # 来源：daily_bar_raw 的 adj_factor 变化检测，或 Baostock 分红数据
+        # ── 5. financial_statement 年度财务报表原始数据 ───────────────
+        # 数据来源：Baostock query_profit_data / query_balance_data / query_dupont_data
+        # PIT约束：announcement_date <= available_date（公告日T日生效，T+1可查）
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS corporate_actions (
-                ts_code       VARCHAR,      -- 证券代码
-                action_date   DATE,         -- 除权除息生效日期
-                ann_date      DATE,         -- 公告日期（用于PIT约束）
-                prev_adj      DOUBLE,       -- 变化前复权因子
-                curr_adj      DOUBLE,       -- 变化后复权因子
-                action_type   VARCHAR,      -- 类型：dividend/split/reverse_split/rights_issue
-                change_ratio  DOUBLE,       -- 变化幅度（curr/prev - 1）
-                reason        VARCHAR,      -- 事件描述（如 分红0.5元/股）
-                created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (ts_code, action_date)
+            CREATE TABLE IF NOT EXISTS financial_statement (
+                ticker               VARCHAR,
+                report_period_end     DATE,          -- 报告期（如 2024-12-31）
+                announcement_date     DATE,          -- 公告日期
+                available_date       DATE,          -- PIT生效日 = announcement_date + 1
+                report_type          VARCHAR,       -- FY / Q1 / Q2 / Q3
+                revenue              DOUBLE,        -- 营业收入（万元）
+                cogs                 DOUBLE,        -- 营业成本
+                gross_profit         DOUBLE,        -- 毛利润
+                operating_profit     DOUBLE,        -- 营业利润
+                net_profit           DOUBLE,        -- 净利润
+                net_profit_parent    DOUBLE,        -- 归母净利润
+                total_assets         DOUBLE,        -- 总资产
+                total_liabilities    DOUBLE,        -- 总负债
+                equity               DOUBLE,        -- 所有者权益
+                asset_to_equity      DOUBLE,        -- 资产负债率推导值（= total_assets / equity）
+                operating_cash_flow  DOUBLE,        -- 经营活动现金流
+                investing_cash_flow  DOUBLE,        -- 投资活动现金流
+                financing_cash_flow  DOUBLE,        -- 筹资活动现金流
+                capex               DOUBLE,        -- 资本支出
+                roe_avg             DOUBLE,        -- 加权平均净资产收益率（Baostock roeAvg）
+                roa                 DOUBLE,        -- 总资产报酬率
+                roic                DOUBLE,        -- 投资资本回报率
+                gross_margin         DOUBLE,        -- 毛利率（gpMargin，金融机构为NULL）
+                net_margin           DOUBLE,        -- 净利率（npMargin）
+                created_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (ticker, report_period_end)
             )
         """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_fs_ticker ON financial_statement(ticker)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_fs_ann ON financial_statement(announcement_date)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_fs_avail ON financial_statement(available_date)")
 
-        # 交易日历
+        # ── 6. financial_factor 财务因子（选股用派生数据）───────────
+        # 由 financial_statement 派生，标准化为因子值
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS trade_calendar (
-                cal_date       DATE PRIMARY KEY,
-                is_open        BOOLEAN,
-                pretrade_date  DATE
+            CREATE TABLE IF NOT EXISTS financial_factor (
+                ticker                 VARCHAR,
+                report_period_end       DATE,
+                announcement_date       DATE,
+                available_date         DATE,
+                roe                   DOUBLE,         -- roe_avg（同比用前一年值）
+                roic                  DOUBLE,
+                gross_margin          DOUBLE,
+                asset_liability_ratio DOUBLE,         -- 资产负债率（= 1 - 1/asset_to_equity）
+                net_profit            DOUBLE,
+                operating_cash_flow   DOUBLE,
+                revenue_yoy           DOUBLE,         -- 营收同比增速
+                net_profit_yoy        DOUBLE,         -- 净利润同比增速
+                quality_score         DOUBLE,         -- 质量因子综合分（待实现）
+                growth_score          DOUBLE,         -- 成长因子综合分（待实现）
+                created_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (ticker, report_period_end)
             )
         """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_ff_ticker ON financial_factor(ticker)")
 
-        # 财务数据（Point-in-Time：含 ann_date）
+        # ── 7. share_structure 股本结构 ─────────────────────────────
+        # 来源：Baostock query_stock_struct
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS financial_data (
-                ts_code        VARCHAR,
-                ann_date       DATE,          -- 公告日（PIT 约束用）
-                end_date       DATE,          -- 报告期
-                report_type    VARCHAR,       -- 'Q1'/'Q2'/'Q3'/'Q4'
-                revenue        DOUBLE,
-                net_profit     DOUBLE,
-                total_assets   DOUBLE,
-                total_equity   DOUBLE,
-                total_mv       DOUBLE,
-                circ_mv        DOUBLE,
+            CREATE TABLE IF NOT EXISTS share_structure (
+                ticker             VARCHAR,
+                announcement_date  DATE,
+                report_period_end  DATE,
+                total_shares       DOUBLE,        -- 总股本（万股）
+                float_shares       DOUBLE,        -- 流通股本（万股）
+                float_ratio        DOUBLE,        -- 流通比例
+                share_type         VARCHAR,       -- share_type 类别：share_total / share_float
+                created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (ticker, announcement_date, share_type)
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_ss_ticker ON share_structure(ticker)")
+
+        # ── 8. company_status 公司状态（时间序列）────────────────────
+        # 记录公司状态变化时间点（上市/退市/停牌/ ST等）
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS company_status (
+                ticker              VARCHAR,
+                status_date         DATE,           -- 状态变化日期
+                listed_flag         BOOLEAN,         -- 是否上市
+                delisted_flag      BOOLEAN,         -- 是否退市
+                suspended_flag      BOOLEAN,         -- 是否停牌
+                st_status           BOOLEAN,          -- 是否ST
+                risk_warning_flag   BOOLEAN,         -- 是否风险警示
+                tradable_flag       BOOLEAN,         -- 是否可交易
+                created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (ticker, status_date)
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_cs_ticker ON company_status(ticker)")
+
+        # ── 9. index_membership 指数成分 ────────────────────────────
+        # 记录各指数当前成分股列表
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS index_membership (
+                index_code     VARCHAR,
+                ticker         VARCHAR,
+                in_date        DATE,
+                out_date       DATE,
+                source         VARCHAR,           -- csindex / sse / szse
+                created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (index_code, ticker)
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_im_ticker ON index_membership(ticker)")
+
+        # ── 10. valuation_daily 每日估值 ────────────────────────────
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS valuation_daily (
+                ticker         VARCHAR,
+                trade_date     DATE,
                 pe_ttm         DOUBLE,
                 pb             DOUBLE,
-                roe            DOUBLE,
-                roa            DOUBLE,
-                roic           DOUBLE,
-                gross_margin   DOUBLE,
-                debt_ratio     DOUBLE,
-                eps            DOUBLE,        -- 基本每股收益（_bs_profit_row / _ak_indicator_row 提供）
-                data_source    VARCHAR,       -- 数据来源标识（akshare / baostock）
-                PRIMARY KEY (ts_code, end_date, report_type)
+                ps_ttm         DOUBLE,
+                pcf_cf_ttm     DOUBLE,
+                total_mv       DOUBLE,
+                circ_mv        DOUBLE,
+                created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (ticker, trade_date)
             )
         """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_vd_ticker ON valuation_daily(ticker)")
 
-        # 市值数据（每日快照）
+        # ── 工具表：sync_progress（断点续传）─────────────────────────
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS daily_valuation (
-                ts_code       VARCHAR,
-                trade_date    DATE,
-                total_mv      DOUBLE,
-                circ_mv       DOUBLE,
-                pe_ttm        DOUBLE,
-                pb            DOUBLE,
-                ps_ttm        DOUBLE,
-                pcf_cf_ttm    DOUBLE,
-                PRIMARY KEY (ts_code, trade_date)
+            CREATE TABLE IF NOT EXISTS sync_progress (
+                ticker          VARCHAR NOT NULL,
+                table_name      VARCHAR NOT NULL,
+                last_sync_date  DATE,
+                last_sync_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                total_records   INTEGER DEFAULT 0,
+                status          VARCHAR DEFAULT 'ok',
+                error_msg       VARCHAR,
+                PRIMARY KEY (ticker, table_name)
             )
         """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_sp_date ON sync_progress(last_sync_date)")
 
-        # 数据更新日志
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS update_log (
-                id            INTEGER PRIMARY KEY,
-                table_name     VARCHAR,
-                ts_code       VARCHAR,
-                start_date    DATE,
-                end_date      DATE,
-                record_count  INTEGER,
-                update_time   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                status        VARCHAR,
-                error_message VARCHAR
-            )
-        """)
-
-        # 复权因子变化日志（用于检测分红/拆股）
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS adj_factor_log (
-                ts_code       VARCHAR,
-                trade_date    DATE,
-                adj_factor_old DOUBLE,
-                adj_factor_new DOUBLE,
-                change_ratio  DOUBLE,
-                detected_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (ts_code, trade_date)
-            )
-        """)
-
-        # 数据质量报警表
-        cur.execute("""
-            CREATE SEQUENCE IF NOT EXISTS seq_dqa_id START 1
-        """)
+        # ── 工具表：data_quality_alert ───────────────────────────────
+        cur.execute("CREATE SEQUENCE IF NOT EXISTS seq_dqa_id START 1")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS data_quality_alert (
-                id            INTEGER PRIMARY KEY DEFAULT nextval('seq_dqa_id'),
-                alert_type    VARCHAR,
-                ts_code       VARCHAR,
-                trade_date    DATE,
-                detail        VARCHAR,
-                created_at    TIMESTAMP DEFAULT NOW()
+                id           INTEGER PRIMARY KEY DEFAULT nextval('seq_dqa_id'),
+                alert_type   VARCHAR,
+                ticker       VARCHAR,
+                trade_date   DATE,
+                detail       VARCHAR,
+                created_at   TIMESTAMP DEFAULT NOW()
             )
         """)
 
-        # 索引
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_quotes_code ON daily_bar_adjusted(ts_code)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_quotes_date ON daily_bar_adjusted(trade_date)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_fin_ann ON financial_data(ann_date)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_val_date ON daily_valuation(trade_date)")
-
         conn.close()
-        DataEngine._schema_initialized.add(str(self.db_path.resolve()))
-        logger.info(f"DataEngine schema initialized: {self.db_path}")
 
-    # ──────────────────────────────────────────────────────────
-    # 查询接口
-    # ──────────────────────────────────────────────────────────
+        # ── v5 READ COMPATIBILITY VIEWS ─────────────────────────────
+        # 让旧读取代码（get_daily_raw/get_daily_adjusted等）无需修改即可工作
+        cur.execute("DROP VIEW IF EXISTS daily_bar_adjusted")
+        cur.execute("DROP VIEW IF EXISTS daily_bar_raw")
+        cur.execute("DROP VIEW IF EXISTS financial_data")
+        cur.execute("DROP VIEW IF EXISTS stock_basic_history")
+        cur.execute("DROP VIEW IF EXISTS st_status_history")
+
+        # daily_bar_adjusted VIEW：market_daily 列映射 + qfq 实时计算
+        cur.execute("""
+            CREATE VIEW daily_bar_adjusted AS
+            SELECT
+                ticker        AS ts_code,
+                trade_date,
+                open  * adj_factor  AS open,
+                high  * adj_factor  AS high,
+                low   * adj_factor  AS low,
+                close * adj_factor  AS close,
+                pre_close * adj_factor AS pre_close,
+                volume,
+                amount,
+                pct_chg,
+                turnover_rate AS turnover,
+                adj_factor,
+                adj_factor,
+                suspended_flag  AS is_suspend,
+                limit_up_flag   AS limit_up,
+                limit_down_flag AS limit_down
+            FROM market_daily
+        """)
+
+        # daily_bar_raw VIEW：market_daily 列映射
+        cur.execute("""
+            CREATE VIEW daily_bar_raw AS
+            SELECT
+                ticker        AS ts_code,
+                trade_date,
+                ticker        AS symbol,
+                open,
+                high,
+                low,
+                close,
+                volume,
+                amount,
+                pct_chg,
+                turnover_rate AS turnover,
+                adj_factor,
+                pre_close,
+                suspended_flag  AS is_suspend,
+                limit_up_flag   AS limit_up,
+                limit_down_flag AS limit_down,
+                'market_daily'  AS data_source
+            FROM market_daily
+        """)
+
+        # financial_data VIEW：financial_statement 列映射
+        cur.execute("""
+            CREATE VIEW financial_data AS
+            SELECT
+                ticker               AS ts_code,
+                announcement_date   AS ann_date,
+                report_period_end   AS end_date,
+                report_type,
+                revenue,
+                net_profit,
+                total_assets,
+                equity              AS total_equity,
+                roe_avg             AS roe,
+                NULL                AS eps,
+                gross_margin,
+                roic,
+                NULL                AS pe_ttm,
+                NULL                AS pb,
+                NULL                AS debt_ratio,
+                'financial_statement' AS data_source
+            FROM financial_statement
+        """)
+
+        # stock_basic_history VIEW：stock_basic 映射
+        cur.execute("""
+            CREATE VIEW stock_basic_history AS
+            SELECT
+                ticker       AS ts_code,
+                ticker       AS symbol,
+                name,
+                exchange,
+                NULL            AS area,
+                industry_level1 AS industry,
+                NULL            AS market,
+                listed_date  AS list_date,
+                delisted_date AS delist_date,
+                (delisted_date IS NOT NULL) AS is_delisted,
+                NULL            AS delist_reason,
+                NULL            AS board,
+                FALSE           AS is_suspend,
+                listed_date  AS eff_date,
+                NULL            AS end_date,
+                CURRENT_TIMESTAMP AS created_at
+            FROM stock_basic
+        """)
+
+        DataEngine._schema_initialized.add(str(self.db_path.resolve()))
+        logger.info(f"DataEngine v5 schema initialized: {self.db_path}")
+
     def query(self, sql: str, params: tuple = None) -> pd.DataFrame:
         """执行 SQL 查询（支持参数化查询防止SQL注入）"""
         if not HAS_DUCKDB:
@@ -1490,41 +1572,115 @@ class DataEngine:
 
     def _save_financial_data(self, df: pd.DataFrame):
         """
-        保存财务数据到数据库。
+        保存财务数据到 v5 financial_statement 表（v5 重构）
 
-        Bug Fix (2026-04-14):
-        - INSERT OR REPLACE 补全了 pe_ttm、pb、roic、debt_ratio 列，
-          此前只写了 12 列，导致这些字段即使在 _ak_indicator_row 中有值也写不进去
+        字段映射（旧 → v5）：
+          ts_code → ticker
+          ann_date → announcement_date
+          end_date → report_period_end
+          roe → roe_avg
+          debt_ratio → (不写入 financial_statement，由 financial_factor 派生)
+        同时写入 financial_factor 派生表（asset_liability_ratio = 1 - 1/asset_to_equity）
         """
         if df.empty or not HAS_DUCKDB:
             return
         with self.get_connection() as conn:
+            # ── 列名兼容映射 ─────────────────────────────────────────
+            df = df.copy()
+            if "ts_code" in df.columns and "ticker" not in df.columns:
+                df.rename(columns={"ts_code": "ticker"}, inplace=True)
+            if "ann_date" in df.columns and "announcement_date" not in df.columns:
+                df.rename(columns={"ann_date": "announcement_date"}, inplace=True)
+            if "end_date" in df.columns and "report_period_end" not in df.columns:
+                df.rename(columns={"end_date": "report_period_end"}, inplace=True)
+            if "roe" in df.columns and "roe_avg" not in df.columns:
+                df.rename(columns={"roe": "roe_avg"}, inplace=True)
+
+            # available_date = announcement_date（PIT：公告日当天可见）
+            if "available_date" not in df.columns:
+                df["available_date"] = df.get("announcement_date")
+
+            # report_type 默认 FY
+            if "report_type" not in df.columns:
+                df["report_type"] = "FY"
+
+            # 补充 v5 新字段默认值
+            for col in ["cogs", "gross_profit", "operating_profit", "net_profit_parent",
+                        "total_liabilities", "asset_to_equity", "operating_cash_flow",
+                        "investing_cash_flow", "financing_cash_flow", "capex",
+                        "roa", "roic", "gross_margin", "net_margin"]:
+                if col not in df.columns:
+                    df[col] = None
+
+            conn.register("tmp_fin", df)
             try:
                 conn.execute("""
-                    INSERT OR REPLACE INTO financial_data
-                    (ts_code, ann_date, end_date, report_type, revenue,
-                     net_profit, total_assets, total_equity, roe, roa,
-                     eps, gross_margin, pe_ttm, pb, roic, debt_ratio, data_source)
+                    INSERT INTO financial_statement
+                        (ticker, report_period_end, announcement_date, available_date,
+                         report_type, revenue, net_profit, total_assets, equity,
+                         roe_avg, roa, roic, gross_margin, net_margin,
+                         asset_to_equity, created_at, updated_at)
                     SELECT
-                        ts_code, ann_date, end_date, report_type,
-                        revenue, net_profit, total_assets, total_equity,
-                        roe, roa, eps, gross_margin,
-                        COALESCE(pe_ttm, 0.0), COALESCE(pb, 0.0),
-                        COALESCE(roic, 0.0), COALESCE(debt_ratio, 0.0),
-                        data_source
-                    FROM df
+                        ticker, report_period_end, announcement_date, available_date,
+                        COALESCE(report_type, 'FY'),
+                        COALESCE(revenue, 0),
+                        COALESCE(net_profit, 0),
+                        COALESCE(total_assets, 0),
+                        COALESCE(total_equity, 0),
+                        COALESCE(roe_avg, 0),
+                        COALESCE(roa, 0),
+                        COALESCE(roic, 0),
+                        gross_margin,
+                        net_margin,
+                        asset_to_equity,
+                        CURRENT_TIMESTAMP,
+                        CURRENT_TIMESTAMP
+                    FROM tmp_fin
+                    ON CONFLICT(ticker, report_period_end) DO UPDATE SET
+                        revenue       = excluded.revenue,
+                        net_profit    = excluded.net_profit,
+                        total_assets  = excluded.total_assets,
+                        equity        = excluded.equity,
+                        roe_avg       = excluded.roe_avg,
+                        roa           = excluded.roa,
+                        roic          = excluded.roic,
+                        gross_margin  = excluded.gross_margin,
+                        net_margin    = excluded.net_margin,
+                        asset_to_equity = excluded.asset_to_equity,
+                        updated_at    = CURRENT_TIMESTAMP
                 """)
             except Exception as e:
-                logger.warning(f"Financial data UPSERT failed, trying fallback: {e}")
-                # 字段不全时用原始列（列名来自白名单，非用户输入，DuckDB DF 绑定无需参数化）
-                cols = [c for c in df.columns if c in
-                        ["ts_code", "ann_date", "end_date", "report_type",
-                         "revenue", "net_profit", "roe", "roa", "eps",
-                         "total_assets", "total_equity", "gross_margin",
-                         "pe_ttm", "pb", "roic", "debt_ratio", "data_source"]]
-                if cols:
-                    col_str = ','.join(cols)
-                    conn.execute(f"INSERT OR IGNORE INTO financial_data ({col_str}) SELECT {col_str} FROM df")
+                logger.warning(f"financial_statement upsert failed: {e}")
+
+            # ── 同步写入 financial_factor（派生因子）─────────────────
+            try:
+                conn.execute("""
+                    INSERT INTO financial_factor
+                        (ticker, report_period_end, announcement_date, available_date,
+                         roe, roic, gross_margin, asset_liability_ratio, net_profit,
+                         created_at)
+                    SELECT
+                        ticker, report_period_end, announcement_date, available_date,
+                        roe_avg,
+                        roic,
+                        gross_margin,
+                        CASE WHEN asset_to_equity IS NOT NULL AND asset_to_equity > 1
+                             THEN 1.0 - 1.0 / asset_to_equity
+                             ELSE NULL END,
+                        net_profit,
+                        CURRENT_TIMESTAMP
+                    FROM tmp_fin
+                    ON CONFLICT(ticker, report_period_end) DO UPDATE SET
+                        roe           = excluded.roe,
+                        roic          = excluded.roic,
+                        gross_margin  = excluded.gross_margin,
+                        asset_liability_ratio = excluded.asset_liability_ratio,
+                        net_profit    = excluded.net_profit
+                """)
+            except Exception as e:
+                logger.debug(f"financial_factor sync skipped: {e}")
+
+            conn.execute("DROP VIEW IF EXISTS tmp_fin")
 
     def _get_local_stocks(self) -> pd.DataFrame:
         """
@@ -1615,30 +1771,74 @@ class DataEngine:
         df["end_date"] = pd.NaT
 
         with self.get_connection() as conn:
-            # ── 只写入 stock_basic_history（历史PIT层）──────────────────────
-            # UPSERT：同一 (ts_code, eff_date) 已存在则更新，不存在则插入
-            # 保留历史版本：不删除旧 eff_date 的记录
-            # 旧表 stock_basic 已废弃，不再写入
-            hist_cols = ["ts_code", "symbol", "name", "exchange", "board",
-                         "industry", "market", "list_date", "delist_date",
-                         "is_delisted", "eff_date", "end_date"]
-            hist_write_cols = [c for c in hist_cols if c in df.columns]
-            conn.register("tmp_hist", df[hist_write_cols])
+            # ── 写入 v5 stock_basic 表 ──────────────────────────────
+            # UPSERT：同一 ticker 已存在则更新，不存在则插入
+            # 列名映射：ts_code → ticker, industry → industry_level1
+            df_write = df.copy()
+            if "ts_code" in df_write.columns and "ticker" not in df_write.columns:
+                df_write.rename(columns={"ts_code": "ticker"}, inplace=True)
+            if "industry" in df_write.columns and "industry_level1" not in df_write.columns:
+                df_write.rename(columns={"industry": "industry_level1"}, inplace=True)
+            if "delist_date" in df_write.columns and "delisted_date" not in df_write.columns:
+                df_write.rename(columns={"delist_date": "delisted_date"}, inplace=True)
+            if "list_date" in df_write.columns and "listed_date" not in df_write.columns:
+                df_write.rename(columns={"list_date": "listed_date"}, inplace=True)
+            if "list_status" not in df_write.columns:
+                df_write["list_status"] = df_write["delisted_date"].apply(
+                    lambda d: "delisted" if pd.notna(d) else "listed"
+                )
+            if "is_financial" not in df_write.columns:
+                df_write["is_financial"] = False
+
+            sb_cols = ["ticker", "name", "exchange", "market", "industry_level1",
+                       "listed_date", "delisted_date", "list_status", "is_financial"]
+            sb_write = [c for c in sb_cols if c in df_write.columns]
+            conn.register("tmp_sb", df_write[sb_write])
             conn.execute(f"""
-                INSERT INTO stock_basic_history ({','.join(hist_write_cols)})
-                SELECT {','.join(hist_write_cols)} FROM tmp_hist
-                ON CONFLICT (ts_code, eff_date) DO UPDATE SET
-                    symbol       = excluded.symbol,
-                    name         = excluded.name,
-                    exchange     = excluded.exchange,
-                    board        = excluded.board,
-                    industry     = excluded.industry,
-                    market       = excluded.market,
-                    list_date    = excluded.list_date,
-                    delist_date  = excluded.delist_date,
-                    is_delisted  = excluded.is_delisted
+                INSERT INTO stock_basic ({','.join(sb_write)}, created_at, updated_at)
+                SELECT {','.join(sb_write)}, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                FROM tmp_sb
+                ON CONFLICT (ticker) DO UPDATE SET
+                    name           = excluded.name,
+                    exchange       = excluded.exchange,
+                    market         = excluded.market,
+                    industry_level1 = excluded.industry_level1,
+                    listed_date    = excluded.listed_date,
+                    delisted_date  = excluded.delisted_date,
+                    list_status    = excluded.list_status,
+                    updated_at     = CURRENT_TIMESTAMP
             """)
-            conn.execute("DROP VIEW IF EXISTS tmp_hist")
+            conn.execute("DROP VIEW IF EXISTS tmp_sb")
+
+            # ── 同步写入 company_status（状态快照）──────────────────
+            today_str = self._get_now().strftime("%Y-%m-%d")
+            try:
+                cs_df = df_write[["ticker"]].copy()
+                cs_df["status_date"] = pd.to_datetime(today_str)
+                cs_df["listed_flag"] = True
+                cs_df["delisted_flag"] = df_write.get("delisted_date", pd.Series([None]*len(df_write))).notna()
+                cs_df["suspended_flag"] = False
+                cs_df["st_status"] = False
+                cs_df["risk_warning_flag"] = False
+                cs_df["tradable_flag"] = ~cs_df["delisted_flag"]
+                conn.register("tmp_cs", cs_df)
+                conn.execute("""
+                    INSERT INTO company_status
+                        (ticker, status_date, listed_flag, delisted_flag,
+                         suspended_flag, st_status, risk_warning_flag, tradable_flag, created_at)
+                    SELECT ticker, status_date, listed_flag, delisted_flag,
+                           suspended_flag, st_status, risk_warning_flag, tradable_flag,
+                           CURRENT_TIMESTAMP
+                    FROM tmp_cs
+                    ON CONFLICT (ticker, status_date) DO UPDATE SET
+                        listed_flag    = excluded.listed_flag,
+                        delisted_flag  = excluded.delisted_flag,
+                        tradable_flag  = excluded.tradable_flag,
+                        updated_at     = CURRENT_TIMESTAMP
+                """)
+                conn.execute("DROP VIEW IF EXISTS tmp_cs")
+            except Exception as e:
+                logger.debug(f"company_status sync skipped: {e}")
 
         list_filled = df["list_date"].notna().sum() if "list_date" in df.columns else 0
         logger.info(
@@ -1787,12 +1987,12 @@ class DataEngine:
 
     def save_quotes(self, df: pd.DataFrame, mode: str = "append"):
         """
-        保存行情数据到 DuckDB（双表分层写入：daily_bar_raw + daily_bar_adjusted）
+        保存行情数据到 DuckDB（v5: 单表 market_daily）
 
-        数据分层原则（禁止混用）：
-        - daily_bar_raw：存原始未复权 OHLCV（raw_open/raw_high/raw_low/raw_close）
-          若无 raw_* 字段（旧接口兼容），则以 close（adj_factor=1 时等于原始价）降级写入
-        - daily_bar_adjusted：存复权价 OHLCV（open/high/low/close 已乘 adj_factor）
+        数据分层原则（v5）：
+        - market_daily: 存原始价 OHLCV + adj_factor
+          qfq = raw_close × adj_factor（由查询时实时计算，禁止在存储时预计算）
+          不再拆分 raw/adjusted 双表
 
         写入策略：使用 DuckDB register() + INSERT ... SELECT（批量，700x 快于逐行）
         同步更新 sync_progress 表（记录每只股票的最新同步日期，支持断点续跑）
@@ -1800,211 +2000,144 @@ class DataEngine:
         if df.empty or not HAS_DUCKDB:
             return
         with self.get_connection() as conn:
-            # ── 预处理：统一列名，确保必需字段存在 ──────────────────
             df = df.copy()
-            if "symbol" not in df.columns:
-                df["symbol"] = df["ts_code"].str.replace(r"\.[A-Z]+$", "", regex=True)
 
-            # 原始价字段：优先用 raw_* 前缀（fetch_single 新格式）
-            # 降级兼容：若无 raw_* 字段，假定传入 df 的 close 等字段就是原始价
-            has_raw_fields = "raw_close" in df.columns
+            # ── 列名兼容：ts_code → ticker ────────────────────────────
+            if "ts_code" in df.columns and "ticker" not in df.columns:
+                df.rename(columns={"ts_code": "ticker"}, inplace=True)
+
+            if "symbol" not in df.columns:
+                df["symbol"] = df["ticker"].str.replace(r"\.[A-Z]+$", "", regex=True)
+
+            # ── 原始价字段 ───────────────────────────────────────────
+            # 优先用 raw_* 前缀（fetch_single 新格式），否则降级用 close
+            has_raw = "raw_close" in df.columns
             for raw_col, std_col in [("raw_open", "open"), ("raw_high", "high"),
                                       ("raw_low", "low"), ("raw_close", "close")]:
                 if raw_col not in df.columns:
                     df[raw_col] = df.get(std_col, 0.0)
 
-            # ── 计算复权价格字段（qfq_close / hfq_close）─────────────
-            # 复权逻辑：复权价 = 原始价 × adj_factor
-            # qfq（前复权）：以最新日期为基准，向历史复权
-            # hfq（后复权）：以发行价为基准，向最新复权
-            # A股通常使用前复权（qfq），后复权与前复权价差仅在分红除权时显现
-            adj_factor = df.get("adj_factor", pd.Series([1.0] * len(df)))
-            adj_factor = adj_factor.fillna(1.0)
+            raw_close = df["raw_close"].fillna(0)
+            adj_factor = df.get("adj_factor", pd.Series([1.0] * len(df))).fillna(1.0)
 
-            if "raw_close" in df.columns:
-                raw_close = df["raw_close"].fillna(0)
-            else:
-                raw_close = df["close"].fillna(0)
-
-            df["qfq_close"] = raw_close * adj_factor
-            df["qfq_open"]  = df.get("raw_open", df.get("open", 0)) * adj_factor
-            df["qfq_high"]  = df.get("raw_high", df.get("high", 0)) * adj_factor
-            df["qfq_low"]   = df.get("raw_low", df.get("low", 0)) * adj_factor
-
-            # 后复权 = 前复权 × (当前前复权因子 / 历史前复权因子)
-            # 简化为：后复权 = 原始价 × (最新adj_factor / 当前adj_factor)
-            # 为简化实现，hfq 暂时等于 qfq（A股分红频率低，差异可忽略）
-            df["hfq_close"] = df["qfq_close"]
-            df["hfq_open"]  = df["qfq_open"]
-            df["hfq_high"]  = df["qfq_high"]
-            df["hfq_low"]   = df["qfq_low"]
-
+            # ── v5 必填字段补默认值 ──────────────────────────────────
             for col in ["open", "high", "low", "close", "pre_close"]:
                 if col not in df.columns:
                     df[col] = 0.0
             for col in ["volume", "amount"]:
                 if col not in df.columns:
                     df[col] = 0
-            for col in ["pct_chg", "turnover"]:
+            for col in ["pct_chg", "turnover_rate"]:
                 if col not in df.columns:
                     df[col] = 0.0
             if "adj_factor" not in df.columns:
                 df["adj_factor"] = 1.0
-            for col in ["is_suspend", "limit_up", "limit_down"]:
+            for col in ["suspended_flag", "limit_up_flag", "limit_down_flag", "is_new_stock"]:
                 if col not in df.columns:
                     df[col] = False
-            if "data_source" not in df.columns:
-                df["data_source"] = "unknown"
+            for col in ["total_market_cap", "float_market_cap"]:
+                if col not in df.columns:
+                    df[col] = 0.0
+            if "updated_at" not in df.columns:
+                df["updated_at"] = None
 
+            # ── 列名映射：旧 → v5 ───────────────────────────────────
+            rename = {
+                "is_suspend": "suspended_flag",
+                "is_suspend": "suspended_flag",
+                "limit_up": "limit_up_flag",
+                "limit_down": "limit_down_flag",
+            }
+            df.rename(columns=rename, inplace=True)
+
+            # ── mode=overwrite: 删除旧数据 ──────────────────────────
             if mode == "overwrite":
-                codes = df["ts_code"].unique().tolist()
+                codes = df["ticker"].unique().tolist()
                 dates_min = df["trade_date"].min()
                 dates_max = df["trade_date"].max()
                 if codes and not (pd.isna(dates_min) or pd.isna(dates_max)):
-                    codes_df = pd.DataFrame({"ts_code": codes})
-                    conn.register('tmp_codes', codes_df)
+                    codes_df = pd.DataFrame({"ticker": codes})
+                    conn.register("tmp_codes", codes_df)
                     conn.execute("""
-                        DELETE FROM daily_bar_adjusted
-                        WHERE ts_code IN (SELECT ts_code FROM tmp_codes)
-                        AND trade_date BETWEEN ? AND ?
-                    """, (dates_min, dates_max))
-                    conn.execute("""
-                        DELETE FROM daily_bar_raw
-                        WHERE ts_code IN (SELECT ts_code FROM tmp_codes)
+                        DELETE FROM market_daily
+                        WHERE ticker IN (SELECT ticker FROM tmp_codes)
                         AND trade_date BETWEEN ? AND ?
                     """, (dates_min, dates_max))
                     conn.execute("DROP VIEW IF EXISTS tmp_codes")
 
-            # 注册 DataFrame（批量写入核心优化）
-            conn.register('tmp_quotes', df)
-
-            # ── 1. 写入 daily_bar_raw（原始未复权价格）─────────────
-            # 使用 raw_open/raw_close 等原始价字段
+            # ── 写入 market_daily ────────────────────────────────────
+            conn.register("tmp_quotes", df)
             try:
                 conn.execute("""
-                    INSERT INTO daily_bar_raw
-                        (ts_code, trade_date, symbol,
-                         open, high, low, close,
-                         volume, amount, pct_chg, turnover, data_source)
-                    SELECT ts_code, trade_date, symbol,
+                    INSERT INTO market_daily
+                        (ticker, trade_date, open, high, low, close, pre_close,
+                         volume, amount, turnover_rate, total_market_cap, float_market_cap,
+                         adj_factor, suspended_flag, limit_up_flag, limit_down_flag,
+                         is_new_stock, created_at, updated_at)
+                    SELECT ticker, trade_date,
                            COALESCE(raw_open, open, 0),
                            COALESCE(raw_high, high, 0),
                            COALESCE(raw_low,  low,  0),
                            COALESCE(raw_close, close, 0),
-                           COALESCE(volume, 0),
-                           COALESCE(amount, 0),
-                           COALESCE(pct_chg, 0),
-                           COALESCE(turnover, 0),
-                           COALESCE(data_source, 'unknown')
-                    FROM tmp_quotes
-                    ON CONFLICT(ts_code, trade_date) DO UPDATE SET
-                        symbol     = excluded.symbol,
-                        open       = excluded.open,
-                        high       = excluded.high,
-                        low        = excluded.low,
-                        close      = excluded.close,
-                        volume     = excluded.volume,
-                        amount     = excluded.amount,
-                        pct_chg    = excluded.pct_chg,
-                        turnover   = excluded.turnover,
-                        data_source= excluded.data_source
-                """)
-            except Exception as e:
-                logger.warning(f"daily_bar_raw upsert failed: {e}")
-
-            # ── 2. 写入 daily_bar_adjusted（复权价格 + 原始价 + 复权因子）────────
-            # qfq_close = raw_close × adj_factor（复权价）
-            # daily_bar_adjusted.close = qfq_close（前复权价，作为默认复权价使用）
-            try:
-                conn.execute("""
-                    INSERT INTO daily_bar_adjusted
-                        (ts_code, trade_date, open, high, low, close, pre_close,
-                         volume, amount, pct_chg, turnover, adj_factor,
-                         qfq_open, qfq_high, qfq_low, qfq_close,
-                         hfq_open, hfq_high, hfq_low, hfq_close,
-                         is_suspend, limit_up, limit_down, data_source)
-                    SELECT ts_code, trade_date,
-                           COALESCE(open, 0),
-                           COALESCE(high, 0),
-                           COALESCE(low,  0),
-                           COALESCE(close, 0),
                            COALESCE(pre_close, 0),
                            COALESCE(volume, 0),
                            COALESCE(amount, 0),
-                           COALESCE(pct_chg, 0),
-                           COALESCE(turnover, 0),
+                           COALESCE(turnover_rate, 0),
+                           COALESCE(total_market_cap, 0),
+                           COALESCE(float_market_cap, 0),
                            COALESCE(adj_factor, 1.0),
-                           COALESCE(qfq_open, 0),
-                           COALESCE(qfq_high, 0),
-                           COALESCE(qfq_low,  0),
-                           COALESCE(qfq_close, 0),
-                           COALESCE(hfq_open, 0),
-                           COALESCE(hfq_high, 0),
-                           COALESCE(hfq_low,  0),
-                           COALESCE(hfq_close, 0),
-                           COALESCE(is_suspend, FALSE),
-                           COALESCE(limit_up, FALSE),
-                           COALESCE(limit_down, FALSE),
-                           COALESCE(data_source, 'unknown')
+                           COALESCE(suspended_flag, FALSE),
+                           COALESCE(limit_up_flag, FALSE),
+                           COALESCE(limit_down_flag, FALSE),
+                           COALESCE(is_new_stock, FALSE),
+                           CURRENT_TIMESTAMP,
+                           CURRENT_TIMESTAMP
                     FROM tmp_quotes
-                    ON CONFLICT(ts_code, trade_date) DO UPDATE SET
-                        open       = excluded.open,
-                        high       = excluded.high,
-                        low        = excluded.low,
-                        close      = excluded.close,
-                        pre_close  = excluded.pre_close,
-                        volume     = excluded.volume,
-                        amount     = excluded.amount,
-                        pct_chg    = excluded.pct_chg,
-                        turnover   = excluded.turnover,
-                        adj_factor = excluded.adj_factor,
-                        qfq_open   = excluded.qfq_open,
-                        qfq_high   = excluded.qfq_high,
-                        qfq_low    = excluded.qfq_low,
-                        qfq_close  = excluded.qfq_close,
-                        hfq_open   = excluded.hfq_open,
-                        hfq_high   = excluded.hfq_high,
-                        hfq_low    = excluded.hfq_low,
-                        hfq_close  = excluded.hfq_close,
-                        is_suspend = excluded.is_suspend,
-                        limit_up   = excluded.limit_up,
-                        limit_down = excluded.limit_down,
-                        data_source= excluded.data_source
+                    ON CONFLICT(ticker, trade_date) DO UPDATE SET
+                        open             = excluded.open,
+                        high             = excluded.high,
+                        low              = excluded.low,
+                        close            = excluded.close,
+                        pre_close        = excluded.pre_close,
+                        volume           = excluded.volume,
+                        amount           = excluded.amount,
+                        turnover_rate    = excluded.turnover_rate,
+                        total_market_cap = excluded.total_market_cap,
+                        float_market_cap = excluded.float_market_cap,
+                        adj_factor       = excluded.adj_factor,
+                        suspended_flag   = excluded.suspended_flag,
+                        limit_up_flag   = excluded.limit_up_flag,
+                        limit_down_flag = excluded.limit_down_flag,
+                        is_new_stock    = excluded.is_new_stock,
+                        updated_at       = CURRENT_TIMESTAMP
                 """)
             except Exception as e:
-                logger.warning(f"daily_bar_adjusted upsert failed: {e}")
+                logger.warning(f"market_daily upsert failed: {e}")
 
             conn.execute("DROP VIEW IF EXISTS tmp_quotes")
 
-            # ── 3. 更新 sync_progress（分表独立跟踪）────────────────
-            # 写入后，两张表独立跟踪各自的同步进度，
-            # 排障时可精确判断是 raw 层还是 adjusted 层出了问题。
+            # ── 更新 sync_progress（v5: ticker 列名）─────────────────
             try:
-                # 按股票聚合最新日期 + 记录数
-                agg = df.groupby("ts_code").agg(
+                agg = df.groupby("ticker").agg(
                     last_sync_date=("trade_date", "max"),
                     total_records=("trade_date", "count")
                 ).reset_index()
-
-                # 分别对 raw 和 adjusted 各写入一条进度记录
-                for table_name in ("daily_bar_raw", "daily_bar_adjusted"):
-                    prog = agg.copy()
-                    prog["table_name"] = table_name
-                    prog["status"]     = "ok"
-                    prog["error_msg"]  = None
-                    conn.register("tmp_progress", prog)
-                    conn.execute("""
-                        INSERT INTO sync_progress
-                            (ts_code, table_name, last_sync_date, total_records, status)
-                        SELECT ts_code, table_name, last_sync_date, total_records, status
-                        FROM tmp_progress
-                        ON CONFLICT (ts_code, table_name) DO UPDATE SET
-                            last_sync_date = GREATEST(sync_progress.last_sync_date, excluded.last_sync_date),
-                            total_records  = sync_progress.total_records + excluded.total_records,
-                            last_sync_at   = NOW(),
-                            status         = excluded.status
-                    """)
-                    conn.execute("DROP VIEW IF EXISTS tmp_progress")
+                agg["table_name"] = "market_daily"
+                agg["status"]     = "ok"
+                agg["error_msg"]  = None
+                conn.register("tmp_progress", agg)
+                conn.execute("""
+                    INSERT INTO sync_progress
+                        (ticker, table_name, last_sync_date, total_records, status)
+                    SELECT ticker, table_name, last_sync_date, total_records, status
+                    FROM tmp_progress
+                    ON CONFLICT (ticker, table_name) DO UPDATE SET
+                        last_sync_date = GREATEST(sync_progress.last_sync_date, excluded.last_sync_date),
+                        total_records  = sync_progress.total_records + excluded.total_records,
+                        last_sync_at   = NOW(),
+                        status         = excluded.status
+                """)
+                conn.execute("DROP VIEW IF EXISTS tmp_progress")
             except Exception as e:
                 logger.debug(f"sync_progress update skipped: {e}")
 
