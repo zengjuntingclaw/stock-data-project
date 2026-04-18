@@ -1473,7 +1473,7 @@ class DataEngine:
         # Bug Fix (2026-04-14): 原 AkShare stock_a_indicator_lg 早已不可用，
         # 替换为 Baostock query_history_k_data_plus 自带 pe/pb 列
         try:
-            from exchange_mapping import build_bs_code as _build_bs_code
+            from scripts.exchange_mapping import build_bs_code as _build_bs_code
             bs_code_val = _build_bs_code(sym6)
             end_date = self._get_now().strftime("%Y-%m-%d")
             start_date = self._get_now().replace(year=self._get_now().year - 1).strftime("%Y-%m-%d")
@@ -1853,141 +1853,31 @@ class DataEngine:
     # ──────────────────────────────────────────────────────────
     # 日线数据下载
     # ──────────────────────────────────────────────────────────
-    def fetch_single(self,
-                     symbol: str,
-                     start_date: str,
-                     end_date: str,
-                     adjust: Literal["qfq", ""] = "qfq") -> pd.DataFrame:
-        """
-        下载单只股票日线数据
-        
-        重要：同时下载原始价和复权价，分别存储。
-        - daily_bar_raw: 原始未复权OHLCV（所有数据的基础）
-        - daily_bar_adjusted: 复权价格（通过 adj_factor 在查询时计算，或直接用复权close）
-        
-        adjust 参数仅决定返回给调用方的 DataFrame 是否含复权价，
-        不影响原始价存储。
-        
-        Parameters
-        ----------
-        symbol : str
-            6位股票代码
-        start_date : str
-            开始日期，格式 YYYY-MM-DD
-        end_date : str
-            结束日期，格式 YYYY-MM-DD
-        adjust : 'qfq' | ''
-            复权方式（仅影响返回值，复权因子始终计算并存入 daily_bar_adjusted）
-        """
-        if not HAS_AKSHARE:
+        # 统一入口：AkShare优先，失败自动 fallback 到 Baostock
+        df, _ = self._fetch_single_with_retry(
+            symbol=symbol,
+            start_date=start_date,
+            end_date=end_date,
+            adjust=adjust,
+        )
+        if df.empty or "trade_date" not in df.columns:
             return pd.DataFrame()
 
-        try:
-            start_str = start_date.replace("-", "")
-            end_str = end_date.replace("-", "")
+        # save_quotes 需要 raw_* 前缀字段（原始未复权价）
+        for raw_col, std_col in [("raw_open", "open"), ("raw_high", "high"),
+                                  ("raw_low", "low"), ("raw_close", "close")]:
+            if raw_col not in df.columns and std_col in df.columns:
+                df[raw_col] = df[std_col].copy()
+        if "adj_factor" not in df.columns:
+            df["adj_factor"] = 1.0
+        if "pre_close" not in df.columns:
+            df["pre_close"] = df["close"].shift(1) if "close" in df.columns else 0.0
 
-            # ── 1. 始终下载原始价格（adjust=""）─────────────────────
-            df_raw = ak.stock_zh_a_hist(
-                symbol=symbol,
-                period="daily",
-                start_date=start_str,
-                end_date=end_str,
-                adjust=""
-            )
-            if df_raw.empty:
-                return pd.DataFrame()
+        # ts_code → ticker：save_quotes 统一使用 ticker
+        if "ts_code" in df.columns and "ticker" not in df.columns:
+            df.rename(columns={"ts_code": "ticker"}, inplace=True)
 
-            # 列名标准化
-            col_map = {
-                "日期": "trade_date", "开盘": "open", "收盘": "close",
-                "最高": "high", "最低": "low", "成交量": "volume",
-                "成交额": "amount", "涨跌幅": "pct_chg", "换手率": "turnover"
-            }
-            df_raw = df_raw.rename(columns=col_map)
-            df_raw["trade_date"] = pd.to_datetime(df_raw["trade_date"])
-            df_raw["ts_code"] = build_ts_code(symbol)
-            df_raw["pre_close"] = df_raw["close"].shift(1)
-            df_raw["is_suspend"] = df_raw["volume"] == 0
-            df_raw["data_source"] = "akshare"
-
-            # ── 2. 下载复权价格（用于计算 adj_factor）─────────────
-            adj_factor = pd.Series(1.0, index=df_raw.index)
-            df_close_adj = df_raw["close"].copy()  # 默认复权=原始
-            df_open_adj  = df_raw["open"].copy()
-            df_high_adj  = df_raw["high"].copy()
-            df_low_adj   = df_raw["low"].copy()
-            if adjust:
-                try:
-                    df_adj = ak.stock_zh_a_hist(
-                        symbol=symbol, period="daily",
-                        start_date=start_str, end_date=end_str, adjust="qfq"
-                    )
-                    if not df_adj.empty:
-                        adj_col_map = {
-                            "日期": "td2", "开盘": "open_adj", "收盘": "close_adj",
-                            "最高": "high_adj", "最低": "low_adj"
-                        }
-                        df_adj = df_adj.rename(columns=adj_col_map)
-                        df_adj["td2"] = pd.to_datetime(df_adj["td2"])
-                        df_raw = df_raw.merge(
-                            df_adj[["td2", "open_adj", "high_adj", "low_adj", "close_adj"]],
-                            left_on="trade_date", right_on="td2",
-                            how="left"
-                        )
-                        # adj_factor = adj_close / raw_close（复权因子 = 复权收盘 / 原始收盘）
-                        adj_factor = (df_raw["close_adj"] / df_raw["close"].replace(0, np.nan)).fillna(1.0)
-                        adj_factor = adj_factor.replace([np.inf, -np.inf], 1.0)
-                        # 保存复权价格序列
-                        df_close_adj = df_raw["close_adj"].fillna(df_raw["close"])
-                        df_open_adj  = df_raw["open_adj"].fillna(df_raw["open"])
-                        df_high_adj  = df_raw["high_adj"].fillna(df_raw["high"])
-                        df_low_adj   = df_raw["low_adj"].fillna(df_raw["low"])
-                        df_raw.drop(
-                            columns=["td2", "open_adj", "high_adj", "low_adj", "close_adj"],
-                            inplace=True, errors="ignore"
-                        )
-                except Exception as e:
-                    logger.debug(f"adj_factor calc failed for {symbol}: {e}")
-
-            df_raw["adj_factor"] = adj_factor
-            # ── 原始价保存到 _raw_ 字段（供 save_quotes 写入 daily_bar_raw）──
-            df_raw["raw_open"]  = df_raw["open"].copy()
-            df_raw["raw_high"]  = df_raw["high"].copy()
-            df_raw["raw_low"]   = df_raw["low"].copy()
-            df_raw["raw_close"] = df_raw["close"].copy()
-            # ── 复权价覆盖 open/high/low/close（供 save_quotes 写入 daily_bar_adjusted）──
-            df_raw["open"]  = df_open_adj
-            df_raw["high"]  = df_high_adj
-            df_raw["low"]   = df_low_adj
-            df_raw["close"] = df_close_adj
-            # 复权 pct_chg（用复权价重新计算）
-            if adjust == "qfq":
-                df_raw["pct_chg"] = (
-                    df_raw["close"] / df_raw["pre_close"].replace(0, np.nan) - 1
-                ) * 100
-
-            # ── 3. 涨跌停判定（基于原始价）─────────────────────────
-            df_raw = self._apply_limit_flags(df_raw, symbol)
-
-            # ── 4. 验证 ──────────────────────────────────────────
-            val = self.validator.validate(df_raw)
-            if not val["ok"]:
-                logger.warning(f"Data validation issues for {symbol}: {val['issues']}")
-
-            # ── 5. 返回完整 DataFrame（含 raw_*/adj 双字段）─────────
-            # save_quotes() 依赖：
-            #   - raw_open/raw_high/raw_low/raw_close → 写入 daily_bar_raw
-            #   - open/high/low/close（复权价）       → 写入 daily_bar_adjusted
-            cols = ["ts_code", "trade_date",
-                    "raw_open", "raw_high", "raw_low", "raw_close",  # 原始价
-                    "open", "high", "low", "close",                  # 复权价
-                    "pre_close", "volume", "amount", "pct_chg", "turnover",
-                    "adj_factor", "is_suspend", "limit_up", "limit_down", "data_source"]
-            return df_raw[[c for c in cols if c in df_raw.columns]]
-
-        except (ValueError, KeyError, RuntimeError, ConnectionError) as e:
-            logger.error(f"Failed to fetch {symbol}: {e}")
-            return pd.DataFrame()
+        return df
 
     def save_quotes(self, df: pd.DataFrame, mode: str = "append"):
         """
@@ -2447,7 +2337,7 @@ class DataEngine:
             return pd.DataFrame()
         try:
             sym6 = str(symbol).zfill(6)
-            from exchange_mapping import build_bs_code as _build_bs_code
+            from scripts.exchange_mapping import build_bs_code as _build_bs_code
             bs_code = _build_bs_code(sym6)
 
             with self._bs_lock:
@@ -2510,7 +2400,7 @@ class DataEngine:
                 df_raw["adj_factor"] = 1.0
 
             # 基础字段
-            df_raw["ts_code"] = build_ts_code(sym6)
+            df_raw["ticker"] = build_ts_code(sym6)
             df_raw["pre_close"] = df_raw["qfq_close"].shift(1)
             df_raw["pct_chg"] = (
                 df_raw["qfq_close"] / df_raw["pre_close"].replace(0, np.nan) - 1
@@ -2526,7 +2416,7 @@ class DataEngine:
             # raw_* -> 存入 daily_bar_raw（原始未复权价格）
             # qfq_* -> 存入 daily_bar_adjusted（前复权价格）
             result = pd.DataFrame({
-                "ts_code":     df_raw["ts_code"],
+                "ticker":      df_raw["ticker"],
                 "trade_date":  df_raw["trade_date"],
                 # raw 层（原始未复权）
                 "raw_open":    df_raw["open"],
@@ -2841,7 +2731,7 @@ class DataEngine:
                 for sym in symbols[:20]:  # 抽样20只
                     sym6 = str(sym).zfill(6)
                     # 统一使用 exchange_mapping.build_bs_code()，修复：688/920xxx/4xxx/8xxx 全部正确
-                    from exchange_mapping import build_bs_code as _build_bs_code
+                    from scripts.exchange_mapping import build_bs_code as _build_bs_code
                     bs_code = _build_bs_code(sym6)
 
                     # AkShare 数据（参数化查询防止SQL注入）
