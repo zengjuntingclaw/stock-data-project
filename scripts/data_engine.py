@@ -282,7 +282,7 @@ class DataEngine:
             'adj_factor_log', 'update_log',
         ]
         for tbl in old_tables:
-            cur.execute(f"DROP TABLE IF EXISTS {tbl}")
+            cur.execute(f"DROP VIEW IF EXISTS {tbl}")
         logger.debug(f"旧口径残留表已清理: {old_tables}")
 
         # ── 1. stock_basic 证券主表 ─────────────────────────────────
@@ -315,11 +315,11 @@ class DataEngine:
         cur.execute("""
             CREATE TABLE IF NOT EXISTS trading_calendar (
                 cal_date       DATE PRIMARY KEY,
-                is_open        BOOLEAN,          -- TRUE=交易日
-                pretrade_date  DATE              -- 最近前一个交易日
+                is_trading_day BOOLEAN,          -- TRUE=交易日
+                prev_trade_date DATE              -- 最近前一个交易日
             )
         """)
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_tc_is_open ON trading_calendar(is_open)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_tc_is_trading_day ON trading_calendar(is_trading_day)")
 
         # ── 3. market_daily 日行情（原始价层）─────────────────────────
         # 存储 raw_close + adj_factor，qfq 由 market_daily.adj_factor × raw_close 实时计算
@@ -531,7 +531,6 @@ class DataEngine:
             )
         """)
 
-        conn.close()
 
         # ── v5 READ COMPATIBILITY VIEWS ─────────────────────────────
         # 让旧读取代码（get_daily_raw/get_daily_adjusted等）无需修改即可工作
@@ -554,13 +553,14 @@ class DataEngine:
                 pre_close * adj_factor AS pre_close,
                 volume,
                 amount,
-                pct_chg,
                 turnover_rate AS turnover,
-                adj_factor,
                 adj_factor,
                 suspended_flag  AS is_suspend,
                 limit_up_flag   AS limit_up,
-                limit_down_flag AS limit_down
+                limit_down_flag AS limit_down,
+                CASE WHEN pre_close IS NOT NULL AND pre_close != 0
+                     THEN (close - pre_close) / pre_close * 100.0
+                     ELSE 0.0 END AS pct_chg
             FROM market_daily
         """)
 
@@ -577,14 +577,16 @@ class DataEngine:
                 close,
                 volume,
                 amount,
-                pct_chg,
                 turnover_rate AS turnover,
                 adj_factor,
                 pre_close,
                 suspended_flag  AS is_suspend,
                 limit_up_flag   AS limit_up,
                 limit_down_flag AS limit_down,
-                'market_daily'  AS data_source
+                'market_daily'  AS data_source,
+                CASE WHEN pre_close IS NOT NULL AND pre_close != 0
+                     THEN (close - pre_close) / pre_close * 100.0
+                     ELSE 0.0 END AS pct_chg
             FROM market_daily
         """)
 
@@ -630,12 +632,14 @@ class DataEngine:
                 FALSE           AS is_suspend,
                 listed_date  AS eff_date,
                 NULL            AS end_date,
-                CURRENT_TIMESTAMP AS created_at
+                NOW() AS created_at
             FROM stock_basic
         """)
 
         DataEngine._schema_initialized.add(str(self.db_path.resolve()))
         logger.info(f"DataEngine v5 schema initialized: {self.db_path}")
+
+        conn.close()
 
     def query(self, sql: str, params: tuple = None) -> pd.DataFrame:
         """执行 SQL 查询（支持参数化查询防止SQL注入）"""
@@ -1633,8 +1637,8 @@ class DataEngine:
                         gross_margin,
                         net_margin,
                         asset_to_equity,
-                        CURRENT_TIMESTAMP,
-                        CURRENT_TIMESTAMP
+                        NOW(),
+                        NOW()
                     FROM tmp_fin
                     ON CONFLICT(ticker, report_period_end) DO UPDATE SET
                         revenue       = excluded.revenue,
@@ -1647,7 +1651,7 @@ class DataEngine:
                         gross_margin  = excluded.gross_margin,
                         net_margin    = excluded.net_margin,
                         asset_to_equity = excluded.asset_to_equity,
-                        updated_at    = CURRENT_TIMESTAMP
+                        updated_at    = NOW()
                 """)
             except Exception as e:
                 logger.warning(f"financial_statement upsert failed: {e}")
@@ -1668,7 +1672,7 @@ class DataEngine:
                              THEN 1.0 - 1.0 / asset_to_equity
                              ELSE NULL END,
                         net_profit,
-                        CURRENT_TIMESTAMP
+                        NOW()
                     FROM tmp_fin
                     ON CONFLICT(ticker, report_period_end) DO UPDATE SET
                         roe           = excluded.roe,
@@ -1796,7 +1800,7 @@ class DataEngine:
             conn.register("tmp_sb", df_write[sb_write])
             conn.execute(f"""
                 INSERT INTO stock_basic ({','.join(sb_write)}, created_at, updated_at)
-                SELECT {','.join(sb_write)}, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                SELECT {','.join(sb_write)}, NOW(), NOW()
                 FROM tmp_sb
                 ON CONFLICT (ticker) DO UPDATE SET
                     name           = excluded.name,
@@ -1806,7 +1810,7 @@ class DataEngine:
                     listed_date    = excluded.listed_date,
                     delisted_date  = excluded.delisted_date,
                     list_status    = excluded.list_status,
-                    updated_at     = CURRENT_TIMESTAMP
+                    updated_at     = NOW()
             """)
             conn.execute("DROP VIEW IF EXISTS tmp_sb")
 
@@ -1828,13 +1832,13 @@ class DataEngine:
                          suspended_flag, st_status, risk_warning_flag, tradable_flag, created_at)
                     SELECT ticker, status_date, listed_flag, delisted_flag,
                            suspended_flag, st_status, risk_warning_flag, tradable_flag,
-                           CURRENT_TIMESTAMP
+                           NOW()
                     FROM tmp_cs
                     ON CONFLICT (ticker, status_date) DO UPDATE SET
                         listed_flag    = excluded.listed_flag,
                         delisted_flag  = excluded.delisted_flag,
                         tradable_flag  = excluded.tradable_flag,
-                        updated_at     = CURRENT_TIMESTAMP
+                        updated_at     = NOW()
                 """)
                 conn.execute("DROP VIEW IF EXISTS tmp_cs")
             except Exception as e:
@@ -2090,8 +2094,8 @@ class DataEngine:
                            COALESCE(limit_up_flag, FALSE),
                            COALESCE(limit_down_flag, FALSE),
                            COALESCE(is_new_stock, FALSE),
-                           CURRENT_TIMESTAMP,
-                           CURRENT_TIMESTAMP
+                           NOW(),
+                           NOW()
                     FROM tmp_quotes
                     ON CONFLICT(ticker, trade_date) DO UPDATE SET
                         open             = excluded.open,
@@ -2109,7 +2113,7 @@ class DataEngine:
                         limit_up_flag   = excluded.limit_up_flag,
                         limit_down_flag = excluded.limit_down_flag,
                         is_new_stock    = excluded.is_new_stock,
-                        updated_at       = CURRENT_TIMESTAMP
+                        updated_at       = NOW()
                 """)
             except Exception as e:
                 logger.warning(f"market_daily upsert failed: {e}")
@@ -2237,7 +2241,7 @@ class DataEngine:
         if ts_code:
             prog = self.query("""
                 SELECT last_sync_date FROM sync_progress
-                WHERE ts_code = ? AND table_name = 'daily_bar_raw'
+                WHERE ticker = ? AND table_name = 'market_daily'
                 AND status = 'ok'
             """, (ts_code,))
             if not prog.empty and not pd.isna(prog.iloc[0, 0]):
@@ -3681,8 +3685,8 @@ class DataEngine:
     def get_previous_trade_date(self, trade_date: str) -> Optional[str]:
         """获取指定日期的前一个交易日"""
         df = self.query("""
-            SELECT cal_date FROM trade_calendar
-            WHERE is_open = TRUE
+            SELECT cal_date FROM trading_calendar
+            WHERE is_trading_day = TRUE
             AND cal_date < ?
             ORDER BY cal_date DESC
             LIMIT 1
@@ -3830,7 +3834,7 @@ class DataEngine:
     def sync_calendar(self, start_year: int = 2018, end_year: int = None):
         """同步交易日历（网络不可用时跳过，使用本地已有数据）"""
         # 检查本地是否已有日历数据，有则跳过
-        existing = self.query("SELECT COUNT(*) FROM trade_calendar WHERE is_open=TRUE")
+        existing = self.query("SELECT COUNT(*) FROM trading_calendar WHERE is_trading_day=TRUE")
         if existing.iloc[0, 0] > 100:
             logger.info(f"Calendar exists ({existing.iloc[0, 0]} days), skip sync")
             return
@@ -3843,7 +3847,7 @@ class DataEngine:
         end_year = end_year or self._get_now().year
         with self.get_connection() as conn:
             cal = ak.tool_trade_date_hist_sina()
-            cal.columns = ["cal_date", "is_open"]
+            cal.columns = ["cal_date", "is_trading_day"]
             cal["cal_date"] = pd.to_datetime(cal["cal_date"])
             cal["pretrade_date"] = None
             import os as _os
@@ -3860,7 +3864,7 @@ class DataEngine:
                         end_date: str = None) -> List[str]:
         """获取交易日列表"""
         params = []
-        sql = "SELECT cal_date FROM trade_calendar WHERE is_open = TRUE"
+        sql = "SELECT cal_date FROM trading_calendar WHERE is_trading_day = TRUE"
         if start_date:
             sql += " AND cal_date >= ?"
             params.append(start_date)

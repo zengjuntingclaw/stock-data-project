@@ -61,12 +61,5 @@ class TestTimeMock(unittest.TestCase):
         )
         self.assertEqual(state.created_at, '2026-04-10T00:00:00')
 
-    def test_data_consistency_checker_get_now_mockable(self):
-        """data_consistency_checker 已合并到 pipeline_data_engine.QualityEngine，不再单独导出 _get_now"""
-        # 旧模块已合并，该测试已过时；验证 data_consistency_checker 可导入即可
-        import scripts.data_consistency_checker as dcc
-        self.assertIsNotNone(dcc)
 
-
-if __name__ == '__main__':
-    unittest.main(verbosity=2)
+    # [deleted: test_data_consistency_checker_get_now_mockable - 模块已删除]

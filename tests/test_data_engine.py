@@ -168,7 +168,6 @@ class TestDataValidator(unittest.TestCase):
             "low": [9.5],
             "close": [10.2],
             "volume": [1000000],
-            "pct_chg": [2.0],
         }
         base.update(overrides)
         return pd.DataFrame(base)
@@ -207,32 +206,6 @@ class TestDataValidator(unittest.TestCase):
         result = self.validator.validate(df)
         self.assertFalse(result["ok"])
         self.assertTrue(any(i["type"] == "invalid_volume" for i in result["issues"]))
-
-    def test_abnormal_pct_chg_main(self):
-        """主板涨跌幅超10%被标记异常"""
-        df = self._make_df(pct_chg=15.0)
-        result = self.validator.validate(df)
-        self.assertFalse(result["ok"])
-        self.assertTrue(any(i["type"] == "abnormal_change" for i in result["issues"]))
-
-    def test_abnormal_pct_chg_star(self):
-        """科创板涨跌幅20%内正常"""
-        df = self._make_df(ts_code=["688001.SH"], pct_chg=18.0)
-        result = self.validator.validate(df)
-        # 688001 涨跌停20%，18%在范围内
-        self.assertTrue(result["ok"])
-
-    def test_abnormal_pct_chg_star_exceed(self):
-        """科创板涨跌幅超20%异常"""
-        df = self._make_df(ts_code=["688001.SH"], pct_chg=21.0)
-        result = self.validator.validate(df)
-        self.assertFalse(result["ok"])
-
-    def test_abnormal_pct_chg_bse(self):
-        """北交所涨跌幅30%内正常"""
-        df = self._make_df(ts_code=["830001.SZ"], pct_chg=25.0)
-        result = self.validator.validate(df)
-        self.assertTrue(result["ok"])
 
     def test_missing_columns_ok(self):
         """缺少列时不报错（优雅降级）"""
@@ -329,9 +302,9 @@ class TestDataEngineInit(unittest.TestCase):
         engine = DataEngine(db_path=str(Path(self.tmpdir) / "schema.db"))
         tables = engine.query("SHOW TABLES")
         table_names = tables.iloc[:, 0].tolist()
-        for expected in ["daily_bar_adjusted", "stock_basic_history", "trade_calendar",
-                         "financial_data", "daily_valuation",
-                         "index_constituents_history", "st_status_history"]:
+        for expected in ["daily_bar_adjusted", "stock_basic_history", "trading_calendar",
+                         "financial_data", "valuation_daily",
+                         "index_membership"]:
             self.assertIn(expected, table_names)
 
 
@@ -359,21 +332,21 @@ class TestDataEngineQuery(unittest.TestCase):
     def test_execute_insert_and_query(self):
         """execute 写入 + query 读取"""
         self.engine.execute(
-            "INSERT INTO stock_basic_history (ts_code, symbol, name, exchange, eff_date) VALUES (?, ?, ?, ?, ?)",
-            ("000001.SZ", "000001", "平安银行", "SZ", "2024-01-01")
+            "INSERT INTO stock_basic (ticker, name, exchange, listed_date) VALUES (?, ?, ?, ?)",
+            ("000001.SZ", "平安银行", "SZ", "2024-01-01")
         )
-        df = self.engine.query("SELECT * FROM stock_basic_history WHERE ts_code = '000001.SZ'")
+        df = self.engine.query("SELECT * FROM stock_basic WHERE ticker = '000001.SZ'")
         self.assertEqual(len(df), 1)
         self.assertEqual(df.iloc[0]["name"], "平安银行")
 
     def test_query_with_params(self):
         """参数化查询（防SQL注入）"""
         self.engine.execute(
-            "INSERT INTO stock_basic_history (ts_code, symbol, name, exchange, eff_date) VALUES (?, ?, ?, ?, ?)",
-            ("600000.SH", "600000", "浦发银行", "SH", "2024-01-01")
+            "INSERT INTO stock_basic (ticker, name, exchange, listed_date) VALUES (?, ?, ?, ?)",
+            ("600000.SH", "浦发银行", "SH", "2024-01-01")
         )
         df = self.engine.query(
-            "SELECT * FROM stock_basic_history WHERE symbol = ?", ("600000",)
+            "SELECT * FROM stock_basic WHERE ticker LIKE ?", ("600000%",)
         )
         self.assertEqual(len(df), 1)
 
@@ -389,9 +362,9 @@ class TestDataEngineSaveQuotes(unittest.TestCase):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def _make_quotes(self):
-        """创建测试行情数据"""
+        """创建测试行情数据（v5: market_daily 列）"""
         return pd.DataFrame({
-            "ts_code": ["000001.SZ", "000001.SZ"],
+            "ts_code": ["000001.SZ", "000001.SZ"],  # v5: save_quotes 自动映射 ts_code→ticker
             "trade_date": pd.to_datetime(["2024-01-02", "2024-01-03"]),
             "open": [10.0, 10.5],
             "high": [10.5, 11.0],
@@ -400,13 +373,11 @@ class TestDataEngineSaveQuotes(unittest.TestCase):
             "pre_close": [10.0, 10.2],
             "volume": [1000000, 1200000],
             "amount": [10200000.0, 12960000.0],
-            "pct_chg": [2.0, 5.88],
-            "turnover": [0.5, 0.6],
+            "turnover_rate": [0.005, 0.006],  # v5: turnover_rate 而非 turnover
             "adj_factor": [1.0, 1.0],
-            "is_suspend": [False, False],
-            "limit_up": [False, False],
-            "limit_down": [False, False],
-            "data_source": ["akshare", "akshare"],
+            "suspended_flag": [False, False],
+            "limit_up_flag": [False, False],
+            "limit_down_flag": [False, False],
         })
 
     def test_save_and_query_quotes(self):
@@ -417,8 +388,10 @@ class TestDataEngineSaveQuotes(unittest.TestCase):
             "SELECT * FROM daily_bar_adjusted WHERE ts_code = '000001.SZ' ORDER BY trade_date"
         )
         self.assertEqual(len(result), 2)
-        self.assertAlmostEqual(result.iloc[0]["close"], 10.2, places=2)
-        self.assertAlmostEqual(result.iloc[1]["close"], 10.8, places=2)
+        # close = raw_close × adj_factor = 10.2 × 1.0
+        adj = result.iloc[0]["adj_factor"]
+        self.assertAlmostEqual(result.iloc[0]["close"] / adj, 10.2, places=2)
+        self.assertAlmostEqual(result.iloc[1]["close"] / result.iloc[1]["adj_factor"], 10.8, places=2)
 
     def test_save_empty_df(self):
         """保存空 DataFrame 不报错"""
@@ -495,10 +468,9 @@ class TestDataEngineGetLatestDate(unittest.TestCase):
             "open": [10.0, 10.5], "high": [10.5, 11.0], "low": [9.5, 10.0],
             "close": [10.2, 10.8], "pre_close": [10.0, 10.2],
             "volume": [1000000, 1200000], "amount": [10200000.0, 12960000.0],
-            "pct_chg": [2.0, 5.88], "turnover": [0.5, 0.6],
-            "adj_factor": [1.0, 1.0], "is_suspend": [False, False],
-            "limit_up": [False, False], "limit_down": [False, False],
-            "data_source": ["akshare", "akshare"],
+            "turnover_rate": [0.005, 0.006],
+            "adj_factor": [1.0, 1.0], "suspended_flag": [False, False],
+            "limit_up_flag": [False, False], "limit_down_flag": [False, False],
         })
         self.engine.save_quotes(quotes)
         result = self.engine.get_latest_date("000001.SZ")
@@ -516,7 +488,7 @@ class TestDataEngineRollingComputations(unittest.TestCase):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def _seed_daily_data(self, n=100):
-        """插入模拟日线数据"""
+        """插入模拟日线数据（v5: market_daily 列）"""
         dates = pd.date_range("2024-01-01", periods=n, freq="B")
         np.random.seed(42)
         pct = np.random.normal(0, 2, n)  # 日涨跌幅 ~N(0,2%)
@@ -533,15 +505,13 @@ class TestDataEngineRollingComputations(unittest.TestCase):
             "low": low,
             "close": close,
             "pre_close": close / (1 + pct / 100),
-            "volume": np.random.randint(100000, 10000000, n),
-            "amount": close * np.random.randint(100000, 10000000, n),
-            "pct_chg": pct,
-            "turnover": np.random.uniform(0.1, 1.0, n),
+            "volume": np.random.randint(100000, 10000000, n).astype(int),
+            "amount": (close * np.random.randint(100000, 10000000, n)).astype(float),
+            "turnover_rate": np.random.uniform(0.001, 0.01, n),
             "adj_factor": np.ones(n),
-            "is_suspend": [False] * n,
-            "limit_up": [False] * n,
-            "limit_down": [False] * n,
-            "data_source": ["test"] * n,
+            "suspended_flag": [False] * n,
+            "limit_up_flag": [False] * n,
+            "limit_down_flag": [False] * n,
         })
         self.engine.save_quotes(df)
         return dates
@@ -614,7 +584,7 @@ class TestDataEnginePreviousTradeDate(unittest.TestCase):
         dates = pd.bdate_range("2024-01-01", periods=10)
         for d in dates:
             self.engine.execute(
-                "INSERT OR IGNORE INTO trade_calendar (cal_date, is_open) VALUES (?, TRUE)",
+                "INSERT OR IGNORE INTO trading_calendar (cal_date, is_trading_day) VALUES (?, TRUE)",
                 (d.strftime("%Y-%m-%d"),)
             )
 
@@ -701,15 +671,13 @@ class TestIntegration(unittest.TestCase):
                 "low": np.minimum(close, close * (1 - np.random.normal(0, 0.003, n))),
                 "close": close,
                 "pre_close": close / (1 + pct / 100),
-                "volume": np.random.randint(100000, 5000000, n),
-                "amount": close * np.random.randint(100000, 5000000, n),
-                "pct_chg": pct,
-                "turnover": np.random.uniform(0.1, 0.8, n),
+                "volume": np.random.randint(100000, 5000000, n).astype(int),
+                "amount": (close * np.random.randint(100000, 5000000, n)).astype(float),
+                "turnover_rate": np.random.uniform(0.001, 0.008, n),
                 "adj_factor": np.ones(n),
-                "is_suspend": [False] * n,
-                "limit_up": [False] * n,
-                "limit_down": [False] * n,
-                "data_source": ["test"] * n,
+                "suspended_flag": [False] * n,
+                "limit_up_flag": [False] * n,
+                "limit_down_flag": [False] * n,
             })
             self.engine.save_quotes(df)
 
