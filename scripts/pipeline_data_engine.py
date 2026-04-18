@@ -53,6 +53,12 @@ import numpy as np
 
 from loguru import logger
 
+# 数据范围约束
+try:
+    from scripts.data_scope import enforce_scope, ScopeViolationError, ScopeConfig
+except (ModuleNotFoundError, ImportError):
+    from data_scope import enforce_scope, ScopeViolationError, ScopeConfig
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 内部模块导入（统一后的模块）
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1177,8 +1183,10 @@ class PipelineDataEngine:
         use_cache: bool = True
     ) -> pd.DataFrame:
         """获取原始行情（统一入口）"""
-        start = start or self._start_date
-        end = end or datetime.now().strftime("%Y-%m-%d")
+        # 数据范围约束校验（自动裁剪日期范围）
+        clamped_start, clamped_end = enforce_scope(ts_code, start, end)
+        start = clamped_start
+        end = clamped_end
 
         # 1. 尝试从本地读取
         local_df = self.storage.read_daily(ts_code, start, end, "daily_bar_raw")
@@ -1233,8 +1241,10 @@ class PipelineDataEngine:
         table: str = "daily_bar_raw"
     ) -> Dict:
         """同步单只股票数据"""
-        start = start or self._start_date
-        end = end or datetime.now().strftime("%Y-%m-%d")
+        # 数据范围约束校验（自动裁剪日期范围）
+        clamped_start, clamped_end = enforce_scope(ts_code, start, end)
+        start = clamped_start
+        end = clamped_end
 
         # 检查断点
         checkpoint = self.storage.get_checkpoint(ts_code, table)
@@ -1268,7 +1278,22 @@ class PipelineDataEngine:
         end: Optional[str] = None,
         max_workers: int = 4
     ) -> Dict:
-        """批量同步"""
+        """批量同步（受 data_scope.yaml 约束）"""
+        # 数据范围约束预校验
+        clamped_start, clamped_end = enforce_scope(ts_codes[0] if ts_codes else None, start, end)
+        if clamped_start != (start or self._start_date) or clamped_end != (end or datetime.now().strftime("%Y-%m-%d")):
+            logger.warning(f"[Pipeline] batch_sync 日期范围已被裁剪: {start}→{clamped_start} / {end}→{clamped_end}")
+
+        # 不在白名单的股票提前拦截
+        cfg = ScopeConfig.load()
+        disallowed = [c for c in ts_codes if not cfg.is_stock_allowed(c)]
+        if disallowed:
+            raise ScopeViolationError(
+                f"以下股票不在允许的股票池中: {disallowed}。"
+                f" 允许列表: {cfg.allowed_stocks}。"
+                f" 修改 data/data_scope.yaml 即可调整。"
+            )
+
         results = {"total": len(ts_codes), "success": 0, "failed": 0, "total_records": 0, "errors": []}
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:

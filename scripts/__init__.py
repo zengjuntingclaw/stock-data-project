@@ -45,6 +45,15 @@ from scripts.data_fetcher import DataFetcher, DataSource, AkShareSource, Baostoc
 # 数据验证器
 from scripts.data_validator import DataValidator
 
+# 数据范围约束
+from scripts.data_scope import (
+    validate_scope,
+    validate_batch,
+    enforce_scope,
+    ScopeViolationError,
+    ScopeConfig,
+)
+
 __version__ = "3.1.0"
 __all__ = [
     # 数据类
@@ -79,4 +88,7 @@ __all__ = [
     "DataFetcher", "DataSource", "AkShareSource", "BaostockSource",
     # 数据验证器
     "DataValidator",
+    # 数据范围约束
+    "validate_scope", "validate_batch", "enforce_scope",
+    "ScopeViolationError", "ScopeConfig",
 ]
