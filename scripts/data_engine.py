@@ -1853,7 +1853,17 @@ class DataEngine:
     # ──────────────────────────────────────────────────────────
     # 日线数据下载
     # ──────────────────────────────────────────────────────────
-        # 统一入口：AkShare优先，失败自动 fallback 到 Baostock
+    def fetch_single(self,
+                     symbol: str,
+                     start_date: str,
+                     end_date: str,
+                     adjust: Literal["qfq", ""] = "qfq") -> pd.DataFrame:
+        """
+        获取指定股票指定时间段的数据，统一返回 raw_close + adj_factor 双字段。
+        AkShare 优先，失败自动 fallback 到 Baostock。
+        save_quotes 要求 DataFrame 包含 ticker 字段。
+        """
+        # 统一入口：AkShare 优先，失败 fallback Baostock
         df, _ = self._fetch_single_with_retry(
             symbol=symbol,
             start_date=start_date,
@@ -1871,9 +1881,11 @@ class DataEngine:
         if "adj_factor" not in df.columns:
             df["adj_factor"] = 1.0
         if "pre_close" not in df.columns:
-            df["pre_close"] = df["close"].shift(1) if "close" in df.columns else 0.0
+            df["pre_close"] = (
+                df["close"].shift(1) if "close" in df.columns else 0.0
+            )
 
-        # ts_code → ticker：save_quotes 统一使用 ticker
+        # ts_code → ticker：save_quotes 统一使用 ticker 列名
         if "ts_code" in df.columns and "ticker" not in df.columns:
             df.rename(columns={"ts_code": "ticker"}, inplace=True)
 
@@ -2400,7 +2412,9 @@ class DataEngine:
                 df_raw["adj_factor"] = 1.0
 
             # 基础字段
-            df_raw["ticker"] = build_ts_code(sym6)
+
+            df_raw["ts_code"] = build_ts_code(sym6)
+            df_raw["ticker"]  = build_ts_code(sym6)
             df_raw["pre_close"] = df_raw["qfq_close"].shift(1)
             df_raw["pct_chg"] = (
                 df_raw["qfq_close"] / df_raw["pre_close"].replace(0, np.nan) - 1
@@ -2416,7 +2430,7 @@ class DataEngine:
             # raw_* -> 存入 daily_bar_raw（原始未复权价格）
             # qfq_* -> 存入 daily_bar_adjusted（前复权价格）
             result = pd.DataFrame({
-                "ticker":      df_raw["ticker"],
+                "ticker":     df_raw["ticker"],
                 "trade_date":  df_raw["trade_date"],
                 # raw 层（原始未复权）
                 "raw_open":    df_raw["open"],
